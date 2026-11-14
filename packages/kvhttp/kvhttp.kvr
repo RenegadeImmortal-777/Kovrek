@@ -3,3 +3,22 @@ fn post(url: String, body: Any) -> String { return http_post(url, body); }
 fn request(method: String, url: String, headers: Map, body: Any, timeout_ms: Number) -> Map {
     return http_request(method, url, headers, body, timeout_ms);
 }
+fn validate_url(url: String, allow_http: Bool) -> Map {
+    return url_validate_public(url, allow_http);
+}
+fn resolve_public(url: String, allow_http: Bool) -> Map {
+    return url_resolve_public(url, allow_http);
+}
+fn safe_request(method: String, url: String, headers: Map, body: Any, timeout_ms: Number) -> Map {
+    return http_request_safe(method, url, headers, body, timeout_ms);
+}
+fn safe_request_opts(method: String, url: String, headers: Map, body: Any, timeout_ms: Number, opts: Map) -> Map {
+    return http_request_safe(method, url, headers, body, timeout_ms, opts);
+}
+fn sign_webhook(secret: String, timestamp: String, payload: String) -> String {
+    return "t=" + timestamp + ",v1=" + hmac_sha256(secret, timestamp + "." + payload);
+}
+fn verify_webhook(secret: String, timestamp: String, payload: String, signature: String) -> Bool {
+    let expected = sign_webhook(secret, timestamp, payload);
+    return constant_time_equal(expected, signature);
+}

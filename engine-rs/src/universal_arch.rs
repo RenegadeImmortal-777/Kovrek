@@ -19,6 +19,10 @@ use tiny_http::{Header, Response, Server, StatusCode};
 use crate::pipeline::verify_source_strict;
 use crate::registry::safe_package_relative_path;
 use crate::runtime::{channels, require_cap};
+use crate::server::{
+    BodyReadError, DEFAULT_MAX_BODY_BYTES, apply_security_headers, json_error_response,
+    read_request_body_limited,
+};
 use crate::value::{Val, json_to_val, map_lookup, val_to_json};
 use crate::vm::Vm;
 
@@ -510,7 +514,7 @@ fn static_content_type(path: &Path) -> &'static str {
 }
 
 pub(crate) fn val_to_http_response(value: Val) -> Response<Box<dyn Read + Send>> {
-    match value {
+    let mut response = match value {
         Val::Map(pairs) => {
             if let Some(Val::Num(ch_num)) = map_lookup(&pairs, &Val::Str("stream_channel".into())) {
                 let reader: Box<dyn Read + Send> = Box::new(ChannelSseReader::new(*ch_num as u64));
@@ -523,6 +527,7 @@ pub(crate) fn val_to_http_response(value: Val) -> Response<Box<dyn Read + Send>>
                         r.add_header(h);
                     }
                 }
+                apply_security_headers(&mut r);
                 return r;
             }
             let has_http_keys = map_lookup(&pairs, &Val::Str("body".into())).is_some()
@@ -539,6 +544,7 @@ pub(crate) fn val_to_http_response(value: Val) -> Response<Box<dyn Read + Send>>
                 ) {
                     r.add_header(h);
                 }
+                apply_security_headers(&mut r);
                 return r;
             }
             let status = match map_lookup(&pairs, &Val::Str("status".into())) {
@@ -588,7 +594,9 @@ pub(crate) fn val_to_http_response(value: Val) -> Response<Box<dyn Read + Send>>
             }
             r
         }
-    }
+    };
+    apply_security_headers(&mut response);
+    response
 }
 
 fn resolve_safe_static(dir: &Path, req_path: &str) -> Option<PathBuf> {
@@ -618,6 +626,7 @@ fn handle_desktop_or_app_request(
     static_dir: Option<&Path>,
     inline_html: Option<&str>,
     stop_flag: &Arc<AtomicBool>,
+    max_body_bytes: usize,
 ) -> Result<(), String> {
     let full_url = req.url().to_string();
     let path = full_url.split('?').next().unwrap_or("/").to_string();
@@ -628,6 +637,7 @@ fn handle_desktop_or_app_request(
         if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/javascript"[..]) {
             r.add_header(h);
         }
+        apply_security_headers(&mut r);
         return req.respond(r).map_err(|e| e.to_string());
     }
     if path == "/__kovrek/health" {
@@ -635,16 +645,32 @@ fn handle_desktop_or_app_request(
         if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]) {
             r.add_header(h);
         }
+        apply_security_headers(&mut r);
         return req.respond(r).map_err(|e| e.to_string());
     }
     if path == "/__kovrek/shutdown" && method == "POST" {
         stop_flag.store(true, Ordering::SeqCst);
-        let r = Response::from_string(r#"{"ok":true,"shutting_down":true}"#).boxed();
+        let mut r = Response::from_string(r#"{"ok":true,"shutting_down":true}"#).boxed();
+        apply_security_headers(&mut r);
         return req.respond(r).map_err(|e| e.to_string());
     }
 
-    let mut body = String::new();
-    let _ = req.as_reader().read_to_string(&mut body);
+    let body = match read_request_body_limited(&mut req, max_body_bytes) {
+        Ok(b) => b,
+        Err(BodyReadError::TooLarge(limit)) => {
+            return req
+                .respond(json_error_response(
+                    413,
+                    &format!("request body exceeded {limit} bytes"),
+                ))
+                .map_err(|e| e.to_string());
+        }
+        Err(BodyReadError::Io(e)) => {
+            return req
+                .respond(json_error_response(400, &e))
+                .map_err(|e| e.to_string());
+        }
+    };
     let headers = Val::Map(
         req.headers()
             .iter()
@@ -659,12 +685,25 @@ fn handle_desktop_or_app_request(
 
     if path == "/__kovrek/invoke" && method == "POST" {
         let Some(h) = handler else {
-            let r = Response::from_string(r#"{"ok":false,"error":"no IPC handler bound"}"#)
-                .with_status_code(StatusCode(404))
-                .boxed();
-            return req.respond(r).map_err(|e| e.to_string());
+            return req
+                .respond(json_error_response(404, "no IPC handler bound"))
+                .map_err(|e| e.to_string());
         };
-        let parsed: JsonValue = serde_json::from_str(&body).unwrap_or(JsonValue::Null);
+        let parsed: JsonValue = if body.trim().is_empty() {
+            JsonValue::Null
+        } else {
+            match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    return req
+                        .respond(json_error_response(
+                            400,
+                            &format!("invalid JSON payload: {e}"),
+                        ))
+                        .map_err(|e| e.to_string());
+                }
+            }
+        };
         let action = parsed
             .get("action")
             .and_then(JsonValue::as_str)
@@ -692,9 +731,13 @@ fn handle_desktop_or_app_request(
                     ]),
                 ),
             ])),
-            Err(e) => Response::from_string(json!({ "ok": false, "error": e }).to_string())
-                .with_status_code(StatusCode(500))
-                .boxed(),
+            Err(e) => {
+                let mut r = Response::from_string(json!({ "ok": false, "error": e }).to_string())
+                    .with_status_code(StatusCode(500))
+                    .boxed();
+                apply_security_headers(&mut r);
+                r
+            }
         };
         return req.respond(resp).map_err(|e| e.to_string());
     }
@@ -711,6 +754,7 @@ fn handle_desktop_or_app_request(
         ) {
             r.add_header(h);
         }
+        apply_security_headers(&mut r);
         return req.respond(r).map_err(|e| e.to_string());
     }
 
@@ -722,6 +766,7 @@ fn handle_desktop_or_app_request(
         if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]) {
             r.add_header(h);
         }
+        apply_security_headers(&mut r);
         return req.respond(r).map_err(|e| e.to_string());
     }
 
@@ -741,19 +786,22 @@ fn handle_desktop_or_app_request(
         ]);
         let resp = match vm.invoke_callable_sync(h, vec![req_val]) {
             Ok(v) => val_to_http_response(v),
-            Err(e) => Response::from_string(format!("Kovrek handler error: {e}"))
-                .with_status_code(StatusCode(500))
-                .boxed(),
+            Err(e) => {
+                let mut r = Response::from_string(format!("Kovrek handler error: {e}"))
+                    .with_status_code(StatusCode(500))
+                    .boxed();
+                apply_security_headers(&mut r);
+                r
+            }
         };
         return req.respond(resp).map_err(|e| e.to_string());
     }
 
-    req.respond(
-        Response::from_string("404 Not Found")
-            .with_status_code(StatusCode(404))
-            .boxed(),
-    )
-    .map_err(|e| e.to_string())
+    let mut not_found = Response::from_string("404 Not Found")
+        .with_status_code(StatusCode(404))
+        .boxed();
+    apply_security_headers(&mut not_found);
+    req.respond(not_found).map_err(|e| e.to_string())
 }
 
 struct AppPoolConfig {
@@ -763,6 +811,7 @@ struct AppPoolConfig {
     stop_flag: Arc<AtomicBool>,
     workers: usize,
     max_requests: Option<usize>,
+    max_body_bytes: usize,
 }
 
 fn spawn_app_worker_pool(
@@ -780,6 +829,7 @@ fn spawn_app_worker_pool(
             let ih = cfg.inline_html.clone();
             let stop = cfg.stop_flag.clone();
             let limit_opt = cfg.max_requests;
+            let max_body = cfg.max_body_bytes;
             let cnt = handled.clone();
             thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
@@ -799,6 +849,7 @@ fn spawn_app_worker_pool(
                                 sd.as_deref(),
                                 ih.as_deref(),
                                 &stop,
+                                max_body,
                             );
                             if let Some(limit) = limit_opt
                                 && c >= limit as u64
@@ -842,6 +893,8 @@ pub(crate) fn run_desktop_app(vm: &mut Vm, args: Vec<Val>) -> Result<Val, String
         Val::Num(n) if *n >= 1.0 => Some(*n as usize),
         _ => None,
     });
+    let max_body_bytes = apply_map_usize(pairs, "max_body_bytes", DEFAULT_MAX_BODY_BYTES)
+        .clamp(1024, 64 * 1024 * 1024);
     let headless = match map_lookup(pairs, &Val::Str("headless".into())) {
         Some(Val::Bool(b)) => *b,
         _ => false,
@@ -878,6 +931,7 @@ pub(crate) fn run_desktop_app(vm: &mut Vm, args: Vec<Val>) -> Result<Val, String
             stop_flag: stop_flag.clone(),
             workers,
             max_requests,
+            max_body_bytes,
         },
     );
 
@@ -960,6 +1014,8 @@ pub(crate) fn run_app_serve(vm: &mut Vm, args: Vec<Val>) -> Result<Val, String> 
         Val::Num(n) if *n >= 1.0 => Some(*n as usize),
         _ => None,
     });
+    let max_body_bytes = apply_map_usize(&opts, "max_body_bytes", DEFAULT_MAX_BODY_BYTES)
+        .clamp(1024, 64 * 1024 * 1024);
     let static_dir = match map_lookup(&opts, &Val::Str("static_dir".into())) {
         Some(Val::Str(s)) => Some(PathBuf::from(s)),
         _ => None,
@@ -982,6 +1038,7 @@ pub(crate) fn run_app_serve(vm: &mut Vm, args: Vec<Val>) -> Result<Val, String> 
             stop_flag: stop_flag.clone(),
             workers,
             max_requests,
+            max_body_bytes,
         },
     );
     if let Some(on_ready) = map_lookup(&opts, &Val::Str("on_ready".into())).cloned()

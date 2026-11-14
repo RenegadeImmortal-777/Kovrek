@@ -1,9 +1,20 @@
-fn html_page(title: String, body: String) -> String {
-    return "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" + title + "</title></head><body>" + body + "</body></html>";
+fn escape_html(text: Any) -> String { return html_escape(text); }
+fn safe_href(href: String) -> String {
+    let trimmed = trim(href);
+    let lo = lower(trimmed);
+    if starts_with(lo, "https://") or starts_with(lo, "http://") or starts_with(lo, "/") or starts_with(lo, "#") or starts_with(lo, "./") or starts_with(lo, "../") {
+        return html_escape(trimmed);
+    }
+    return "#";
 }
-fn heading(text: String) -> String { return "<h1>" + text + "</h1>"; }
-fn paragraph(text: String) -> String { return "<p>" + text + "</p>"; }
-fn link(href: String, text: String) -> String { return "<a href=\"" + href + "\">" + text + "</a>"; }
+fn html_page(title: String, body: String) -> String {
+    return "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>" + html_escape(title) + "</title></head><body>" + body + "</body></html>";
+}
+fn heading(text: String) -> String { return "<h1>" + html_escape(text) + "</h1>"; }
+fn paragraph(text: String) -> String { return "<p>" + html_escape(text) + "</p>"; }
+fn link(href: String, text: String) -> String {
+    return "<a href=\"" + safe_href(href) + "\">" + html_escape(text) + "</a>";
+}
 
 fn response(body: Any, status: Number, content_type: String) -> Map {
     return {"status":status, "content_type":content_type, "body":body};
@@ -11,7 +22,16 @@ fn response(body: Any, status: Number, content_type: String) -> Map {
 fn response_with_headers(body: Any, status: Number, content_type: String, headers: Map) -> Map {
     return {"status":status, "content_type":content_type, "body":body, "headers":headers};
 }
-fn request_header(request: Map, name: String) -> Any { return get(request["headers"], name); }
+fn request_header(request: Map, name: String) -> Any {
+    let hdrs = request["headers"];
+    let direct = get(hdrs, name);
+    if direct != null { return direct; }
+    let target = lower(name);
+    for k in keys(hdrs) {
+        if lower(k) == target { return hdrs[k]; }
+    }
+    return null;
+}
 fn json_response(data: Any) -> Map {
     return response(json_stringify(data), 200, "application/json; charset=utf-8");
 }
@@ -27,3 +47,49 @@ fn html_response(html: String) -> Map {
 fn param(request: Map, name: String) -> Any { return get(request["params"], name); }
 fn query_param(request: Map, name: String) -> Any { return get(request["query"], name); }
 fn json_body(request: Map) -> Any { return json_parse(request["body"]); }
+
+fn security_headers() -> Map {
+    return {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+        "Cross-Origin-Resource-Policy": "same-origin"
+    };
+}
+
+fn html_security_headers() -> Map {
+    return {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+        "Cross-Origin-Resource-Policy": "same-origin",
+        "Content-Security-Policy": "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'self'; frame-ancestors 'none'; object-src 'none'"
+    };
+}
+
+fn is_cross_site(request: Map) -> Bool {
+    let sfs = request_header(request, "sec-fetch-site");
+    if sfs != null and lower(str(sfs)) == "cross-site" { return true; }
+    let origin = request_header(request, "origin");
+    let host = request_header(request, "host");
+    if origin != null and host != null {
+        let orig = lower(trim(str(origin)));
+        let hst = lower(trim(str(host)));
+        if orig != ("http://" + hst) and orig != ("https://" + hst) { return true; }
+    }
+    return false;
+}
+
+fn client_ip(request: Map, trusted_proxies: List, direct_ip: String) -> String {
+    let peer = trim(direct_ip);
+    if not contains(trusted_proxies, peer) { return peer; }
+    let xff = request_header(request, "x-forwarded-for");
+    if xff == null { return peer; }
+    let parts = split(str(xff), ",");
+    if len(parts) == 0 { return peer; }
+    let first = trim(parts[0]);
+    if len(first) == 0 { return peer; }
+    return first;
+}

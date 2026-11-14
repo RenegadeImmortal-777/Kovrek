@@ -4,3 +4,50 @@ fn derive(password: String, salt: String, iterations: Number, bytes: Number) -> 
     return pbkdf2_sha256(password, salt, iterations, bytes);
 }
 fn secure_equal(left: String, right: String) -> Bool { return constant_time_equal(left, right); }
+
+fn random_hex(bytes: Number) -> String { return random_bytes_hex(bytes); }
+fn token(bytes: Number) -> String { return random_token(bytes); }
+fn escape_html(text: Any) -> String { return html_escape(text); }
+fn encrypt_secret(secret: String, plaintext: String) -> String {
+    return aes_gcm_encrypt(secret, plaintext);
+}
+fn decrypt_secret(secret: String, encrypted: String) -> String {
+    return aes_gcm_decrypt(secret, encrypted);
+}
+fn is_private_address(addr: String) -> Bool { return is_private_ip(addr); }
+fn validate_public_url(url: String, allow_http: Bool) -> Map {
+    return url_validate_public(url, allow_http);
+}
+
+fn chain_entry(prev_hash: String, actor: String, action: String, target: String, detail: Any, ts: Number) -> Map {
+    let canonical = prev_hash + "|" + actor + "|" + action + "|" + target + "|" + json_stringify(detail) + "|" + str(ts);
+    let digest = sha256(canonical);
+    return {
+        "prev_hash": prev_hash,
+        "hash": digest,
+        "actor": actor,
+        "action": action,
+        "target": target,
+        "detail": detail,
+        "ts": ts
+    };
+}
+
+fn verify_chain(entries: List) -> Map {
+    let expected_prev = "0000000000000000000000000000000000000000000000000000000000000000";
+    let idx = 0;
+    for entry in entries {
+        let prev = entry["prev_hash"];
+        if not constant_time_equal(prev, expected_prev) {
+            return {"ok": false, "checked": idx, "broken_index": idx};
+        }
+        let canonical = prev + "|" + entry["actor"] + "|" + entry["action"] + "|" + entry["target"] + "|" + json_stringify(entry["detail"]) + "|" + str(entry["ts"]);
+        let expected_hash = sha256(canonical);
+        if not constant_time_equal(entry["hash"], expected_hash) {
+            return {"ok": false, "checked": idx, "broken_index": idx};
+        }
+        expected_prev = expected_hash;
+        idx = idx + 1;
+    }
+    return {"ok": true, "checked": idx};
+}

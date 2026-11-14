@@ -4,14 +4,86 @@
 // Extracted from `main.rs` without behavior change; see docs/ENGINE-SPLIT.md.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value as JsonValue;
-use tiny_http::{Header, Response, Server, StatusCode};
+use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 use crate::pipeline::{load_source, prepare_vm};
 use crate::registry::{safe_package_relative_path, unpack_bundle_to_dir};
 use crate::value::Val;
+
+pub(crate) const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+pub(crate) const REGISTRY_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+pub(crate) const DEFAULT_SECURITY_HEADERS: [(&str, &str); 5] = [
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer"),
+    (
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=()",
+    ),
+    ("Cross-Origin-Resource-Policy", "same-origin"),
+];
+
+pub(crate) enum BodyReadError {
+    TooLarge(usize),
+    Io(String),
+}
+
+pub(crate) fn apply_security_headers<R: Read>(response: &mut Response<R>) {
+    for (name, value) in DEFAULT_SECURITY_HEADERS {
+        let present = response
+            .headers()
+            .iter()
+            .any(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name));
+        if !present && let Ok(h) = Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            response.add_header(h);
+        }
+    }
+}
+
+pub(crate) fn read_request_body_limited(
+    req: &mut Request,
+    max_bytes: usize,
+) -> Result<String, BodyReadError> {
+    if let Some(content_len) = req.body_length()
+        && content_len > max_bytes
+    {
+        return Err(BodyReadError::TooLarge(max_bytes));
+    }
+    let mut buf = Vec::new();
+    let take_cap = max_bytes.saturating_add(1) as u64;
+    req.as_reader()
+        .take(take_cap)
+        .read_to_end(&mut buf)
+        .map_err(|e| BodyReadError::Io(e.to_string()))?;
+    if buf.len() > max_bytes {
+        return Err(BodyReadError::TooLarge(max_bytes));
+    }
+    String::from_utf8(buf).map_err(|e| BodyReadError::Io(format!("invalid UTF-8 body: {e}")))
+}
+
+pub(crate) fn json_error_response(status: u16, message: &str) -> Response<Box<dyn Read + Send>> {
+    let payload = serde_json::json!({
+        "ok": false,
+        "error": message,
+    })
+    .to_string();
+    let mut r = Response::from_string(payload)
+        .with_status_code(StatusCode(status))
+        .boxed();
+    if let Ok(h) = Header::from_bytes(
+        &b"Content-Type"[..],
+        &b"application/json; charset=utf-8"[..],
+    ) {
+        r.add_header(h);
+    }
+    apply_security_headers(&mut r);
+    r
+}
 
 pub(crate) fn resolve_static_path(dir: &Path, request_url: &str) -> Option<PathBuf> {
     let raw = request_url.split('?').next().unwrap_or("/");
@@ -39,7 +111,7 @@ pub(crate) fn serve_directory(dir: &Path, port: u16) -> Result<(), String> {
     println!("Kovrek web server: http://127.0.0.1:{port}");
     println!("Serving {}", dir.display());
     for req in server.incoming_requests() {
-        let response = if let Some(path) = resolve_static_path(dir, req.url()) {
+        let mut response = if let Some(path) = resolve_static_path(dir, req.url()) {
             let data = fs::read(&path).map_err(|e| e.to_string())?;
             let mut r = Response::from_data(data);
             let content_type = match path.extension().and_then(|x| x.to_str()).unwrap_or("") {
@@ -59,6 +131,7 @@ pub(crate) fn serve_directory(dir: &Path, port: u16) -> Result<(), String> {
         } else {
             Response::from_string("404 Not Found").with_status_code(StatusCode(404))
         };
+        apply_security_headers(&mut response);
         req.respond(response).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -68,6 +141,11 @@ pub(crate) fn serve_routes(routes_file: &Path, port: u16) -> Result<(), String> 
     let config: JsonValue =
         serde_json::from_str(&fs::read_to_string(routes_file).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
+    let max_body_bytes = config
+        .get("max_body_bytes")
+        .and_then(JsonValue::as_u64)
+        .map(|n| (n as usize).clamp(1024, 64 * 1024 * 1024))
+        .unwrap_or(DEFAULT_MAX_BODY_BYTES);
     let routes = config
         .get("routes")
         .and_then(JsonValue::as_object)
@@ -76,10 +154,10 @@ pub(crate) fn serve_routes(routes_file: &Path, port: u16) -> Result<(), String> 
     println!("Kovrek API server: http://127.0.0.1:{port}");
     println!("Routes: {}", routes.len());
     for mut req in server.incoming_requests() {
-        let path = req.url().split('?').next().unwrap_or("/");
-        let method = req.method().as_str();
+        let path = req.url().split('?').next().unwrap_or("/").to_string();
+        let method = req.method().as_str().to_string();
         let method_key = format!("{method} {path}");
-        let route = routes.get(&method_key).or_else(|| routes.get(path));
+        let route = routes.get(&method_key).or_else(|| routes.get(&path));
         let response = if let Some(route) = route {
             let status = route
                 .get("status")
@@ -95,32 +173,54 @@ pub(crate) fn serve_routes(routes_file: &Path, port: u16) -> Result<(), String> 
                         "text/plain; charset=utf-8"
                     }
                 });
-            let body = if route
+            if route
                 .get("echo")
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(false)
             {
-                let mut text = String::new();
-                req.as_reader()
-                    .read_to_string(&mut text)
-                    .map_err(|e| e.to_string())?;
-                text
-            } else if let Some(j) = route.get("json") {
-                serde_json::to_string(j).map_err(|e| e.to_string())?
+                match read_request_body_limited(&mut req, max_body_bytes) {
+                    Ok(text) => {
+                        let mut r = Response::from_string(text)
+                            .with_status_code(StatusCode(status))
+                            .boxed();
+                        if let Ok(h) =
+                            Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
+                        {
+                            r.add_header(h);
+                        }
+                        apply_security_headers(&mut r);
+                        r
+                    }
+                    Err(BodyReadError::TooLarge(limit)) => {
+                        json_error_response(413, &format!("request body exceeded {limit} bytes"))
+                    }
+                    Err(BodyReadError::Io(e)) => json_error_response(400, &e),
+                }
             } else {
-                route
-                    .get("body")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or("")
-                    .to_string()
-            };
-            let mut r = Response::from_string(body).with_status_code(StatusCode(status));
-            if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()) {
-                r.add_header(h);
+                let body = if let Some(j) = route.get("json") {
+                    serde_json::to_string(j).map_err(|e| e.to_string())?
+                } else {
+                    route
+                        .get("body")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let mut r = Response::from_string(body)
+                    .with_status_code(StatusCode(status))
+                    .boxed();
+                if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()) {
+                    r.add_header(h);
+                }
+                apply_security_headers(&mut r);
+                r
             }
-            r
         } else {
-            Response::from_string("404 Not Found").with_status_code(StatusCode(404))
+            let mut r = Response::from_string("404 Not Found")
+                .with_status_code(StatusCode(404))
+                .boxed();
+            apply_security_headers(&mut r);
+            r
         };
         req.respond(response).map_err(|e| e.to_string())?;
     }
@@ -200,6 +300,11 @@ pub(crate) fn serve_kovrek_app(
         .and_then(JsonValue::as_u64)
         .map(|n| (n as usize).clamp(1, 16))
         .unwrap_or(4);
+    let max_body_bytes = config
+        .get("max_body_bytes")
+        .and_then(JsonValue::as_u64)
+        .map(|n| (n as usize).clamp(1024, 64 * 1024 * 1024))
+        .unwrap_or(DEFAULT_MAX_BODY_BYTES);
     let server =
         std::sync::Arc::new(Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?);
     println!("Kovrek dynamic app: http://127.0.0.1:{port}");
@@ -243,8 +348,20 @@ pub(crate) fn serve_kovrek_app(
                     }
                 }
                 if let Some(handler) = handler {
-                    let mut body = String::new();
-                    let _ = req.as_reader().read_to_string(&mut body);
+                    let body = match read_request_body_limited(&mut req, max_body_bytes) {
+                        Ok(b) => b,
+                        Err(BodyReadError::TooLarge(limit)) => {
+                            let _ = req.respond(json_error_response(
+                                413,
+                                &format!("request body exceeded {limit} bytes"),
+                            ));
+                            continue;
+                        }
+                        Err(BodyReadError::Io(e)) => {
+                            let _ = req.respond(json_error_response(400, &e));
+                            continue;
+                        }
+                    };
                     let params = Val::Map(
                         route_params
                             .iter()
@@ -274,9 +391,13 @@ pub(crate) fn serve_kovrek_app(
                     ]);
                     let resp = match wvm.invoke(&handler, vec![request]) {
                         Ok(value) => crate::universal_arch::val_to_http_response(value),
-                        Err(e) => Response::from_string(format!("Kovrek handler error: {e}"))
-                            .with_status_code(StatusCode(500))
-                            .boxed(),
+                        Err(e) => {
+                            let mut r = Response::from_string(format!("Kovrek handler error: {e}"))
+                                .with_status_code(StatusCode(500))
+                                .boxed();
+                            apply_security_headers(&mut r);
+                            r
+                        }
                     };
                     let _ = req.respond(resp);
                 } else if let Some(dir) = sdir.as_deref()
@@ -297,13 +418,14 @@ pub(crate) fn serve_kovrek_app(
                     if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()) {
                         r.add_header(h);
                     }
+                    apply_security_headers(&mut r);
                     let _ = req.respond(r);
                 } else {
-                    let _ = req.respond(
-                        Response::from_string("404 Not Found")
-                            .with_status_code(StatusCode(404))
-                            .boxed(),
-                    );
+                    let mut r = Response::from_string("404 Not Found")
+                        .with_status_code(StatusCode(404))
+                        .boxed();
+                    apply_security_headers(&mut r);
+                    let _ = req.respond(r);
                 }
             }
         }));
@@ -321,10 +443,11 @@ pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
     for mut req in server.incoming_requests() {
         let method = req.method().as_str().to_string();
         let path = req.url().split('?').next().unwrap_or("/").to_string();
-        let response = if method == "POST" && (path == "/publish" || path == "/registry/publish") {
-            let mut body = String::new();
-            let resp = match req.as_reader().read_to_string(&mut body) {
-                Ok(_) => match serde_json::from_str::<JsonValue>(&body) {
+        let mut response = if method == "POST"
+            && (path == "/publish" || path == "/registry/publish")
+        {
+            let resp = match read_request_body_limited(&mut req, REGISTRY_MAX_BODY_BYTES) {
+                Ok(body) => match serde_json::from_str::<JsonValue>(&body) {
                     Ok(bundle) => {
                         let name = bundle.get("name").and_then(JsonValue::as_str).unwrap_or("");
                         let version = bundle
@@ -405,7 +528,13 @@ pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
                     Err(e) => Response::from_string(format!("invalid JSON: {e}"))
                         .with_status_code(StatusCode(400)),
                 },
-                Err(e) => Response::from_string(e.to_string()).with_status_code(StatusCode(400)),
+                Err(BodyReadError::TooLarge(limit)) => {
+                    Response::from_string(format!("request body exceeded {limit} bytes"))
+                        .with_status_code(StatusCode(413))
+                }
+                Err(BodyReadError::Io(e)) => {
+                    Response::from_string(e).with_status_code(StatusCode(400))
+                }
             };
             resp
         } else if method == "GET"
@@ -436,6 +565,7 @@ pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
         } else {
             Response::from_string("404 Not Found").with_status_code(StatusCode(404))
         };
+        apply_security_headers(&mut response);
         req.respond(response).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -956,7 +1086,21 @@ pub(crate) fn handle_notebook_api_request(
             (200, "text/plain; charset=utf-8", guard.export_script())
         }
         ("POST", "/api/notebook/run") => {
-            let parsed: JsonValue = serde_json::from_str(body).unwrap_or_default();
+            let parsed: JsonValue = if body.trim().is_empty() {
+                JsonValue::Null
+            } else {
+                match serde_json::from_str(body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return (
+                            400,
+                            "application/json",
+                            serde_json::json!({ "error": format!("invalid JSON body: {e}") })
+                                .to_string(),
+                        );
+                    }
+                }
+            };
             let cid = parsed
                 .get("id")
                 .and_then(JsonValue::as_str)
@@ -1023,26 +1167,47 @@ async function resetNb(){await fetch('/api/notebook/reset',{method:'POST'});out.
     for mut req in server.incoming_requests() {
         let method = req.method().as_str().to_string();
         let url = req.url().split('?').next().unwrap_or("/").to_string();
-        let response = if method == "GET" && url == "/" {
+        let mut response = if method == "GET" && url == "/" {
             let mut r = Response::from_string(UI_HTML);
             if let Ok(h) =
                 Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
             {
                 r.add_header(h);
             }
+            if let Ok(csp) = Header::from_bytes(
+                &b"Content-Security-Policy"[..],
+                &b"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; base-uri 'self'; frame-ancestors 'none'; object-src 'none'"[..],
+            ) {
+                r.add_header(csp);
+            }
             r
         } else {
-            let mut body = String::new();
-            if method == "POST" {
-                let _ = req.as_reader().read_to_string(&mut body);
-            }
-            let (status, ctype, text) = handle_notebook_api_request(&session, &method, &url, &body);
+            let body_res = if method == "POST" {
+                read_request_body_limited(&mut req, DEFAULT_MAX_BODY_BYTES)
+            } else {
+                Ok(String::new())
+            };
+            let (status, ctype, text) = match body_res {
+                Ok(body) => handle_notebook_api_request(&session, &method, &url, &body),
+                Err(BodyReadError::TooLarge(limit)) => (
+                    413,
+                    "application/json",
+                    serde_json::json!({ "error": format!("request body exceeded {limit} bytes") })
+                        .to_string(),
+                ),
+                Err(BodyReadError::Io(e)) => (
+                    400,
+                    "application/json",
+                    serde_json::json!({ "error": e }).to_string(),
+                ),
+            };
             let mut r = Response::from_string(text).with_status_code(StatusCode(status));
             if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()) {
                 r.add_header(h);
             }
             r
         };
+        apply_security_headers(&mut response);
         req.respond(response).map_err(|e| e.to_string())?;
     }
     Ok(())

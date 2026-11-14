@@ -10,6 +10,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -26,7 +27,7 @@ use libloading::Library;
 use rand::Rng;
 use regex::Regex;
 #[cfg(feature = "native-services")]
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 
@@ -38,6 +39,7 @@ use crate::runtime::{
     export_function_object, namespace_module_ops, register_named_function_object,
     resolve_function_object, tasks,
 };
+use crate::security;
 use crate::tensor::{
     AdamState, TensorOp, adam_states, tensor_backward, tensor_from_value, tensor_id,
     tensor_snapshot, tensor_store, tensors,
@@ -63,6 +65,239 @@ fn wasm_bytes_from_val(v: &Val) -> Result<Vec<u8>, String> {
         Val::Str(path) => fs::read(path).map_err(|e| format!("failed to read '{path}': {e}")),
         _ => Err("expected wasm byte List or .wasm file path String".into()),
     }
+}
+
+#[cfg(feature = "native-services")]
+const SQLITE_BUSY_TIMEOUT_MS: u64 = 5000;
+#[cfg(feature = "native-services")]
+const DEFAULT_SAFE_HTTP_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(feature = "native-services")]
+fn open_sqlite_conn(path: &str) -> Result<Connection, String> {
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+        .map_err(|e| e.to_string())?;
+    let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+    Ok(conn)
+}
+
+#[cfg(feature = "native-services")]
+fn sql_ref_to_val(cell: rusqlite::types::ValueRef<'_>) -> Val {
+    match cell {
+        rusqlite::types::ValueRef::Null => Val::Null,
+        rusqlite::types::ValueRef::Integer(x) => Val::Num(x as f64),
+        rusqlite::types::ValueRef::Real(x) => Val::Num(x),
+        rusqlite::types::ValueRef::Text(x) => Val::Str(String::from_utf8_lossy(x).to_string()),
+        rusqlite::types::ValueRef::Blob(x) => Val::Str(format!("<{} bytes>", x.len())),
+    }
+}
+
+#[cfg(feature = "native-services")]
+fn collect_sqlite_rows(
+    conn: &Connection,
+    sql: &str,
+    params: &[rusqlite::types::Value],
+) -> Result<Vec<Val>, String> {
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let mut pairs = Vec::with_capacity(names.len());
+            for (i, name) in names.iter().enumerate() {
+                pairs.push((Val::Str(name.clone()), sql_ref_to_val(row.get_ref(i)?)));
+            }
+            Ok(Val::Map(pairs))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "native-services")]
+fn parse_sqlite_tx_item(item: &Val) -> Result<(String, Vec<rusqlite::types::Value>), String> {
+    match item {
+        Val::Str(sql) => Ok((sql.clone(), Vec::new())),
+        Val::List(parts) if parts.len() == 1 || parts.len() == 2 => {
+            let Val::Str(sql) = &parts[0] else {
+                return Err("sqlite_tx statement SQL must be String".into());
+            };
+            let params = match parts.get(1) {
+                Some(Val::List(xs)) => xs.iter().map(val_to_sql_value).collect(),
+                Some(Val::Null) | None => Vec::new(),
+                _ => return Err("sqlite_tx statement params must be List".into()),
+            };
+            Ok((sql.clone(), params))
+        }
+        Val::Map(pairs) => {
+            let sql = match map_lookup(pairs, &Val::Str("sql".into())) {
+                Some(Val::Str(s)) => s.clone(),
+                _ => return Err("sqlite_tx map entry requires String 'sql'".into()),
+            };
+            let params = match map_lookup(pairs, &Val::Str("params".into())) {
+                Some(Val::List(xs)) => xs.iter().map(val_to_sql_value).collect(),
+                Some(Val::Null) | None => Vec::new(),
+                _ => return Err("sqlite_tx map 'params' must be List".into()),
+            };
+            Ok((sql, params))
+        }
+        _ => Err("sqlite_tx items must be SQL String, [sql, params], or {sql, params}".into()),
+    }
+}
+
+#[cfg(feature = "native-services")]
+fn response_to_http_val(
+    response: reqwest::blocking::Response,
+    max_bytes: Option<usize>,
+) -> Result<Val, String> {
+    let status = response.status();
+    let header_pairs = response
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                Val::Str(k.as_str().to_string()),
+                Val::Str(v.to_str().unwrap_or("").to_string()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let body = if let Some(limit) = max_bytes {
+        let mut buf = Vec::new();
+        response
+            .take((limit + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| e.to_string())?;
+        if buf.len() > limit {
+            return Err(format!("safe HTTP response exceeded {limit} byte limit"));
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    } else {
+        response.text().map_err(|e| e.to_string())?
+    };
+    Ok(Val::Map(vec![
+        (Val::Str("status".into()), Val::Num(status.as_u16() as f64)),
+        (Val::Str("ok".into()), Val::Bool(status.is_success())),
+        (Val::Str("headers".into()), Val::Map(header_pairs)),
+        (Val::Str("body".into()), Val::Str(body)),
+    ]))
+}
+
+#[cfg(feature = "native-services")]
+fn resolve_redirect_location(
+    base_url: &str,
+    origin: &str,
+    location: &str,
+) -> Result<String, String> {
+    let loc = location.trim();
+    if loc.starts_with("http://") || loc.starts_with("https://") {
+        return Ok(loc.to_string());
+    }
+    if loc.starts_with("//") {
+        let scheme = base_url
+            .split_once("://")
+            .map(|(s, _)| s)
+            .unwrap_or("https");
+        return Ok(format!("{scheme}:{loc}"));
+    }
+    if loc.starts_with('/') {
+        return Ok(format!("{origin}{loc}"));
+    }
+    Err("relative redirect without leading '/' blocked in safe HTTP mode".into())
+}
+
+#[cfg(feature = "native-services")]
+fn execute_safe_http(
+    method_text: &str,
+    url_raw: &str,
+    headers: &[(Val, Val)],
+    body_val: &Val,
+    timeout_ms: u64,
+    opts: Option<&Vec<(Val, Val)>>,
+) -> Result<Val, String> {
+    let allow_http = opts
+        .and_then(|m| map_lookup(m, &Val::Str("allow_http".into())))
+        .is_none_or(Val::truthy);
+    let max_redirects = opts
+        .and_then(|m| map_lookup(m, &Val::Str("max_redirects".into())))
+        .and_then(|v| match v {
+            Val::Num(n) => Some((*n as i64).clamp(0, 5) as usize),
+            _ => None,
+        })
+        .unwrap_or(3);
+    let allow_cross_origin = opts
+        .and_then(|m| map_lookup(m, &Val::Str("allow_cross_origin_redirect".into())))
+        .is_some_and(Val::truthy);
+    let max_resp_bytes = opts
+        .and_then(|m| map_lookup(m, &Val::Str("max_response_bytes".into())))
+        .and_then(|v| match v {
+            Val::Num(n) if *n >= 1024.0 => Some((*n as usize).min(64 * 1024 * 1024)),
+            _ => None,
+        })
+        .unwrap_or(DEFAULT_SAFE_HTTP_MAX_BYTES);
+
+    let mut current_url = url_raw.to_string();
+    let mut current_method =
+        reqwest::Method::from_bytes(method_text.as_bytes()).map_err(|e| e.to_string())?;
+    let mut current_body = if matches!(body_val, Val::Null) {
+        None
+    } else {
+        Some(match body_val {
+            Val::Str(s) => s.clone(),
+            other => json_stringify_value(other)?,
+        })
+    };
+
+    let initial_origin = security::validate_public_url(&current_url, allow_http)?.origin;
+
+    for hop in 0..=max_redirects {
+        let validated = security::validate_public_url(&current_url, allow_http)?;
+        let addrs = security::resolve_public_url_addrs(&validated)?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(timeout_ms))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve(&validated.host, addrs[0])
+            .build()
+            .map_err(|e| e.to_string())?;
+        let mut request = client.request(current_method.clone(), &validated.url);
+        for (k, v) in headers {
+            let key_str = k.show();
+            if validated.origin != initial_origin
+                && (key_str.eq_ignore_ascii_case("authorization")
+                    || key_str.eq_ignore_ascii_case("cookie"))
+            {
+                continue;
+            }
+            request = request.header(key_str, v.show());
+        }
+        if let Some(ref body_str) = current_body {
+            request = request.body(body_str.clone());
+        }
+        let response = request.send().map_err(|e| e.to_string())?;
+        if response.status().is_redirection() && hop < max_redirects {
+            let Some(loc) = response.headers().get(reqwest::header::LOCATION) else {
+                return response_to_http_val(response, Some(max_resp_bytes));
+            };
+            let loc_str = loc.to_str().map_err(|e| e.to_string())?;
+            let next_raw = resolve_redirect_location(&validated.url, &validated.origin, loc_str)?;
+            let next_val = security::validate_public_url(&next_raw, allow_http)?;
+            if !allow_cross_origin && next_val.origin != initial_origin {
+                return Err("cross-origin redirect blocked in safe HTTP mode".into());
+            }
+            if (301..=303).contains(&response.status().as_u16())
+                && current_method != reqwest::Method::GET
+                && current_method != reqwest::Method::HEAD
+            {
+                current_method = reqwest::Method::GET;
+                current_body = None;
+            }
+            current_url = next_val.url;
+            continue;
+        }
+        return response_to_http_val(response, Some(max_resp_bytes));
+    }
+    Err("too many redirects".into())
 }
 
 impl Vm {
@@ -129,6 +364,204 @@ impl Vm {
                     _ => return Err("right must be String".into()),
                 };
                 Val::Bool(constant_time_strings_equal(left, right))
+            }
+            "random_bytes_hex" => {
+                let n_bytes = match a.as_slice() {
+                    [] => 32usize,
+                    [Val::Num(n)] => (*n).max(1.0) as usize,
+                    _ => return Err("random_bytes_hex expects optional byte count Number".into()),
+                };
+                Val::Str(security::random_bytes_hex(n_bytes)?)
+            }
+            "random_token" => {
+                let n_bytes = match a.as_slice() {
+                    [] => 32usize,
+                    [Val::Num(n)] => (*n).max(1.0) as usize,
+                    _ => return Err("random_token expects optional byte count Number".into()),
+                };
+                Val::Str(security::random_token_urlsafe(n_bytes)?)
+            }
+            "html_escape" => {
+                if a.len() != 1 {
+                    return Err("html_escape expects value".into());
+                }
+                Val::Str(security::html_escape(&a[0].show()))
+            }
+            "base32_encode" => {
+                if a.len() != 1 {
+                    return Err("base32_encode expects String".into());
+                }
+                let s = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("base32_encode expects String".into()),
+                };
+                Val::Str(security::base32_encode(s.as_bytes()))
+            }
+            "base32_decode" => {
+                if a.len() != 1 {
+                    return Err("base32_decode expects Base32 String".into());
+                }
+                let s = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("base32_decode expects Base32 String".into()),
+                };
+                let raw = security::base32_decode(s)?;
+                Val::Str(String::from_utf8(raw).map_err(|e| e.to_string())?)
+            }
+            "totp_secret" => {
+                if !a.is_empty() {
+                    return Err("totp_secret takes no arguments".into());
+                }
+                Val::Str(security::generate_totp_secret())
+            }
+            "totp_code" => {
+                if a.is_empty() || a.len() > 2 {
+                    return Err("totp_code expects (secret[, time_secs])".into());
+                }
+                let secret = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("totp_code secret must be String".into()),
+                };
+                let code = match a.get(1) {
+                    Some(Val::Num(ts)) => {
+                        security::totp_code_at(secret, (*ts).max(0.0) as u64, 6, 30)?
+                    }
+                    Some(Val::Null) | None => security::totp_code_now(secret)?,
+                    _ => return Err("totp_code time_secs must be Number".into()),
+                };
+                Val::Str(code)
+            }
+            "totp_verify" => {
+                if a.len() < 2 || a.len() > 4 {
+                    return Err("totp_verify expects (secret, code[, window[, time_secs]])".into());
+                }
+                let secret = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("totp_verify secret must be String".into()),
+                };
+                let code = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("totp_verify code must be String".into()),
+                };
+                let window = match a.get(2) {
+                    Some(Val::Num(w)) => (*w).max(0.0) as u32,
+                    Some(Val::Null) | None => 1,
+                    _ => return Err("totp_verify window must be Number".into()),
+                };
+                let ok = match a.get(3) {
+                    Some(Val::Num(ts)) => {
+                        security::verify_totp_at(secret, code, (*ts).max(0.0) as u64, window)
+                    }
+                    Some(Val::Null) | None => security::verify_totp_now(secret, code, window),
+                    _ => return Err("totp_verify time_secs must be Number".into()),
+                };
+                Val::Bool(ok)
+            }
+            "aes_gcm_encrypt" => {
+                if a.len() != 2 && a.len() != 3 {
+                    return Err("aes_gcm_encrypt expects (key, plaintext[, aad])".into());
+                }
+                let key = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("aes_gcm_encrypt key must be String".into()),
+                };
+                let plaintext = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("aes_gcm_encrypt plaintext must be String".into()),
+                };
+                let aad = match a.get(2) {
+                    Some(Val::Str(s)) => s.as_bytes(),
+                    Some(Val::Null) | None => b"",
+                    _ => return Err("aes_gcm_encrypt aad must be String".into()),
+                };
+                Val::Str(security::aes_gcm_encrypt_token(key, plaintext, aad)?)
+            }
+            "aes_gcm_decrypt" => {
+                if a.len() != 2 && a.len() != 3 {
+                    return Err("aes_gcm_decrypt expects (key, ciphertext[, aad])".into());
+                }
+                let key = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("aes_gcm_decrypt key must be String".into()),
+                };
+                let token = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("aes_gcm_decrypt ciphertext must be String".into()),
+                };
+                let aad = match a.get(2) {
+                    Some(Val::Str(s)) => s.as_bytes(),
+                    Some(Val::Null) | None => b"",
+                    _ => return Err("aes_gcm_decrypt aad must be String".into()),
+                };
+                Val::Str(security::aes_gcm_decrypt_token(key, token, aad)?)
+            }
+            "is_private_ip" => {
+                if a.len() != 1 {
+                    return Err("is_private_ip expects IP String".into());
+                }
+                let ip = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("is_private_ip expects String".into()),
+                };
+                Val::Bool(security::is_private_ip_str(ip))
+            }
+            "url_validate_public" => {
+                if a.is_empty() || a.len() > 2 {
+                    return Err("url_validate_public expects (url[, allow_http])".into());
+                }
+                let url = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("url must be String".into()),
+                };
+                let allow_http = a.get(1).is_none_or(Val::truthy);
+                match security::validate_public_url(url, allow_http) {
+                    Ok(v) => Val::Map(vec![
+                        (Val::Str("ok".into()), Val::Bool(true)),
+                        (Val::Str("scheme".into()), Val::Str(v.scheme)),
+                        (Val::Str("host".into()), Val::Str(v.host)),
+                        (Val::Str("port".into()), Val::Num(f64::from(v.port))),
+                        (Val::Str("origin".into()), Val::Str(v.origin)),
+                        (Val::Str("url".into()), Val::Str(v.url)),
+                    ]),
+                    Err(e) => Val::Map(vec![
+                        (Val::Str("ok".into()), Val::Bool(false)),
+                        (Val::Str("error".into()), Val::Str(e)),
+                    ]),
+                }
+            }
+            "url_resolve_public" => {
+                crate::runtime::require_cap("net")?;
+                if a.is_empty() || a.len() > 2 {
+                    return Err("url_resolve_public expects (url[, allow_http])".into());
+                }
+                let url = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("url must be String".into()),
+                };
+                let allow_http = a.get(1).is_none_or(Val::truthy);
+                match security::validate_public_url(url, allow_http)
+                    .and_then(|v| Ok((v.clone(), security::resolve_public_url_addrs(&v)?)))
+                {
+                    Ok((v, addrs)) => Val::Map(vec![
+                        (Val::Str("ok".into()), Val::Bool(true)),
+                        (Val::Str("origin".into()), Val::Str(v.origin)),
+                        (Val::Str("host".into()), Val::Str(v.host)),
+                        (Val::Str("port".into()), Val::Num(f64::from(v.port))),
+                        (
+                            Val::Str("ips".into()),
+                            Val::List(
+                                addrs
+                                    .into_iter()
+                                    .map(|sa| Val::Str(sa.ip().to_string()))
+                                    .collect(),
+                            ),
+                        ),
+                    ]),
+                    Err(e) => Val::Map(vec![
+                        (Val::Str("ok".into()), Val::Bool(false)),
+                        (Val::Str("error".into()), Val::Str(e)),
+                    ]),
+                }
             }
             "shell" => {
                 crate::runtime::require_cap("process")?;
@@ -220,24 +653,39 @@ impl Vm {
                     request = request.body(body);
                 }
                 let response = request.send().map_err(|e| e.to_string())?;
-                let status = response.status();
-                let header_pairs = response
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            Val::Str(k.as_str().to_string()),
-                            Val::Str(v.to_str().unwrap_or("").to_string()),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let body = response.text().map_err(|e| e.to_string())?;
-                Val::Map(vec![
-                    (Val::Str("status".into()), Val::Num(status.as_u16() as f64)),
-                    (Val::Str("ok".into()), Val::Bool(status.is_success())),
-                    (Val::Str("headers".into()), Val::Map(header_pairs)),
-                    (Val::Str("body".into()), Val::Str(body)),
-                ])
+                response_to_http_val(response, None)?
+            }
+            #[cfg(feature = "native-services")]
+            "http_request_safe" => {
+                crate::runtime::require_cap("net")?;
+                if a.len() != 5 && a.len() != 6 {
+                    return Err(
+                        "http_request_safe expects method,url,headers,body,timeout_ms[,opts]"
+                            .into(),
+                    );
+                }
+                let method_text = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("method must be String".into()),
+                };
+                let url = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("url must be String".into()),
+                };
+                let headers = match &a[2] {
+                    Val::Map(p) => p,
+                    _ => return Err("headers must be Map".into()),
+                };
+                let timeout = match a[4] {
+                    Val::Num(n) => n.max(1.0) as u64,
+                    _ => return Err("timeout_ms must be Number".into()),
+                };
+                let opts = match a.get(5) {
+                    Some(Val::Map(m)) => Some(m),
+                    Some(Val::Null) | None => None,
+                    _ => return Err("opts must be Map".into()),
+                };
+                execute_safe_http(method_text, url, headers, &a[3], timeout, opts)?
             }
             #[cfg(feature = "native-services")]
             "http_stream" => {
@@ -374,7 +822,7 @@ impl Vm {
                     Val::Str(s) => s,
                     _ => return Err("sql must be String".into()),
                 };
-                let conn = Connection::open(path).map_err(|e| e.to_string())?;
+                let conn = open_sqlite_conn(path)?;
                 let n = conn.execute(sql, []).map_err(|e| e.to_string())?;
                 Val::Num(n as f64)
             }
@@ -391,35 +839,8 @@ impl Vm {
                     Val::Str(s) => s,
                     _ => return Err("sql must be String".into()),
                 };
-                let conn = Connection::open(path).map_err(|e| e.to_string())?;
-                let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-                let names: Vec<String> =
-                    stmt.column_names().iter().map(|s| s.to_string()).collect();
-                let rows = stmt
-                    .query_map([], |row| {
-                        let mut pairs = Vec::new();
-                        for (i, name) in names.iter().enumerate() {
-                            let val = match row.get_ref(i)? {
-                                rusqlite::types::ValueRef::Null => Val::Null,
-                                rusqlite::types::ValueRef::Integer(x) => Val::Num(x as f64),
-                                rusqlite::types::ValueRef::Real(x) => Val::Num(x),
-                                rusqlite::types::ValueRef::Text(x) => {
-                                    Val::Str(String::from_utf8_lossy(x).to_string())
-                                }
-                                rusqlite::types::ValueRef::Blob(x) => {
-                                    Val::Str(format!("<{} bytes>", x.len()))
-                                }
-                            };
-                            pairs.push((Val::Str(name.clone()), val));
-                        }
-                        Ok(Val::Map(pairs))
-                    })
-                    .map_err(|e| e.to_string())?;
-                let mut out = Vec::new();
-                for row in rows {
-                    out.push(row.map_err(|e| e.to_string())?);
-                }
-                Val::List(out)
+                let conn = open_sqlite_conn(path)?;
+                Val::List(collect_sqlite_rows(&conn, sql, &[])?)
             }
             #[cfg(feature = "native-services")]
             "sqlite_exec_params" => {
@@ -440,7 +861,7 @@ impl Vm {
                 };
                 let values: Vec<rusqlite::types::Value> =
                     params.iter().map(val_to_sql_value).collect();
-                let conn = Connection::open(path).map_err(|e| e.to_string())?;
+                let conn = open_sqlite_conn(path)?;
                 let n = conn
                     .execute(sql, rusqlite::params_from_iter(values.iter()))
                     .map_err(|e| e.to_string())?;
@@ -465,35 +886,196 @@ impl Vm {
                 };
                 let values: Vec<rusqlite::types::Value> =
                     params.iter().map(val_to_sql_value).collect();
-                let conn = Connection::open(path).map_err(|e| e.to_string())?;
-                let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-                let names: Vec<String> =
-                    stmt.column_names().iter().map(|s| s.to_string()).collect();
-                let rows = stmt
-                    .query_map(rusqlite::params_from_iter(values.iter()), |row| {
-                        let mut pairs = Vec::new();
-                        for (i, name) in names.iter().enumerate() {
-                            let val = match row.get_ref(i)? {
-                                rusqlite::types::ValueRef::Null => Val::Null,
-                                rusqlite::types::ValueRef::Integer(x) => Val::Num(x as f64),
-                                rusqlite::types::ValueRef::Real(x) => Val::Num(x),
-                                rusqlite::types::ValueRef::Text(x) => {
-                                    Val::Str(String::from_utf8_lossy(x).to_string())
-                                }
-                                rusqlite::types::ValueRef::Blob(x) => {
-                                    Val::Str(format!("<{} bytes>", x.len()))
-                                }
-                            };
-                            pairs.push((Val::Str(name.clone()), val));
-                        }
-                        Ok(Val::Map(pairs))
-                    })
-                    .map_err(|e| e.to_string())?;
-                let mut out = Vec::new();
-                for row in rows {
-                    out.push(row.map_err(|e| e.to_string())?);
+                let conn = open_sqlite_conn(path)?;
+                Val::List(collect_sqlite_rows(&conn, sql, &values)?)
+            }
+            #[cfg(feature = "native-services")]
+            "sqlite_init_wal" => {
+                crate::runtime::require_cap("fs.write")?;
+                if a.len() != 1 {
+                    return Err("sqlite_init_wal expects path".into());
                 }
-                Val::List(out)
+                let path = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("path must be String".into()),
+                };
+                if let Some(parent) = Path::new(path).parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let conn = open_sqlite_conn(path)?;
+                let journal_mode: String = conn
+                    .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
+                    .map_err(|e| e.to_string())?;
+                conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")
+                    .map_err(|e| e.to_string())?;
+                Val::Map(vec![
+                    (Val::Str("ok".into()), Val::Bool(true)),
+                    (Val::Str("journal_mode".into()), Val::Str(journal_mode)),
+                    (Val::Str("foreign_keys".into()), Val::Bool(true)),
+                    (
+                        Val::Str("busy_timeout_ms".into()),
+                        Val::Num(SQLITE_BUSY_TIMEOUT_MS as f64),
+                    ),
+                ])
+            }
+            #[cfg(feature = "native-services")]
+            "sqlite_tx" => {
+                crate::runtime::require_cap("fs.write")?;
+                if a.len() != 2 {
+                    return Err("sqlite_tx expects (path, statements)".into());
+                }
+                let path = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("path must be String".into()),
+                };
+                let Val::List(items) = &a[1] else {
+                    return Err("sqlite_tx statements must be List".into());
+                };
+                let parsed: Vec<(String, Vec<rusqlite::types::Value>)> = items
+                    .iter()
+                    .map(parse_sqlite_tx_item)
+                    .collect::<Result<_, _>>()?;
+                let conn = open_sqlite_conn(path)?;
+                conn.execute_batch("BEGIN IMMEDIATE;")
+                    .map_err(|e| e.to_string())?;
+                let mut total_changes = 0usize;
+                for (sql, values) in &parsed {
+                    match conn.execute(sql, rusqlite::params_from_iter(values.iter())) {
+                        Ok(n) => total_changes += n,
+                        Err(e) => {
+                            let _ = conn.execute_batch("ROLLBACK;");
+                            return Err(format!("sqlite_tx rolled back: {e}"));
+                        }
+                    }
+                }
+                if let Err(e) = conn.execute_batch("COMMIT;") {
+                    let _ = conn.execute_batch("ROLLBACK;");
+                    return Err(format!("sqlite_tx commit failed: {e}"));
+                }
+                Val::Map(vec![
+                    (Val::Str("ok".into()), Val::Bool(true)),
+                    (Val::Str("changes".into()), Val::Num(total_changes as f64)),
+                    (Val::Str("statements".into()), Val::Num(parsed.len() as f64)),
+                ])
+            }
+            #[cfg(feature = "native-services")]
+            "sqlite_backup" => {
+                crate::runtime::require_cap("fs.read")?;
+                crate::runtime::require_cap("fs.write")?;
+                if a.len() != 2 {
+                    return Err("sqlite_backup expects (src_path, dst_path)".into());
+                }
+                let src_path = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("src_path must be String".into()),
+                };
+                let dst_path = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("dst_path must be String".into()),
+                };
+                if src_path == dst_path {
+                    return Err("sqlite_backup src_path and dst_path must differ".into());
+                }
+                if !Path::new(src_path).is_file() {
+                    return Err(format!("sqlite_backup source '{src_path}' not found"));
+                }
+                if let Some(parent) = Path::new(dst_path).parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let dst = PathBuf::from(dst_path);
+                let tmp_dst = PathBuf::from(format!("{dst_path}.tmp"));
+                let _ = fs::remove_file(&tmp_dst);
+                let src = open_sqlite_conn(src_path)?;
+                let _ = src.execute_batch("PRAGMA wal_checkpoint(FULL);");
+                let tmp_str = tmp_dst.to_string_lossy().to_string();
+                src.execute("VACUUM INTO ?1", rusqlite::params![tmp_str])
+                    .map_err(|e| {
+                        let _ = fs::remove_file(&tmp_dst);
+                        e.to_string()
+                    })?;
+                drop(src);
+                let verify_conn = Connection::open_with_flags(
+                    &tmp_dst,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .map_err(|e| {
+                    let _ = fs::remove_file(&tmp_dst);
+                    e.to_string()
+                })?;
+                let integrity: String = verify_conn
+                    .pragma_query_value(None, "integrity_check", |row| row.get(0))
+                    .map_err(|e| {
+                        let _ = fs::remove_file(&tmp_dst);
+                        e.to_string()
+                    })?;
+                drop(verify_conn);
+                let ok = integrity.eq_ignore_ascii_case("ok");
+                if !ok {
+                    let _ = fs::remove_file(&tmp_dst);
+                    return Err(format!("sqlite_backup integrity check failed: {integrity}"));
+                }
+                if dst.exists() {
+                    let _ = fs::remove_file(&dst);
+                }
+                fs::rename(&tmp_dst, &dst).map_err(|e| {
+                    let _ = fs::remove_file(&tmp_dst);
+                    e.to_string()
+                })?;
+                Val::Map(vec![
+                    (Val::Str("ok".into()), Val::Bool(true)),
+                    (Val::Str("source".into()), Val::Str(src_path.clone())),
+                    (Val::Str("backup".into()), Val::Str(dst_path.clone())),
+                    (Val::Str("integrity".into()), Val::Str(integrity)),
+                ])
+            }
+            #[cfg(feature = "native-services")]
+            "sqlite_verify" => {
+                crate::runtime::require_cap("fs.read")?;
+                if a.len() != 1 {
+                    return Err("sqlite_verify expects path".into());
+                }
+                let path = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("path must be String".into()),
+                };
+                if !Path::new(path).is_file() {
+                    return Err(format!("sqlite_verify file '{path}' not found"));
+                }
+                let conn = Connection::open_with_flags(
+                    path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )
+                .map_err(|e| e.to_string())?;
+                conn.busy_timeout(Duration::from_millis(SQLITE_BUSY_TIMEOUT_MS))
+                    .map_err(|e| e.to_string())?;
+                let mut ic_stmt = conn
+                    .prepare("PRAGMA integrity_check;")
+                    .map_err(|e| e.to_string())?;
+                let ic_msgs: Vec<String> = ic_stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?;
+                let integrity = if ic_msgs.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    ic_msgs.join("; ")
+                };
+                let fk_rows = collect_sqlite_rows(&conn, "PRAGMA foreign_key_check;", &[])?;
+                let fk_violations = fk_rows.len();
+                let ok = integrity.eq_ignore_ascii_case("ok") && fk_violations == 0;
+                Val::Map(vec![
+                    (Val::Str("ok".into()), Val::Bool(ok)),
+                    (Val::Str("integrity".into()), Val::Str(integrity)),
+                    (
+                        Val::Str("foreign_key_violations".into()),
+                        Val::Num(fk_violations as f64),
+                    ),
+                ])
             }
             "spawn" => {
                 if a.len() != 2 {

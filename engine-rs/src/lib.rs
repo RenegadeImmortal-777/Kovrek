@@ -43,6 +43,7 @@ mod project;
 mod py_bridge;
 mod registry;
 mod runtime;
+mod security;
 mod server;
 mod sim_actor;
 mod spirv;
@@ -6904,5 +6905,282 @@ assert(s["ok"]);
         } else {
             panic!("expected memo widget");
         }
+    }
+
+    #[test]
+    fn helm_security_crypto_totp_ssrf_and_html_builtins() {
+        let src = r##"
+let h1 = random_bytes_hex(16);
+let h2 = random_bytes_hex(16);
+assert(len(h1) == 32 and len(h2) == 32 and h1 != h2);
+let tok = random_token(24);
+assert(len(tok) >= 32);
+
+let escaped = html_escape("<script>alert('xss')</script> & \"q\"");
+assert(escaped == "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt; &amp; &quot;q&quot;");
+
+let b32 = base32_encode("12345678901234567890");
+assert(base32_decode(b32) == "12345678901234567890");
+let code = totp_code(b32, 59);
+assert(code == "287082");
+assert(totp_verify(b32, code, 1, 60));
+assert(not totp_verify(b32, "000000", 1, 60));
+let gen_sec = totp_secret();
+assert(len(gen_sec) == 32);
+assert(totp_verify(gen_sec, totp_code(gen_sec), 1));
+
+let sealed = aes_gcm_encrypt("master-key-123", "top-secret-payload", "mfa");
+assert(aes_gcm_decrypt("master-key-123", sealed, "mfa") == "top-secret-payload");
+let bad_key = false;
+try { aes_gcm_decrypt("wrong-key", sealed, "mfa"); } catch err { bad_key = true; }
+assert(bad_key);
+let bad_aad = false;
+try { aes_gcm_decrypt("master-key-123", sealed, "other"); } catch err { bad_aad = true; }
+assert(bad_aad);
+
+assert(is_private_ip("127.0.0.1"));
+assert(is_private_ip("169.254.169.254"));
+assert(is_private_ip("10.0.0.8"));
+assert(is_private_ip("::1"));
+assert(is_private_ip("[::ffff:192.168.1.5]"));
+assert(not is_private_ip("8.8.8.8"));
+
+assert(not url_validate_public("http://localhost:8080/hook", true)["ok"]);
+assert(not url_validate_public("https://u:p@example.com/hook", true)["ok"]);
+assert(not url_validate_public("http://0x7f000001/admin", true)["ok"]);
+assert(not url_validate_public("http://0177.0.0.1/admin", true)["ok"]);
+assert(not url_validate_public("http://example.com/hook", false)["ok"]);
+let pub_ok = url_validate_public("https://example.com/webhooks", false);
+assert(pub_ok["ok"] and pub_ok["origin"] == "https://example.com");
+"##;
+        run_source(src).expect("security builtins should succeed");
+    }
+
+    #[cfg(feature = "native-services")]
+    #[test]
+    fn helm_sqlite_wal_atomic_tx_backup_and_verify() {
+        let dir = env::temp_dir().join(format!("kovrek_helm_sqlite_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("app.sqlite");
+        let bak = dir.join("backups").join("app-backup.sqlite");
+        let db_esc = db.to_string_lossy().replace('\\', "\\\\");
+        let bak_esc = bak.to_string_lossy().replace('\\', "\\\\");
+
+        let src = format!(
+            r##"
+let wal = sqlite_init_wal("{db_esc}");
+assert(wal["ok"] and lower(wal["journal_mode"]) == "wal" and wal["foreign_keys"]);
+
+sqlite_tx("{db_esc}", [
+    "CREATE TABLE accounts (id INTEGER PRIMARY KEY, owner TEXT NOT NULL)",
+    "CREATE TABLE entries (id INTEGER PRIMARY KEY, acct_id INTEGER NOT NULL REFERENCES accounts(id), amount REAL NOT NULL)",
+    ["INSERT INTO accounts(id, owner) VALUES (?, ?)", [1, "alice"]],
+    ["INSERT INTO entries(id, acct_id, amount) VALUES (?, ?, ?)", [10, 1, 42.5]]
+]);
+
+let rolled_back = false;
+try {{
+    sqlite_tx("{db_esc}", [
+        ["INSERT INTO accounts(id, owner) VALUES (?, ?)", [2, "bob"]],
+        ["INSERT INTO entries(id, acct_id, amount) VALUES (?, ?, ?)", [11, 999, 99.0]]
+    ]);
+}} catch err {{
+    rolled_back = true;
+}}
+assert(rolled_back);
+let accts = sqlite_query("{db_esc}", "SELECT id, owner FROM accounts ORDER BY id");
+assert(len(accts) == 1 and accts[0]["owner"] == "alice");
+
+let b = sqlite_backup("{db_esc}", "{bak_esc}");
+assert(b["ok"] and lower(b["integrity"]) == "ok");
+let v = sqlite_verify("{bak_esc}");
+assert(v["ok"] and lower(v["integrity"]) == "ok" and v["foreign_key_violations"] == 0);
+let brovs = sqlite_query("{bak_esc}", "SELECT amount FROM entries WHERE id = 10");
+assert(len(brovs) == 1 and brovs[0]["amount"] == 42.5);
+"##
+        );
+        run_source(&src).expect("sqlite WAL/tx/backup/verify should succeed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "native-services")]
+    #[test]
+    fn helm_http_server_hardening_headers_413_ssrf_and_fail_closed_json() {
+        let session = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::server::NotebookSession::new(None),
+        ));
+        let (st, _ct, body) = crate::server::handle_notebook_api_request(
+            &session,
+            "POST",
+            "/api/notebook/run",
+            "{bad-json",
+        );
+        assert_eq!(st, 400);
+        assert!(body.contains("invalid JSON"));
+
+        let src = r##"
+let pad = "a";
+let i = 0;
+while i < 12 {
+    pad = pad + pad;
+    i = i + 1;
+}
+
+let s = app_serve(fn(req) {
+    return {"ok": true, "path": req["path"], "len": len(req["body"])};
+}, {
+    "port": 0,
+    "workers": 2,
+    "max_requests": 2,
+    "max_body_bytes": 1024,
+    "on_ready": fn(port) {
+        let base = "http://127.0.0.1:" + str(port);
+        let resp = http_request("GET", base + "/health", {}, null, 3000);
+        assert(resp["status"] == 200);
+        assert(get(resp["headers"], "x-content-type-options") == "nosniff");
+        assert(get(resp["headers"], "x-frame-options") == "DENY");
+        assert(get(resp["headers"], "referrer-policy") == "no-referrer");
+
+        let big = http_request("POST", base + "/upload", {}, pad, 3000);
+        assert(big["status"] == 413);
+
+        let ssrf_blocked = false;
+        try {
+            http_request_safe("GET", base + "/health", {}, null, 3000);
+        } catch err {
+            ssrf_blocked = contains(err, "blocked");
+        }
+        assert(ssrf_blocked);
+    }
+});
+assert(s["ok"]);
+
+let d = desktop_app({
+    "title": "Hardening Test",
+    "html": "<html><body>Hi</body></html>",
+    "headless": true,
+    "max_requests": 1,
+    "on_ready": fn(info) {
+        let bad = http_request("POST", info["url"] + "__kovrek/invoke", {"Content-Type": "application/json"}, "{not-valid-json", 3000);
+        assert(bad["status"] == 400);
+        assert(get(bad["headers"], "x-content-type-options") == "nosniff");
+    }
+}, fn(req) { return {"ok": true}; });
+assert(d["ok"]);
+"##;
+        run_source(src).expect("HTTP server hardening and SSRF block should succeed");
+    }
+
+    #[test]
+    fn helm_upgraded_packages_compile_and_execute_cleanly() {
+        let pkgs_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("packages");
+        let sec_src = fs::read_to_string(pkgs_root.join("kvsecurity/kvsecurity.kvr")).unwrap();
+        let auth_src = fs::read_to_string(pkgs_root.join("kvauth/kvauth.kvr")).unwrap();
+        let web_src = fs::read_to_string(pkgs_root.join("kvweb/kvweb.kvr")).unwrap();
+
+        let test_src = format!(
+            r##"
+{sec_src}
+let e0 = chain_entry("0000000000000000000000000000000000000000000000000000000000000000", "admin", "login", "usr:1", {{"ip": "10.0.0.1"}}, 100);
+let e1 = chain_entry(e0["hash"], "admin", "grant", "key:1", {{"scope": "read"}}, 101);
+assert(verify_chain([e0, e1])["ok"]);
+let tampered = chain_entry(e0["hash"], "mallory", "grant", "key:1", {{"scope": "admin"}}, 101);
+tampered["hash"] = e1["hash"];
+assert(not verify_chain([e0, tampered])["ok"]);
+let sealed = encrypt_secret("k1", "v1");
+assert(decrypt_secret("k1", sealed) == "v1");
+"##
+        );
+        run_source(&test_src).expect("kvsecurity upgrade should execute cleanly");
+
+        let auth_test = format!(
+            r##"
+{auth_src}
+let mfa_sec = generate_totp_secret();
+assert(verify_totp(mfa_sec, totp_now(mfa_sec), 1));
+let rec = generate_recovery_codes(3);
+assert(len(rec["codes"]) == 3 and len(rec["hashes"]) == 3);
+let c1 = consume_recovery_code(rec["codes"][0], rec["hashes"]);
+assert(c1["ok"] and len(c1["remaining_hashes"]) == 2);
+let c2 = consume_recovery_code(rec["codes"][0], c1["remaining_hashes"]);
+assert(not c2["ok"]);
+let csrf = csrf_token("s", "sess1", "post:/x");
+assert(verify_csrf_token("s", "sess1", "post:/x", csrf));
+assert(not verify_csrf_token("s", "sess2", "post:/x", csrf));
+assert(has_scope(["read", "write"], "read") and not has_scope(["read"], "admin"));
+let enc_sec = encrypt_mfa_secret("master", mfa_sec);
+assert(decrypt_mfa_secret("master", enc_sec) == mfa_sec);
+"##
+        );
+        run_source(&auth_test).expect("kvauth upgrade should execute cleanly");
+
+        let web_test = format!(
+            r##"
+{web_src}
+assert(heading("<img src=x onerror=alert(1)>") == "<h1>&lt;img src=x onerror=alert(1)&gt;</h1>");
+assert(paragraph("a & b") == "<p>a &amp; b</p>");
+assert(link("javascript:alert(1)", "<b>bad</b>") == "<a href=\"#\">&lt;b&gt;bad&lt;/b&gt;</a>");
+assert(link("https://kovrek.dev/?a=1&b=2", "home") == "<a href=\"https://kovrek.dev/?a=1&amp;b=2\">home</a>");
+let hdrs = html_security_headers();
+assert(hdrs["X-Frame-Options"] == "DENY" and contains(hdrs["Content-Security-Policy"], "frame-ancestors 'none'"));
+assert(is_cross_site({{"headers": {{"Sec-Fetch-Site": "cross-site"}}}}));
+assert(not is_cross_site({{"headers": {{"Sec-Fetch-Site": "same-origin", "Origin": "https://app.test", "Host": "app.test"}}}}));
+assert(client_ip({{"headers": {{"X-Forwarded-For": "203.0.113.5, 10.0.0.2"}}}}, ["10.0.0.2"], "10.0.0.2") == "203.0.113.5");
+assert(client_ip({{"headers": {{"X-Forwarded-For": "203.0.113.5"}}}}, ["10.0.0.2"], "198.51.100.9") == "198.51.100.9");
+"##
+        );
+        run_source(&web_test).expect("kvweb upgrade should execute cleanly");
+    }
+
+    #[cfg(feature = "native-services")]
+    #[test]
+    fn helm_upgraded_native_packages_contract() {
+        let pkgs_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("packages");
+        let sq_src = fs::read_to_string(pkgs_root.join("kvsqlite/kvsqlite.kvr")).unwrap();
+        let http_src = fs::read_to_string(pkgs_root.join("kvhttp/kvhttp.kvr")).unwrap();
+
+        let dir = env::temp_dir().join(format!("kovrek_native_pkg_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("store.sqlite");
+        let bak = dir.join("store.bak.sqlite");
+        let db_esc = db.to_string_lossy().replace('\\', "\\\\");
+        let bak_esc = bak.to_string_lossy().replace('\\', "\\\\");
+
+        let sq_test = format!(
+            r##"
+{sq_src}
+let w = init_wal("{db_esc}");
+assert(w["ok"]);
+tx("{db_esc}", ["CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)", ["INSERT INTO kv(k, v) VALUES (?, ?)", ["mode", "helm"]]]);
+let b = backup("{db_esc}", "{bak_esc}");
+assert(b["ok"]);
+let v = verify("{bak_esc}");
+assert(v["ok"]);
+"##
+        );
+        run_source(&sq_test).expect("kvsqlite upgrade should execute cleanly");
+
+        let http_test = format!(
+            r##"
+{http_src}
+let v_bad = validate_url("http://127.0.0.1/internal", true);
+assert(not v_bad["ok"]);
+let v_ok = validate_url("https://example.com/hook", false);
+assert(v_ok["ok"]);
+let sig = sign_webhook("whsec_test", "1700000000", "{{\"ev\":\"ok\"}}");
+assert(verify_webhook("whsec_test", "1700000000", "{{\"ev\":\"ok\"}}", sig));
+assert(not verify_webhook("whsec_wrong", "1700000000", "{{\"ev\":\"ok\"}}", sig));
+"##
+        );
+        run_source(&http_test).expect("kvhttp upgrade should execute cleanly");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
