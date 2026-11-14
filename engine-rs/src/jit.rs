@@ -2286,6 +2286,38 @@ pub(crate) fn alloc_executable(bytes: &[u8]) -> Result<ExecMem, String> {
         fn munmap(addr: *mut core::ffi::c_void, len: usize) -> i32;
     }
     let size = bytes.len().max(4096);
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        const MAP_JIT: i32 = 0x0800;
+        unsafe extern "C" {
+            fn pthread_jit_write_protect_np(enabled: i32);
+            fn sys_icache_invalidate(start: *mut core::ffi::c_void, len: usize);
+        }
+        let jit_ptr = unsafe {
+            mmap(
+                core::ptr::null_mut(),
+                size,
+                PROT_READ | PROT_WRITE | PROT_EXEC,
+                MAP_PRIVATE | MAP_ANON | MAP_JIT,
+                -1,
+                0,
+            )
+        };
+        if !jit_ptr.is_null() && jit_ptr as isize != -1 {
+            unsafe {
+                pthread_jit_write_protect_np(0);
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), jit_ptr as *mut u8, bytes.len());
+                pthread_jit_write_protect_np(1);
+                sys_icache_invalidate(jit_ptr, bytes.len());
+            }
+            return Ok(ExecMem {
+                ptr: jit_ptr as *mut u8,
+                size,
+            });
+        }
+    }
+
     let ptr = unsafe {
         mmap(
             core::ptr::null_mut(),
@@ -2308,7 +2340,16 @@ pub(crate) fn alloc_executable(bytes: &[u8]) -> Result<ExecMem, String> {
         }
         return Err("mprotect(PROT_EXEC) failed".into());
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        unsafe extern "C" {
+            fn sys_icache_invalidate(start: *mut core::ffi::c_void, len: usize);
+        }
+        unsafe {
+            sys_icache_invalidate(ptr, bytes.len());
+        }
+    }
+    #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
     {
         unsafe extern "C" {
             fn __clear_cache(start: *mut core::ffi::c_void, end: *mut core::ffi::c_void);

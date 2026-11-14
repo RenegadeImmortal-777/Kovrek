@@ -1496,6 +1496,107 @@ pub(crate) fn ffi_call(
     let mut sym_bytes = sym.into_bytes_with_nul();
     sym_bytes.shrink_to_fit();
 
+    #[cfg(target_arch = "aarch64")]
+    fn invoke_aarch64_c_abi_dynamic(
+        fn_ptr: usize,
+        ret_ty: CAbiType,
+        cargs: &[CArg],
+    ) -> Result<Val, String> {
+        let mut gp = [0u64; 8];
+        let mut fp = [0.0f64; 8];
+        let mut gp_idx = 0usize;
+        let mut fp_idx = 0usize;
+
+        let mut push_gp = |val: u64| -> Result<(), String> {
+            if gp_idx >= gp.len() {
+                return Err("ffi_call aarch64: >8 integer/pointer arguments not supported".into());
+            }
+            gp[gp_idx] = val;
+            gp_idx += 1;
+            Ok(())
+        };
+        let mut push_fp = |val: f64| -> Result<(), String> {
+            if fp_idx >= fp.len() {
+                return Err("ffi_call aarch64: >8 float/double arguments not supported".into());
+            }
+            fp[fp_idx] = val;
+            fp_idx += 1;
+            Ok(())
+        };
+
+        for arg in cargs {
+            match arg {
+                CArg::I32(v) => push_gp((*v as i64) as u64)?,
+                CArg::U32(v) => push_gp(*v as u64)?,
+                CArg::I64(v) => push_gp(*v as u64)?,
+                CArg::U64(v) => push_gp(*v)?,
+                CArg::Bool(b) => push_gp(u64::from(*b))?,
+                CArg::CStr(s) => push_gp((s.as_ptr() as usize) as u64)?,
+                CArg::Ptr(p) => push_gp((*p as usize) as u64)?,
+                // AAPCS64 passes f32 in low 32 bits of the D/S register.
+                CArg::F32(v) => push_fp(f64::from_bits(v.to_bits() as u64))?,
+                CArg::F64(v) => push_fp(*v)?,
+            }
+        }
+
+        macro_rules! call_aarch64 {
+            ($ret:ty) => {{
+                type FnTy = unsafe extern "C" fn(
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    u64,
+                    f64,
+                    f64,
+                    f64,
+                    f64,
+                    f64,
+                    f64,
+                    f64,
+                    f64,
+                ) -> $ret;
+                let f: FnTy = unsafe { std::mem::transmute::<usize, FnTy>(fn_ptr) };
+                unsafe {
+                    f(
+                        gp[0], gp[1], gp[2], gp[3], gp[4], gp[5], gp[6], gp[7], fp[0], fp[1],
+                        fp[2], fp[3], fp[4], fp[5], fp[6], fp[7],
+                    )
+                }
+            }};
+        }
+
+        Ok(match ret_ty {
+            CAbiType::Void => {
+                call_aarch64!(());
+                Val::Null
+            }
+            CAbiType::I32 => Val::Num((call_aarch64!(i32)) as f64),
+            CAbiType::U32 => Val::Num((call_aarch64!(u32)) as f64),
+            CAbiType::I64 => Val::Num((call_aarch64!(i64)) as f64),
+            CAbiType::U64 => Val::Num((call_aarch64!(u64)) as f64),
+            CAbiType::F32 => Val::Num((call_aarch64!(f32)) as f64),
+            CAbiType::F64 => Val::Num(call_aarch64!(f64)),
+            CAbiType::Bool => Val::Bool(call_aarch64!(bool)),
+            CAbiType::Ptr => Val::Num((call_aarch64!(*mut core::ffi::c_void) as usize) as f64),
+            CAbiType::CStr => {
+                let ptr = call_aarch64!(*const c_char);
+                if ptr.is_null() {
+                    Val::Null
+                } else {
+                    Val::Str(
+                        unsafe { CStr::from_ptr(ptr) }
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                }
+            }
+        })
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
         let raw_sym: Symbol<unsafe extern "C" fn()> =
@@ -1504,7 +1605,15 @@ pub(crate) fn ffi_call(
         invoke_c_abi_dynamic(fn_ptr, ret_ty, &param_tys, &cargs)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        let raw_sym: Symbol<unsafe extern "C" fn()> =
+            unsafe { lib.get(&sym_bytes) }.map_err(|e| e.to_string())?;
+        let fn_ptr = (*raw_sym) as usize;
+        invoke_aarch64_c_abi_dynamic(fn_ptr, ret_ty, &cargs)
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     unsafe {
         match (ret_ty, param_tys.as_slice()) {
             (CAbiType::Void, []) => {

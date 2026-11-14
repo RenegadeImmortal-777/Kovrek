@@ -3391,10 +3391,10 @@ assert(kvdecimal.format(kvdecimal.mul(kvdecimal.from_str("1.25", 2), kvdecimal.f
         )
         .unwrap();
 
-        // Normalize cfg_is_x64() without inventing a builtin!
+        // Normalize JIT availability flag for host architecture without inventing a builtin.
         let code = fs::read_to_string(&main_kvr).unwrap().replace(
             "cfg_is_x64()",
-            if cfg!(target_arch = "x86_64") {
+            if crate::jit::jit_available() {
                 "true"
             } else {
                 "false"
