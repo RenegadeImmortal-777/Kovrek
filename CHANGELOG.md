@@ -1,9 +1,9 @@
 # Changelog
 
 Consolidated release history for Kovrek, distilled from the milestone documents that
-previously each lived in their own root-level file. Those files are retained for
-provenance and are marked historical. Previously developed under the working name
-*Veyra* prior to the 12.0 Sovereign Kovrek (`.kvr`, `.kvbc`) rebrand.
+previously each lived in their own root-level file (archived under [`docs/archive/`](docs/archive/)).
+Those files are retained for provenance and are marked historical. Previously developed under the
+working name *Veyra* prior to the 12.0 Sovereign Kovrek (`.kvr`, `.kvbc`) rebrand.
 
 Two execution paths exist in this repository and are tracked separately below:
 
@@ -21,7 +21,10 @@ release date in the source material; earlier entries are undated.
 ## 12.0 Sovereign
 
 Self-hosting, language parity, compiler optimization, tensor broadcasting, and full-stack Sovereign Apex release.
-Release gate verified **2026-11-14** (**130/130** unit tests, **74/74** packages, **8/8** release gates).
+Release gate verified **2026-11-14** (**144/144** unit tests, **77/77** packages, **8/8** release gates).
+
+- **Licensing, Onboarding, Benchmarks & Cross-Platform CI (`LICENSE`, `install.sh`, `install.ps1`, `benchmarks/`, `py_bridge.rs`)**:
+  Added MIT `LICENSE` and `Cargo.toml` crate metadata, one-line Windows/Linux/macOS installers (`install.ps1`, `install.sh`), architecture hero banner (`docs/assets/kovrek-banner.svg`), archived legacy `STATUS-*.md` / `PYTHON-*.md` records under `docs/archive/`, added reproducible VM/Tensor/Verify/AOT benchmarks (`benchmarks/`), updated Rust `1.100` Clippy compatibility (`as_chunks`) and multi-candidate Unix `libpython` shared library probing, and guarded optional `numpy`/`torch` C-API tests on clean CI runners.
 
 - **GPU Tiled/Attention Kernels & Low-Precision Dtypes (`spirv.rs`, `gpu.rs`, `tensor.rs`, `builtins/science_ml.rs`)**:
   - Added workgroup shared-memory tiled GEMM, Flash-style causal online-softmax attention, and fused Residual+LayerNorm+activation pipelines across SPIR-V, HLSL `cs_5_0`, and CPU fallback (`gpu_kernel_inspect`), plus IEEE-754 `f16`/`bf16` dtype casting.

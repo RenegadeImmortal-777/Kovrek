@@ -38,7 +38,7 @@ pub(crate) fn hex_to_bytes(s: &str) -> Result<Vec<u8>, String> {
     }
     let mut out = Vec::with_capacity(trimmed.len() / 2);
     let raw = trimmed.as_bytes();
-    for pair in raw.chunks_exact(2) {
+    for &pair in raw.as_chunks::<2>().0 {
         let hi = (pair[0] as char)
             .to_digit(16)
             .ok_or_else(|| "invalid hex character".to_string())?;
@@ -155,7 +155,7 @@ pub(crate) fn sha1_digest(data: &[u8]) -> [u8; 20] {
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
     let mut w = [0u32; 80];
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         for i in 0..16 {
             let off = i * 4;
             w[i] = u32::from_be_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);

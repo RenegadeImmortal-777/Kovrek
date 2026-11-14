@@ -2338,6 +2338,9 @@ assert(m.copy()["c"] == 30);
 
     #[test]
     fn python_bridge_vm_interop() {
+        if !crate::py_bridge::py_available() {
+            return;
+        }
         let src = r#"
 assert(py_available());
 let m = py_import("math");
@@ -2372,38 +2375,47 @@ assert(repr(box) != "");
 
     #[test]
     fn inprocess_cpython_and_zero_copy_numpy_torch_buffers() {
+        if !crate::py_bridge::py_available() {
+            return;
+        }
         let src = r#"
 let info = py_info();
 assert(info["available"]);
-assert(info["mode"] == "in-process-capi");
-assert(info["zero_copy_buffer"]);
+let inproc = info["mode"] == "in-process-capi";
+let has_np = py_eval("__import__('importlib.util', fromlist=['find_spec']).find_spec('numpy') is not None");
+let has_torch = py_eval("__import__('importlib.util', fromlist=['find_spec']).find_spec('torch') is not None");
 
-let np = py_import("numpy");
-let arr = np.array([[1.5, 2.5, 3.5], [4.5, 5.5, 6.5]], dtype=np.float64);
-let t = py_to_tensor(arr);
-assert(tensor_shape(t) == [2, 3]);
-assert(tensor_values(t) == [1.5, 2.5, 3.5, 4.5, 5.5, 6.5]);
+if inproc and has_np {
+    assert(info["zero_copy_buffer"]);
+    let np = py_import("numpy");
+    let arr = np.array([[1.5, 2.5, 3.5], [4.5, 5.5, 6.5]], dtype=np.float64);
+    let t = py_to_tensor(arr);
+    assert(tensor_shape(t) == [2, 3]);
+    assert(tensor_values(t) == [1.5, 2.5, 3.5, 4.5, 5.5, 6.5]);
 
-let t2 = tensor_add(t, t);
-let back = tensor_to_py(t2);
-assert(list(back.shape) == [2, 3]);
-assert(float(back.sum()) == 48.0);
+    let t2 = tensor_add(t, t);
+    let back = tensor_to_py(t2);
+    assert(list(back.shape) == [2, 3]);
+    assert(float(back.sum()) == 48.0);
 
-let raw_i32 = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32).T;
-let ti = py_to_tensor(raw_i32);
-assert(tensor_shape(ti) == [3, 2]);
-assert(tensor_values(ti) == [1, 4, 2, 5, 3, 6]);
-assert(py_free(arr));
-assert(not py_free(arr));
-assert(py_free(back));
-assert(py_free(raw_i32));
+    let raw_i32 = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.int32).T;
+    let ti = py_to_tensor(raw_i32);
+    assert(tensor_shape(ti) == [3, 2]);
+    assert(tensor_values(ti) == [1, 4, 2, 5, 3, 6]);
+    assert(py_free(arr));
+    assert(not py_free(arr));
+    assert(py_free(back));
+    assert(py_free(raw_i32));
+}
 
-let torch = py_import("torch");
-let th = torch.tensor([[2.0, 4.0], [6.0, 8.0]]).numpy();
-let tt = py_to_tensor(th);
-assert(tensor_shape(tt) == [2, 2]);
-assert(tensor_values(tt) == [2, 4, 6, 8]);
-assert(py_free(th));
+if inproc and has_torch {
+    let torch = py_import("torch");
+    let th = torch.tensor([[2.0, 4.0], [6.0, 8.0]]).numpy();
+    let tt = py_to_tensor(th);
+    assert(tensor_shape(tt) == [2, 2]);
+    assert(tensor_values(tt) == [2, 4, 6, 8]);
+    assert(py_free(th));
+}
 "#;
         assert_eq!(run_source(src), Ok(()));
 

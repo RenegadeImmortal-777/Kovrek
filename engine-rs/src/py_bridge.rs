@@ -327,15 +327,30 @@ unsafe fn load_data_ptr(lib: &Library, sym: &[u8]) -> Result<*mut PyObject, Stri
     Ok(*s)
 }
 
-fn discover_python_dll() -> Option<(PathBuf, Vec<PathBuf>)> {
+fn is_static_archive(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("a") || ext.eq_ignore_ascii_case("lib"))
+}
+
+fn push_dll_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf, require_file: bool) {
+    if path.as_os_str().is_empty() || is_static_archive(&path) {
+        return;
+    }
+    if require_file && !path.is_file() {
+        return;
+    }
+    if !candidates.contains(&path) {
+        candidates.push(path);
+    }
+}
+
+fn discover_python_dll() -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut dll_candidates: Vec<PathBuf> = Vec::new();
     let mut site_paths: Vec<PathBuf> = Vec::new();
 
     if let Ok(explicit) = env::var("KOVREK_PYTHON_DLL") {
-        let p = PathBuf::from(explicit);
-        if p.is_file() {
-            dll_candidates.push(p);
-        }
+        push_dll_candidate(&mut dll_candidates, PathBuf::from(explicit), true);
     }
 
     if let Ok(cwd) = env::current_dir() {
@@ -352,17 +367,19 @@ fn discover_python_dll() -> Option<(PathBuf, Vec<PathBuf>)> {
     }
 
     if let Some((exe, prefix)) = detect_python() {
-        let probe = "import os, sys, sysconfig; print(sys.executable); print(sys.base_prefix); print(sysconfig.get_config_var('LIBDIR') or ''); print(sysconfig.get_config_var('LDLIBRARY') or ''); print(f'{sys.version_info.major}.{sys.version_info.minor}')";
+        let probe = "import sys, sysconfig; print(sys.executable); print(sys.base_prefix); print(sysconfig.get_config_var('LIBDIR') or ''); print(sysconfig.get_config_var('LDLIBRARY') or ''); print(sysconfig.get_config_var('INSTSONAME') or ''); print(f'{sys.version_info.major}.{sys.version_info.minor}'); print(sysconfig.get_config_var('MULTIARCH') or '')";
         if let Ok(out) = Command::new(exe).args(prefix).arg("-c").arg(probe).output() {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout);
                 let lines: Vec<&str> = text.lines().map(str::trim).collect();
-                if lines.len() >= 5 {
+                if lines.len() >= 7 {
                     let exe_dir = Path::new(lines[0]).parent().map(Path::to_path_buf);
                     let base_prefix = PathBuf::from(lines[1]);
                     let libdir = PathBuf::from(lines[2]);
                     let ldlib = lines[3];
-                    let majmin = lines[4];
+                    let instsoname = lines[4];
+                    let majmin = lines[5];
+                    let multiarch = lines[6];
                     let nodot = majmin.replace('.', "");
                     if cfg!(windows) {
                         for base in [
@@ -373,38 +390,60 @@ fn discover_python_dll() -> Option<(PathBuf, Vec<PathBuf>)> {
                         .into_iter()
                         .flatten()
                         {
-                            let p = base.join(format!("python{nodot}.dll"));
-                            if p.is_file() {
-                                dll_candidates.push(p);
-                            }
+                            push_dll_candidate(
+                                &mut dll_candidates,
+                                base.join(format!("python{nodot}.dll")),
+                                true,
+                            );
                         }
                     } else {
-                        if !ldlib.is_empty() {
+                        let mut search_dirs: Vec<PathBuf> = Vec::new();
+                        if !libdir.as_os_str().is_empty() {
+                            search_dirs.push(libdir.clone());
+                        }
+                        if !base_prefix.as_os_str().is_empty() {
+                            search_dirs.push(base_prefix.join("lib"));
+                        }
+                        if !multiarch.is_empty() {
                             if !libdir.as_os_str().is_empty() {
-                                let p = libdir.join(ldlib);
-                                if p.is_file() {
-                                    dll_candidates.push(p);
-                                }
+                                search_dirs.push(libdir.join(multiarch));
                             }
-                            let p2 = PathBuf::from(ldlib);
-                            if p2.is_file() {
-                                dll_candidates.push(p2);
-                            }
+                            search_dirs.push(PathBuf::from("/usr/lib").join(multiarch));
                         }
-                        let ext = if cfg!(target_os = "macos") {
-                            "dylib"
+
+                        for raw in [instsoname, ldlib] {
+                            if raw.is_empty() {
+                                continue;
+                            }
+                            for dir in &search_dirs {
+                                push_dll_candidate(&mut dll_candidates, dir.join(raw), true);
+                            }
+                            push_dll_candidate(&mut dll_candidates, PathBuf::from(raw), true);
+                        }
+
+                        let named_variants: Vec<String> = if cfg!(target_os = "macos") {
+                            if !base_prefix.as_os_str().is_empty() {
+                                push_dll_candidate(
+                                    &mut dll_candidates,
+                                    base_prefix.join("Python"),
+                                    true,
+                                );
+                            }
+                            vec![format!("libpython{majmin}.dylib")]
                         } else {
-                            "so"
+                            vec![
+                                format!("libpython{majmin}.so.1.0"),
+                                format!("libpython{majmin}.so.1"),
+                                format!("libpython{majmin}.so"),
+                            ]
                         };
-                        let named = format!("libpython{majmin}.{ext}");
-                        for dir in [libdir.as_path(), &base_prefix.join("lib")] {
-                            let p = dir.join(&named);
-                            if p.is_file() {
-                                dll_candidates.push(p);
+                        for named in &named_variants {
+                            for dir in &search_dirs {
+                                push_dll_candidate(&mut dll_candidates, dir.join(named), true);
                             }
                         }
-                        if cfg!(target_os = "linux") {
-                            dll_candidates.push(PathBuf::from(&named));
+                        for named in named_variants {
+                            push_dll_candidate(&mut dll_candidates, PathBuf::from(named), false);
                         }
                     }
                     let base_site = if cfg!(windows) {
@@ -423,10 +462,7 @@ fn discover_python_dll() -> Option<(PathBuf, Vec<PathBuf>)> {
         }
     }
 
-    dll_candidates
-        .into_iter()
-        .next()
-        .map(|dll| (dll, site_paths))
+    (dll_candidates, site_paths)
 }
 
 static PY_CAPI: OnceLock<Result<PyCapi, String>> = OnceLock::new();
@@ -507,9 +543,25 @@ impl PyCapi {
 
 impl PyCapiInner {
     fn try_init() -> Result<Self, String> {
-        let (dll_path, site_paths) = discover_python_dll().ok_or("shared libpython not found")?;
-        let lib = unsafe { Library::new(&dll_path) }
-            .map_err(|e| format!("failed to load {}: {e}", dll_path.display()))?;
+        let (dll_candidates, site_paths) = discover_python_dll();
+        if dll_candidates.is_empty() {
+            return Err("shared libpython not found".to_string());
+        }
+        let mut loaded: Option<(PathBuf, Library)> = None;
+        let mut last_err: Option<String> = None;
+        for candidate in dll_candidates {
+            match unsafe { Library::new(&candidate) } {
+                Ok(lib) => {
+                    loaded = Some((candidate, lib));
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(format!("failed to load {}: {e}", candidate.display()));
+                }
+            }
+        }
+        let (dll_path, lib) = loaded
+            .ok_or_else(|| last_err.unwrap_or_else(|| "shared libpython not found".to_string()))?;
 
         let init_ex: unsafe extern "C" fn(c_int) = unsafe { load_fn(&lib, b"Py_InitializeEx\0")? };
         let is_init: unsafe extern "C" fn() -> c_int =

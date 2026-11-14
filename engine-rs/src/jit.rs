@@ -2197,8 +2197,10 @@ pub(crate) fn debug_emit_aarch64(
     let root = planned.get(&root_key).ok_or("missing planned root")?;
     let bytes = compile_aarch64_code(&root.def, &root.plan, &slot_ptrs)?;
     Ok(bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect())
 }
 

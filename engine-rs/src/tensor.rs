@@ -826,7 +826,7 @@ pub(crate) fn tensor_backward(root: u64) -> Result<(), String> {
                 let total_cols: usize = col_lens.iter().sum();
                 let mut store = tensors().lock().map_err(|_| "tensor registry poisoned")?;
                 let mut col_offset = 0;
-                for (pid, parent_cols) in parents.into_iter().zip(col_lens.into_iter()) {
+                for (pid, parent_cols) in parents.into_iter().zip(col_lens) {
                     if let Some(t) = store.get_mut(&pid) {
                         if t.requires_grad {
                             for r in 0..rows {

@@ -4,6 +4,63 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Kovrek 12.0 "Sovereign" — Native Language, Prover, GPU & Fault Simulation</title>
+  <meta name="description" content="Single-binary Rust language and runtime with Python ergonomics, static @verify prover, SPIR-V/HLSL GPU kernels, deterministic crash-safe actors, 77 verified packages, and AOT native/Wasm compilation." />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Kovrek 12.0 &quot;Sovereign&quot; — Python Ergonomics, Single Native Binary" />
+  <meta property="og:description" content="Static @verify formal contracts, Vulkan SPIR-V & D3D11 HLSL GPU kernels, deterministic crash-safe actors, and zero-toolchain native/Wasm AOT." />
+  <meta property="og:url" content="https://renegadeimmortal-777.github.io/Kovrek/" />
+  <meta property="og:image" content="https://raw.githubusercontent.com/RenegadeImmortal-777/Kovrek/master/docs/assets/kovrek-banner.svg" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Kovrek 12.0 &quot;Sovereign&quot;" />
+  <meta name="twitter:description" content="Python ergonomics in a single MIT-licensed native binary with static @verify prover, SPIR-V/HLSL GPU compute, and deterministic crash-safe actors." />
+  <meta name="twitter:image" content="https://raw.githubusercontent.com/RenegadeImmortal-777/Kovrek/master/docs/assets/kovrek-banner.svg" />
+  <style>
+    .install-wrap {
+      max-width: 780px;
+      margin: 1.5rem auto 0;
+      text-align: left;
+      background: rgba(17, 24, 39, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 0.9rem 1rem;
+    }
+    .install-tabs {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 0.55rem;
+      flex-wrap: wrap;
+    }
+    .install-tab-group { display: flex; gap: 0.45rem; }
+    .install-tab, .copy-btn {
+      background: #1f2937;
+      color: var(--text);
+      border: 1px solid #374151;
+      border-radius: 7px;
+      padding: 0.3rem 0.7rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .install-tab.active {
+      background: rgba(56, 189, 248, 0.16);
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .install-cmd {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.86rem;
+      color: #6ee7b7;
+      background: #070b14;
+      border: 1px solid #1f2937;
+      border-radius: 8px;
+      padding: 0.65rem 0.85rem;
+      overflow-x: auto;
+      white-space: nowrap;
+      margin: 0;
+    }
+  </style>
   <style>
     :root {
       --bg: #0b0f19;
@@ -173,7 +230,7 @@
 </head>
 <body>
   <header>
-    <div class="badge">Kovrek 12.0 "Sovereign" • 130/130 Tests • 74/74 Packages • 8/8 Gates</div>
+    <div class="badge">Kovrek 12.0 "Sovereign" • 144/144 Tests • 77/77 Packages • 8/8 Gates • MIT</div>
     <h1>Python Ergonomics.<br/>One Native Full-Stack Language.</h1>
     <p class="subtitle">
       An 8.8 MB zero-dependency native runtime uniting Python-grade syntax, a 3-stage self-hosted compiler,
@@ -181,14 +238,24 @@
       Vulkan <code>SPIR-V</code> &amp; <code>HLSL</code> FlashAttention/tiled GPU compute, crash-safe deterministic actors,
       and Wasm/PE32+/ELF64 AOT.
     </p>
+    <div class="install-wrap">
+      <div class="install-tabs">
+        <div class="install-tab-group">
+          <button class="install-tab active" id="tab-unix" onclick="selectInstall('unix')">Linux / macOS</button>
+          <button class="install-tab" id="tab-win" onclick="selectInstall('win')">Windows (PowerShell)</button>
+        </div>
+        <button class="copy-btn" id="copy-install-btn" onclick="copyInstall()">Copy Command</button>
+      </div>
+      <pre class="install-cmd" id="install-cmd">curl -fsSL https://raw.githubusercontent.com/RenegadeImmortal-777/Kovrek/master/install.sh | bash</pre>
+    </div>
     <div class="cta-row">
-      <a class="btn btn-primary" href="https://github.com/RenegadeImmortal-777/Kovrek/releases/download/v12.0.1-kovrek/kovrek-native-windows-x86_64.exe">
+      <a class="btn btn-primary" href="https://github.com/RenegadeImmortal-777/Kovrek/releases/latest/download/kovrek-native-windows-x86_64.exe">
         Download Windows (x64)
       </a>
-      <a class="btn btn-secondary" href="https://github.com/RenegadeImmortal-777/Kovrek/releases/download/v12.0.1-kovrek/kovrek-native-linux-x86_64">
+      <a class="btn btn-secondary" href="https://github.com/RenegadeImmortal-777/Kovrek/releases/latest/download/kovrek-native-linux-x86_64">
         Linux (x64)
       </a>
-      <a class="btn btn-secondary" href="https://github.com/RenegadeImmortal-777/Kovrek/releases/download/v12.0.1-kovrek/kovrek-native-macos-arm64">
+      <a class="btn btn-secondary" href="https://github.com/RenegadeImmortal-777/Kovrek/releases/latest/download/kovrek-native-macos-arm64">
         macOS (arm64)
       </a>
       <a class="btn btn-secondary" href="https://github.com/RenegadeImmortal-777/Kovrek">
@@ -208,7 +275,8 @@
             <option value="gpu">3. Tiled GPU, FlashAttention, bf16 &amp; Autograd</option>
             <option value="oop">4. OOP Inheritance, Upvalues &amp; try/catch</option>
           </select>
-          <button class="run-btn" onclick="runSnippet()">Run Verified Output</button>
+          <button class="copy-btn" id="copy-code-btn" onclick="copySnippet()">Copy Code</button>
+          <button class="run-btn" onclick="runSnippet()">Show Verified Output</button>
         </div>
       </div>
       <div class="pg-grid">
@@ -228,7 +296,7 @@
       </div>
       <div class="card">
         <h3>Crash-Safe Actors, Wasm &amp; Direct AOT</h3>
-        <p>FoundationDB-style deterministic virtual-clock &amp; crash VFS testing, OTP supervised TCP actors, standalone <code>kovrek wasm</code>, direct linker-free PE32+/ELF64 emission, and 74 verified packages.</p>
+        <p>FoundationDB-style deterministic virtual-clock &amp; crash VFS testing, OTP supervised TCP actors, standalone <code>kovrek wasm</code>, direct linker-free PE32+/ELF64 emission, and 77 verified packages.</p>
       </div>
     </section>
   </main>
@@ -257,6 +325,34 @@
       }
     };
 
+    const INSTALL_CMDS = {
+      unix: "curl -fsSL https://raw.githubusercontent.com/RenegadeImmortal-777/Kovrek/master/install.sh | bash",
+      win: "irm https://raw.githubusercontent.com/RenegadeImmortal-777/Kovrek/master/install.ps1 | iex"
+    };
+    let activeInstall = "unix";
+    function selectInstall(platform) {
+      activeInstall = platform;
+      document.getElementById('tab-unix').classList.toggle('active', platform === 'unix');
+      document.getElementById('tab-win').classList.toggle('active', platform === 'win');
+      document.getElementById('install-cmd').textContent = INSTALL_CMDS[platform];
+    }
+    function copyInstall() {
+      const btn = document.getElementById('copy-install-btn');
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(INSTALL_CMDS[activeInstall]);
+      }
+      btn.textContent = "Copied!";
+      setTimeout(() => { btn.textContent = "Copy Command"; }, 1600);
+    }
+    function copySnippet() {
+      const btn = document.getElementById('copy-code-btn');
+      const code = document.getElementById('editor').value;
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(code);
+      }
+      btn.textContent = "Copied!";
+      setTimeout(() => { btn.textContent = "Copy Code"; }, 1600);
+    }
     function loadPreset() {
       const key = document.getElementById('preset').value;
       document.getElementById('editor').value = PRESETS[key].code;
@@ -265,7 +361,13 @@
     function runSnippet() {
       const key = document.getElementById('preset').value;
       const outEl = document.getElementById('output');
-      outEl.textContent = "Verified output from kovrek-native 12.0.0-sovereign:\n\n" + PRESETS[key].out;
+      const edited = document.getElementById('editor').value.trim();
+      if (edited !== PRESETS[key].code.trim()) {
+        outEl.textContent =
+          "Code modified locally.\n\nThis static showcase displays pre-captured native CLI output for presets rather than running custom Rust/GPU/actor workloads in the browser.\nUse the one-line installer above to execute modified .kvr code locally via `kovrek run`.";
+        return;
+      }
+      outEl.textContent = "Verified captured output from kovrek-native:\n\n" + PRESETS[key].out;
     }
     loadPreset();
   </script>

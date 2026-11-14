@@ -1,0 +1,32 @@
+// Kovrek Compute Benchmark: iterative & recursive Fibonacci
+// Exercises loop dispatch, integer arithmetic, typed functions, and AOT native lowering.
+
+fn fib_iter(n: Int) -> Int {
+    let a = 0;
+    let b = 1;
+    let i = 0;
+    while i < n {
+        let next = a + b;
+        a = b;
+        b = next;
+        i = i + 1;
+    }
+    return a;
+}
+
+fn fib_rec(n: Int) -> Int {
+    if n <= 1 {
+        return n;
+    }
+    return fib_rec(n - 1) + fib_rec(n - 2);
+}
+
+let checksum = 0;
+let round = 0;
+while round < 2000 {
+    checksum = checksum + fib_iter(35);
+    round = round + 1;
+}
+
+assert(checksum == 2000 * 9227465);
+assert(fib_rec(22) == 17711);

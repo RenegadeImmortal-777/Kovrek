@@ -1,10 +1,16 @@
 # Kovrek 12.0 "Sovereign"
 
+<p align="center">
+  <img src="docs/assets/kovrek-banner.svg" alt="Kovrek 12.0 Sovereign Architecture Banner" width="100%" />
+</p>
+
 > **Python ergonomics. Single-binary Rust runtime (`8.8 MB`). Static `@verify` proofs, GPU FlashAttention/tiled GEMM (`SPIR-V` + `HLSL`), crash-safe deterministic actors, and zero-toolchain native/Wasm AOT — with zero Python dependency.**
 
-[![Release Binaries](https://img.shields.io/badge/release-v12.0.1--kovrek-0ea5e9)](https://github.com/RenegadeImmortal-777/Kovrek/releases/tag/v12.0.1-kovrek)
-[![Tests](https://img.shields.io/badge/cargo%20test-130%2F130%20pass-10b981)](STATUS.md)
-[![Packages](https://img.shields.io/badge/packages-74%2F74%20verified-10b981)](docs/PACKAGES.md)
+[![Kovrek CI](https://github.com/RenegadeImmortal-777/Kovrek/actions/workflows/ci.yml/badge.svg)](https://github.com/RenegadeImmortal-777/Kovrek/actions/workflows/ci.yml)
+[![Release Binaries](https://img.shields.io/github/v/release/RenegadeImmortal-777/Kovrek?color=0ea5e9&label=release)](https://github.com/RenegadeImmortal-777/Kovrek/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-3b82f6)](LICENSE)
+[![Tests](https://img.shields.io/badge/cargo%20test-144%2F144%20pass-10b981)](STATUS.md)
+[![Packages](https://img.shields.io/badge/packages-77%2F77%20verified-10b981)](docs/PACKAGES.md)
 [![Gates](https://img.shields.io/badge/release%20gates-8%2F8%20pass-10b981)](STATUS.md)
 
 ---
@@ -53,8 +59,17 @@ sim_stop();
 
 ## Quick Start
 
-### Option A: Prebuilt Native Binary (Recommended)
-1. Download the `v12.0.1-kovrek` binary for Windows/Linux/macOS from [GitHub Releases](https://github.com/RenegadeImmortal-777/Kovrek/releases/tag/v12.0.1-kovrek) (or run `.\INSTALL.bat` on Windows from a clone).
+### Option A: One-Line Installer / Prebuilt Native Binary (Recommended)
+1. **Install via one command** (downloads the verified binary for your OS from [GitHub Releases](https://github.com/RenegadeImmortal-777/Kovrek/releases/latest)):
+   ```powershell
+   # Windows (PowerShell)
+   irm https://raw.githubusercontent.com/RenegadeImmortal-777/Kovrek/master/install.ps1 | iex
+   ```
+   ```bash
+   # Linux / macOS
+   curl -fsSL https://raw.githubusercontent.com/RenegadeImmortal-777/Kovrek/master/install.sh | bash
+   ```
+   Or download directly from [GitHub Releases](https://github.com/RenegadeImmortal-777/Kovrek/releases/latest) (or run `.\INSTALL.bat` on Windows from a clone).
 2. Try the built-in demos right away:
 
 ```powershell
@@ -104,16 +119,17 @@ Every file in [examples/sovereign/](examples/sovereign) is verified directly aga
 | **Compilation Targets** | 3-stage self-hosted `.kvbc` compiler (`compiler-kvr/src/main.kvr`), SSA/algebraic/DCE optimizer (`ir.rs`), in-memory `x86_64` & `aarch64` JIT (`jit.rs`), standalone `.wasm`/WASI emitter (`kovrek wasm`), direct zero-toolchain PE32+/ELF64 writer (`kovrek aot --direct`), full `rustc` native AOT |
 | **GPU, AI & Python Interop** | Vulkan SPIR-V + Direct3D 11 (`cs_5_0` HLSL) compute + multi-threaded CPU fallback, single-pass `gpu_fuse` & `gpu_fused_linear`, workgroup `groupshared` tiled GEMM, causal online FlashAttention, fused Residual+LayerNorm+activation, `f16`/`bf16` casting, N-D autograd tensors + Adam, in-process CPython C-API + PEP 3118 + strided PyCapsule DLPack (`tensor_to_dlpack`/`py_from_dlpack`) |
 | **Fault Simulation & Tooling** | OTP supervision trees (`one_for_one`/`one_for_all`/`rest_for_one`), TCP actor RPC, deterministic SplitMix64 cluster & crash-safe VFS simulation, LSP + time-travel reversible DAP (`stepBack`, forward/reverse data watchpoints), reactive topological DAG notebooks (`kovrek notebook`), flight-recorder profiler (`profile_start`/`profile_stop`/`kovrek profile`), VS Code extension |
-| **Ecosystem & FFI** | 74 verified packages (`package-matrix.ps1`), HMAC-SHA256 signed bundles (`.kvpkg`), semver + workspaces, HTTP registry (`kovrek pkg serve`), `kovrek_plugin_v1` native `cdylib` ABI, C header struct/enum/`#define` bindgen (`kovrek ffi bindgen`), dynamic `x86_64` C-ABI `ffi_call` + bounded `mem_*` buffers |
+| **Ecosystem & FFI** | 77 verified packages (`package-matrix.ps1`), HMAC-SHA256 signed bundles (`.kvpkg`), semver + workspaces, HTTP registry (`kovrek pkg serve`), `kovrek_plugin_v1` native `cdylib` ABI, C header struct/enum/`#define` bindgen (`kovrek ffi bindgen`), dynamic `x86_64` C-ABI `ffi_call` + bounded `mem_*` buffers |
 
 ---
 
 ## Verification & Honest Scope
 
 All numbers below come directly from [STATUS.md](STATUS.md) and [gate-report.txt](gate-report.txt) generated on this repo:
-- **`cargo test`:** `130 passed; 0 failed` (VM, JIT, GPU, Formal Safety, Self-Hosted 3-stage fixpoint, Actors, Sim VFS, DLPack, CPython, AOT, Wasm)
-- **Package Matrix:** `74/74` packages checked and executed cleanly
+- **`cargo test`:** `144 passed; 0 failed` (VM, JIT, GPU, Formal Safety, Self-Hosted 3-stage fixpoint, Actors, Sim VFS, DLPack, CPython, AOT, Wasm, Security/HTTP/SQLite hardening)
+- **Package Matrix:** `77/77` packages checked and executed cleanly
 - **Release Gates:** `8/8` (`cargo fmt --check`, `cargo test`, `--no-default-features`, `clippy -D warnings`, `release` build, `package-matrix`, `ecosystem-gate`, `release-check`)
+- **Measured Benchmarks:** `bench_fib_jit.kvr` (`8.179 ms` best VM), `bench_tensor_matmul.kvr` (`1.025 ms` best), `bench_verify_contract.kvr` (`4` contracts / `11` invariants statically proven, `52.963 ms` best 5,000-check run) — see [benchmarks/README.md](benchmarks/README.md)
 
 **Where mature ecosystems still lead:** Python (PyPI), Rust (`crates.io`), and TypeScript (`npm`) carry orders-of-magnitude larger third-party library ecosystems, decades of LLVM micro-architectural tuning, and vendor-tuned cuBLAS/Triton kernels. Kovrek is designed to eliminate multi-language glue friction while staying C-ABI and DLPack interoperable when you want external libraries.
 
@@ -122,8 +138,10 @@ All numbers below come directly from [STATUS.md](STATUS.md) and [gate-report.txt
 ## Documentation & Contributing
 
 - [STATUS.md](STATUS.md) — Authoritative test/gate report and architecture map
+- [benchmarks/README.md](benchmarks/README.md) — Reproducible compute, tensor, contract verify, and AOT benchmarks
 - [docs/LANGUAGE.md](docs/LANGUAGE.md) — Language syntax, contracts, actors, simulation & profiling guide
 - [docs/index.html](docs/index.html) — Interactive web showcase ([examples/sovereign/](examples/sovereign) snippets)
 - [docs/PACKAGES.md](docs/PACKAGES.md) & [docs/REMOTE-REGISTRY.md](docs/REMOTE-REGISTRY.md) — Package ecosystem & registry protocol
 - [CHANGELOG.md](CHANGELOG.md) — Complete release history (`4.0` -> `12.0 Sovereign`)
+- [LICENSE](LICENSE) & [docs/archive/](docs/archive/) — MIT license and archived historical milestone docs
 - [CONTRIBUTING.md](CONTRIBUTING.md) — How to test, build, and contribute

@@ -2,9 +2,10 @@
 
 Single authoritative statement of where this project currently stands. If this file
 and any other document disagree, this file and [CHANGELOG.md](CHANGELOG.md) win. The
-older `STATUS-*.md` and `PYTHON-*.md` files are historical records, retained for
-provenance and marked as such. Previously developed under the working name *Veyra*
-prior to the 12.0 Sovereign Kovrek (`.kvr`, `.kvbc`) rebrand.
+older `STATUS-*.md` and `PYTHON-*.md` files are historical records archived under
+[`docs/archive/`](docs/archive/), retained for provenance and marked as such. Previously
+developed under the working name *Veyra* prior to the 12.0 Sovereign Kovrek (`.kvr`,
+`.kvbc`) rebrand.
 
 ## Current release
 
@@ -41,11 +42,11 @@ Last full gate run: **2026-11-14**. Every gate passed (**8/8**).
 | Gate | Result |
 |---|---|
 | `cargo fmt --check` | PASS |
-| `cargo test` | PASS — 130 passed, 0 failed |
+| `cargo test` | PASS — 144 passed, 0 failed |
 | `cargo check --no-default-features` | PASS |
 | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
 | `cargo build --release` | PASS |
-| `scripts/package-matrix.ps1` | PASS — 74/74 packages checked & executed |
+| `scripts/package-matrix.ps1` | PASS — 77/77 packages checked & executed |
 | `scripts/ecosystem-gate.ps1` | PASS |
 | `scripts/release-check.ps1` | PASS (`bin/kovrek-native.exe` synced) |
 
@@ -182,7 +183,7 @@ Native, without Python:
   (`kovrek pkg serve`, `POST /publish`, `.kvpkg.json` reproducible bundles), HMAC-SHA256 signing &
   verification, scoped `@org/pkg` + semver constraints, monorepo `"workspaces"`,
   `kovrek.lock` format 3, flat and per-platform `kovrek_plugin_v1` native binary plugins,
-  `kovrek pkg py-bridge`, recursive dependencies with cycle protection, and 74 shipped
+  `kovrek pkg py-bridge`, recursive dependencies with cycle protection, and 77 shipped
   packages verified both statically and at runtime by `scripts/package-matrix.ps1`.
 - **Tooling**: `run`/`check`/`lint`/`fmt`/`test`/`build`/`aot`/`wasm`/`ffi`/`notebook`/
   `repl`/`disasm`/`bench`/`profile`/`doc`, line-aware LSP diagnostics and navigation
@@ -206,7 +207,7 @@ Native, without Python:
   zero-copy tensor buffers (`py_bridge.rs`), universal Vulkan SPIR-V + Direct3D 11 `f64`/`f32`
   GPU compute (`gpu.rs`), multi-arch x86_64/aarch64 + list slicing + inter-call JIT (`jit.rs`),
   `BigInt`/`BigDecimal`/`Complex`/`FFT`, C3 MRO/`super()`/descriptors/metaclasses, full structural
-  `match`/`case` pattern matching, upgraded `kvdecimal` `0.2.0` + 6 new packages (74 total), and
+  `match`/`case` pattern matching, upgraded `kvdecimal` `0.2.0` + expanded packages (77 total), and
   federated registry/workspaces/scoped packages/platform native plugins/`kovrek pkg py-bridge` (`registry.rs`).
 
 ## Repository map
@@ -216,7 +217,7 @@ Native, without Python:
 | `engine-rs/` | Native Rust Horizon engine (`lib.rs`, `main.rs`, `builtins/`, `ir.rs`, `vm.rs`, `jit.rs`, `gpu.rs`, `plugin.rs`, `registry.rs`, `aot.rs`, etc.) |
 | `compiler-kvr/` | Pure-Kovrek self-hosted compiler emitting `kovrek-bc-v1` (`.kvbc`) |
 | `bin/` | Built native launcher (`bin/kovrek-native.exe`) |
-| `packages/` | 74 native Kovrek packages |
+| `packages/` | 77 native Kovrek packages |
 | `registry/` | Registry index |
 | `stdlib/` | Kovrek-written standard library modules |
 | `spec/` | Architecture and language specification |

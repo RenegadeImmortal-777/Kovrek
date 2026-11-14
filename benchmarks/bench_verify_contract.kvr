@@ -1,0 +1,33 @@
+// Kovrek Static Verification + Runtime Contract Benchmark
+// Combines `kovrek verify` static contract analysis with 5,000 runtime checks.
+
+fn bounded_transfer(balance: Int, amount: Int) -> Int {
+    requires(balance >= 0, "balance must be non-negative");
+    requires(amount >= 1, "amount must be positive");
+    requires(amount <= balance, "amount must not exceed balance");
+    let remaining = balance - amount;
+    ensures(remaining >= 0, "remaining balance stays non-negative");
+    return remaining;
+}
+
+fn clamp_score(score: Int, low: Int, high: Int) -> Int {
+    requires(low <= high, "bounds ordered");
+    if score < low {
+        return low;
+    }
+    if score > high {
+        return high;
+    }
+    return score;
+}
+
+let bal = 50000;
+let i = 0;
+while i < 5000 {
+    bal = bounded_transfer(bal, 10);
+    let _ = clamp_score(i % 120, 0, 100);
+    i = i + 1;
+}
+
+assert(bal == 0);
+assert(clamp_score(150, 0, 100) == 100);

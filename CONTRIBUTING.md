@@ -1,6 +1,6 @@
 # Contributing to Kovrek
 
-Thank you for checking out **Kovrek 12.0 "Sovereign"**. All core compiler, VM, JIT, GPU, Formal Verification, Actor, and CLI systems live in Rust (`engine-rs/`) alongside the pure-Kovrek self-hosted compiler (`compiler-kvr/`), 74 curated packages (`packages/`), and VS Code tooling (`tooling/vscode/`).
+Thank you for checking out **Kovrek 12.0 "Sovereign"** (MIT Licensed — see [LICENSE](LICENSE)). All core compiler, VM, JIT, GPU, Formal Verification, Actor, and CLI systems live in Rust (`engine-rs/`) alongside the pure-Kovrek self-hosted compiler (`compiler-kvr/`), 77 curated packages (`packages/`), reproducible benchmarks (`benchmarks/`), and VS Code tooling (`tooling/vscode/`).
 
 ## Prerequisites
 
@@ -12,7 +12,7 @@ Thank you for checking out **Kovrek 12.0 "Sovereign"**. All core compiler, VM, J
 Run the full 8-gate check before opening a pull request:
 
 ```powershell
-# Windows (runs fmt, cargo test, portable core check, clippy -D warnings, release build, 74 packages, ecosystem & release sync)
+# Windows (runs fmt, cargo test, portable core check, clippy -D warnings, release build, 77 packages, ecosystem & release sync)
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\gate-report.ps1
 ```
 
