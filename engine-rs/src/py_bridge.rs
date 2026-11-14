@@ -541,6 +541,19 @@ impl PyCapi {
     }
 }
 
+fn open_python_library(candidate: &Path) -> Result<Library, libloading::Error> {
+    #[cfg(unix)]
+    {
+        use libloading::os::unix;
+        unsafe { unix::Library::open(Some(candidate), unix::RTLD_LAZY | unix::RTLD_GLOBAL) }
+            .map(Library::from)
+    }
+    #[cfg(not(unix))]
+    unsafe {
+        Library::new(candidate)
+    }
+}
+
 impl PyCapiInner {
     fn try_init() -> Result<Self, String> {
         let (dll_candidates, site_paths) = discover_python_dll();
@@ -550,7 +563,7 @@ impl PyCapiInner {
         let mut loaded: Option<(PathBuf, Library)> = None;
         let mut last_err: Option<String> = None;
         for candidate in dll_candidates {
-            match unsafe { Library::new(&candidate) } {
+            match open_python_library(&candidate) {
                 Ok(lib) => {
                     loaded = Some((candidate, lib));
                     break;
