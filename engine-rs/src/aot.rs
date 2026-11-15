@@ -2203,6 +2203,9 @@ pub(crate) fn compile_source_to_rust(src: &str) -> Result<String, String> {
     emitter.out.push_str("\nmod bigint {\n");
     emitter.out.push_str(include_str!("bigint.rs"));
     emitter.out.push_str("\n}\n");
+    emitter.out.push_str("\nmod shared_bounds {\n");
+    emitter.out.push_str(include_str!("shared_bounds.rs"));
+    emitter.out.push_str("\n}\n");
     emitter.line("fn vy_main(rt: &mut Rt) -> Result<(), Flow> {");
     emitter.indent = 1;
     let empty_parent = BTreeSet::new();
@@ -2941,6 +2944,7 @@ struct Rt {
     globals: HashMap<String, Val>,
     start: Instant,
     py_worker: Option<PyWorker>,
+    caps_override: Option<Vec<String>>,
 }
 
 impl Drop for Rt {
@@ -2992,10 +2996,46 @@ impl Rt {
             globals: HashMap::new(),
             start: Instant::now(),
             py_worker: None,
+            caps_override: None,
         }
     }
 
+    fn cap_allows(grants: &[String], cap: &str) -> bool {
+        let cat = cap.split_once('.').map(|(c, _)| c);
+        grants.iter().any(|g| {
+            g == "*" || g.eq_ignore_ascii_case("all") || g == cap || cat.is_some_and(|c| g == c)
+        })
+    }
+
+    fn env_caps() -> Option<Vec<String>> {
+        let raw = std::env::var("KOVREK_CAPS").ok()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "*" || trimmed.eq_ignore_ascii_case("all") {
+            return None;
+        }
+        Some(
+            trimmed
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
+    }
+
+    fn require_cap(&self, cap: &str) -> Result<(), Flow> {
+        let effective = self.caps_override.clone().or_else(Self::env_caps);
+        if let Some(grants) = effective {
+            if !Self::cap_allows(&grants, cap) {
+                return Err(Flow::Err(format!(
+                    "CapabilityError: missing required capability '{cap}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn py_req(&mut self, payload: VyJson) -> Result<VyJson, Flow> {
+        self.require_cap("python")?;
         if self.py_worker.is_none() {
             self.py_worker = Some(PyWorker::spawn().map_err(Flow::Err)?);
         }
@@ -4260,16 +4300,11 @@ impl Rt {
         match (a, b) {
             (Val::Num(x), Val::Num(y)) => Ok(Val::Num(x * y)),
             (Val::Str(s), Val::Num(n)) | (Val::Num(n), Val::Str(s)) => {
-                Ok(Val::Str(s.repeat(n.max(0.0) as usize)))
+                Ok(Val::Str(shared_bounds::repeat_str_bounded(&s, n).map_err(Flow::Err)?))
             }
-            (Val::List(items), Val::Num(n)) | (Val::Num(n), Val::List(items)) => {
-                let count = n.max(0.0) as usize;
-                let mut out = Vec::with_capacity(items.len() * count);
-                for _ in 0..count {
-                    out.extend(items.iter().cloned());
-                }
-                Ok(Val::List(out))
-            }
+            (Val::List(items), Val::Num(n)) | (Val::Num(n), Val::List(items)) => Ok(Val::List(
+                shared_bounds::repeat_list_bounded(&items, n).map_err(Flow::Err)?,
+            )),
             _ => Err(Flow::Err("numeric operation requires numbers".into())),
         }
     }
@@ -5294,19 +5329,9 @@ impl Rt {
                     Ok(Val::Str(out))
                 }
                 "zfill" => match args.first() {
-                    Some(Val::Num(n)) => {
-                        let w = (*n).max(0.0) as usize;
-                        let char_len = s.chars().count();
-                        if char_len >= w {
-                            Ok(Val::Str(s))
-                        } else if let Some(rest) = s.strip_prefix('-') {
-                            Ok(Val::Str(format!("-{}{rest}", "0".repeat(w - char_len))))
-                        } else if let Some(rest) = s.strip_prefix('+') {
-                            Ok(Val::Str(format!("+{}{rest}", "0".repeat(w - char_len))))
-                        } else {
-                            Ok(Val::Str(format!("{}{s}", "0".repeat(w - char_len))))
-                        }
-                    }
+                    Some(Val::Num(n)) => Ok(Val::Str(
+                        shared_bounds::zfill_str_bounded(&s, *n).map_err(Flow::Err)?,
+                    )),
                     _ => Err(Flow::Err("str.zfill expects width Number".into())),
                 },
                 "splitlines" => Ok(Val::List(
@@ -6466,44 +6491,59 @@ impl Rt {
                 };
                 std::process::exit(code);
             }
-            "read_file" => match args.first() {
-                Some(Val::Str(p)) => Val::Str(
-                    std::fs::read_to_string(p).map_err(|e| Flow::Err(e.to_string()))?,
-                ),
-                _ => return Err(Flow::Err("read_file expects String path".into())),
-            },
-            "write_file" => match args {
-                [Val::Str(p), content] => {
-                    std::fs::write(p, self.show_val_runtime(content)?)
-                        .map_err(|e| Flow::Err(e.to_string()))?;
-                    Val::Null
+            "read_file" => {
+                self.require_cap("fs.read")?;
+                match args.first() {
+                    Some(Val::Str(p)) => Val::Str(
+                        std::fs::read_to_string(p).map_err(|e| Flow::Err(e.to_string()))?,
+                    ),
+                    _ => return Err(Flow::Err("read_file expects String path".into())),
                 }
-                _ => return Err(Flow::Err("write_file expects (String path, content)".into())),
-            },
-            "append_file" => match args {
-                [Val::Str(p), content] => {
-                    let mut f = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(p)
-                        .map_err(|e| Flow::Err(e.to_string()))?;
-                    f.write_all(self.show_val_runtime(content)?.as_bytes())
-                        .map_err(|e| Flow::Err(e.to_string()))?;
-                    Val::Null
+            }
+            "write_file" => {
+                self.require_cap("fs.write")?;
+                match args {
+                    [Val::Str(p), content] => {
+                        std::fs::write(p, self.show_val_runtime(content)?)
+                            .map_err(|e| Flow::Err(e.to_string()))?;
+                        Val::Null
+                    }
+                    _ => return Err(Flow::Err("write_file expects (String path, content)".into())),
                 }
-                _ => return Err(Flow::Err("append_file expects (String path, content)".into())),
-            },
-            "file_exists" => match args.first() {
-                Some(Val::Str(p)) => Val::Bool(std::path::Path::new(p).exists()),
-                _ => return Err(Flow::Err("file_exists expects String path".into())),
-            },
-            "env_get" => match args.first() {
-                Some(Val::Str(k)) => match std::env::var(k) {
-                    Ok(v) => Val::Str(v),
-                    Err(_) => Val::Null,
-                },
-                _ => return Err(Flow::Err("env_get expects String key".into())),
-            },
+            }
+            "append_file" => {
+                self.require_cap("fs.write")?;
+                match args {
+                    [Val::Str(p), content] => {
+                        let mut f = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(p)
+                            .map_err(|e| Flow::Err(e.to_string()))?;
+                        f.write_all(self.show_val_runtime(content)?.as_bytes())
+                            .map_err(|e| Flow::Err(e.to_string()))?;
+                        Val::Null
+                    }
+                    _ => return Err(Flow::Err("append_file expects (String path, content)".into())),
+                }
+            }
+            "file_exists" => {
+                self.require_cap("fs.read")?;
+                match args.first() {
+                    Some(Val::Str(p)) => Val::Bool(std::path::Path::new(p).exists()),
+                    _ => return Err(Flow::Err("file_exists expects String path".into())),
+                }
+            }
+            "env_get" => {
+                self.require_cap("env")?;
+                match args.first() {
+                    Some(Val::Str(k)) => match std::env::var(k) {
+                        Ok(v) => Val::Str(v),
+                        Err(_) => Val::Null,
+                    },
+                    _ => return Err(Flow::Err("env_get expects String key".into())),
+                }
+            }
             "starts_with" | "ends_with" => match args {
                 [Val::Str(text), Val::Str(pat)] => Val::Bool(if name == "starts_with" {
                     text.starts_with(pat)
@@ -6550,6 +6590,7 @@ impl Rt {
                 }
             }
             "powershell" | "ps_exec" | "bash_exec" => {
+                self.require_cap("process")?;
                 let cmd_str = match args.first() {
                     Some(Val::Str(s)) => s.clone(),
                     _ => return Err(Flow::Err(format!("{name} expects String command"))),
@@ -6577,6 +6618,7 @@ impl Rt {
                 ])
             }
             "fs_mkdir" => {
+                self.require_cap("fs.write")?;
                 let p = match args.first() {
                     Some(Val::Str(s)) => s.clone(),
                     _ => return Err(Flow::Err("fs_mkdir expects String path".into())),
@@ -6585,6 +6627,7 @@ impl Rt {
                 Val::Bool(true)
             }
             "fs_list" => {
+                self.require_cap("fs.read")?;
                 let p = match args.first() {
                     Some(Val::Str(s)) => s.clone(),
                     _ => return Err(Flow::Err("fs_list expects String path".into())),
@@ -6604,6 +6647,7 @@ impl Rt {
                 Val::List(rows)
             }
             "fs_remove" => {
+                self.require_cap("fs.write")?;
                 let p = match args.first() {
                     Some(Val::Str(s)) => s.clone(),
                     _ => return Err(Flow::Err("fs_remove expects String path".into())),
@@ -6620,6 +6664,7 @@ impl Rt {
                 }
             }
             "fs_stat" => {
+                self.require_cap("fs.read")?;
                 let p = match args.first() {
                     Some(Val::Str(s)) => s.clone(),
                     _ => return Err(Flow::Err("fs_stat expects String path".into())),
@@ -6644,6 +6689,7 @@ impl Rt {
                 }
             }
             "fs_read_bytes" => {
+                self.require_cap("fs.read")?;
                 let p = match args.first() {
                     Some(Val::Str(s)) => s.clone(),
                     _ => return Err(Flow::Err("fs_read_bytes expects String path".into())),
@@ -6652,6 +6698,7 @@ impl Rt {
                 Val::List(bytes.into_iter().map(|b| Val::Num(b as f64)).collect())
             }
             "fs_write_bytes" => {
+                self.require_cap("fs.write")?;
                 if args.len() != 2 {
                     return Err(Flow::Err("fs_write_bytes expects (path, bytes)".into()));
                 }
@@ -6674,18 +6721,23 @@ impl Rt {
                 Val::Num(count as f64)
             }
             "env_set" => {
+                self.require_cap("process")?;
                 if args.len() != 2 {
                     return Err(Flow::Err("env_set expects (key, value)".into()));
                 }
                 let (k, v) = (self.show_val_runtime(&args[0])?, self.show_val_runtime(&args[1])?);
+                shared_bounds::validate_env_assignment(&k, &v).map_err(Flow::Err)?;
                 unsafe { std::env::set_var(k, v) };
                 Val::Bool(true)
             }
-            "env_vars" => Val::Map(
-                std::env::vars()
-                    .map(|(k, v)| (Val::Str(k), Val::Str(v)))
-                    .collect(),
-            ),
+            "env_vars" => {
+                self.require_cap("env")?;
+                Val::Map(
+                    std::env::vars()
+                        .map(|(k, v)| (Val::Str(k), Val::Str(v)))
+                        .collect(),
+                )
+            }
             "node_available" => Val::Bool(
                 Command::new(if cfg!(windows) { "node.exe" } else { "node" })
                     .arg("--version")
@@ -6698,6 +6750,76 @@ impl Rt {
                 (Val::Str("arch".into()), Val::Str(std::env::consts::ARCH.into())),
                 (Val::Str("aot".into()), Val::Bool(true)),
             ]),
+            "cap_current" => {
+                match self.caps_override.clone().or_else(Self::env_caps) {
+                    None => Val::Str("all".into()),
+                    Some(mut xs) => {
+                        xs.sort();
+                        Val::Str(xs.join(","))
+                    }
+                }
+            }
+            "cap_restrict" => {
+                if args.len() != 2 {
+                    return Err(Flow::Err("cap_restrict expects (caps_list_or_csv, fn)".into()));
+                }
+                let mut req: Vec<String> = match &args[0] {
+                    Val::Str(s) => s
+                        .split(',')
+                        .map(|x| x.trim().to_ascii_lowercase())
+                        .filter(|x| !x.is_empty())
+                        .collect(),
+                    Val::List(xs) => {
+                        let mut out = Vec::with_capacity(xs.len());
+                        for item in xs {
+                            let Val::Str(s) = item else {
+                                return Err(Flow::Err("cap_restrict capability names must be String".into()));
+                            };
+                            for part in s.split(',') {
+                                let t = part.trim().to_ascii_lowercase();
+                                if !t.is_empty() {
+                                    out.push(t);
+                                }
+                            }
+                        }
+                        out
+                    }
+                    _ => return Err(Flow::Err("cap_restrict caps must be String or List".into())),
+                };
+                let prev = self.caps_override.clone();
+                let base = prev.clone().or_else(Self::env_caps);
+                let attenuated = match base {
+                    None => {
+                        if req.iter().any(|c| c == "*" || c.eq_ignore_ascii_case("all")) {
+                            None
+                        } else {
+                            Some(req)
+                        }
+                    }
+                    Some(outer) => {
+                        if req.iter().any(|c| c == "*" || c.eq_ignore_ascii_case("all")) {
+                            Some(outer)
+                        } else {
+                            let mut next = Vec::new();
+                            for r in &req {
+                                if Self::cap_allows(&outer, r) {
+                                    next.push(r.clone());
+                                }
+                            }
+                            for o in &outer {
+                                if Self::cap_allows(&req, o) && !next.contains(o) {
+                                    next.push(o.clone());
+                                }
+                            }
+                            Some(next)
+                        }
+                    }
+                };
+                self.caps_override = attenuated;
+                let res = self.call_val(&args[1], vec![]);
+                self.caps_override = prev;
+                res?
+            }
             _ => return Ok(None),
         };
         Ok(Some(out))

@@ -481,6 +481,11 @@ fn inproc_python() -> Option<&'static PyCapi> {
     inproc_python_result().as_ref().ok()
 }
 
+fn checked_inproc_python() -> Result<Option<&'static PyCapi>, String> {
+    crate::runtime::require_cap("python")?;
+    Ok(inproc_python())
+}
+
 impl PyCapi {
     /// Initializes CPython once on a persistent host thread so `Py_InitializeEx` and all
     /// `PyThreadState` / C-extension TLS state stay bound to a live thread across arbitrary
@@ -2029,6 +2034,17 @@ impl PyCapiInner {
 }
 
 unsafe fn read_raw_dltensor(dl: &DLTensor) -> Result<(Vec<usize>, Vec<f64>), String> {
+    unsafe { read_raw_dltensor_with_bounds(dl, None) }
+}
+
+unsafe fn read_raw_dltensor_with_bounds(
+    dl: &DLTensor,
+    max_span_bytes: Option<usize>,
+) -> Result<(Vec<usize>, Vec<f64>), String> {
+    const MAX_DLPACK_NDIM: i32 = 32;
+    const MAX_DLPACK_ELEMENTS: usize = 16 * 1024 * 1024;
+    const MAX_DLPACK_SPAN_BYTES: usize = 1024 * 1024 * 1024;
+
     if dl.device.device_type != 1 {
         return Err(format!(
             "DLPack tensor uses non-CPU device_type={}; move to CPU first",
@@ -2038,44 +2054,115 @@ unsafe fn read_raw_dltensor(dl: &DLTensor) -> Result<(Vec<usize>, Vec<f64>), Str
     if dl.dtype.lanes != 1 {
         return Err("DLPack vector lanes != 1 unsupported".into());
     }
-    let ndim = dl.ndim.max(0) as usize;
-    let shape: Vec<usize> = if ndim == 0 || dl.shape.is_null() {
-        vec![1]
-    } else {
-        unsafe { std::slice::from_raw_parts(dl.shape, ndim) }
-            .iter()
-            .map(|&d| d.max(0) as usize)
-            .collect()
+    let elem_bytes: usize = match (dl.dtype.code, dl.dtype.bits) {
+        (2, 64) | (0, 64) | (1, 64) => 8,
+        (2, 32) | (0, 32) | (1, 32) => 4,
+        (0, 16) | (1, 16) => 2,
+        (0, 8) | (1, 8) | (6, 8) => 1,
+        _ => {
+            return Err(format!(
+                "unsupported DLPack dtype (code={}, bits={})",
+                dl.dtype.code, dl.dtype.bits
+            ));
+        }
     };
-    let total: usize = shape.iter().product();
-    let elem_bytes = (usize::from(dl.dtype.bits) / 8).max(1);
+    if dl.ndim < 0 || dl.ndim > MAX_DLPACK_NDIM {
+        return Err(format!("invalid DLPack ndim={}", dl.ndim));
+    }
+    let ndim = dl.ndim as usize;
+    let shape: Vec<usize> = if ndim == 0 {
+        vec![1]
+    } else if dl.shape.is_null() {
+        return Err("DLPack tensor has non-zero ndim with null shape pointer".into());
+    } else {
+        let raw_shape = unsafe { std::slice::from_raw_parts(dl.shape, ndim) };
+        let mut parsed = Vec::with_capacity(ndim);
+        for &d in raw_shape {
+            if d < 0 {
+                return Err(format!("DLPack tensor has negative dimension {d}"));
+            }
+            parsed.push(usize::try_from(d).map_err(|_| "DLPack shape dimension overflow")?);
+        }
+        parsed
+    };
+    let total = shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| "DLPack tensor element count overflow".to_string())?;
+    if total > MAX_DLPACK_ELEMENTS {
+        return Err(format!(
+            "DLPack tensor element count {total} exceeds limit {MAX_DLPACK_ELEMENTS}"
+        ));
+    }
     let mut strides: Vec<isize> = if ndim > 0 && !dl.strides.is_null() {
-        unsafe { std::slice::from_raw_parts(dl.strides, ndim) }
-            .iter()
-            .map(|&s| s as isize)
-            .collect()
+        let raw_strides = unsafe { std::slice::from_raw_parts(dl.strides, ndim) };
+        let mut parsed = Vec::with_capacity(ndim);
+        for &s in raw_strides {
+            parsed.push(isize::try_from(s).map_err(|_| "DLPack stride overflow")?);
+        }
+        parsed
     } else {
         let mut st = vec![1isize; shape.len()];
         let mut acc = 1isize;
         for i in (0..shape.len()).rev() {
             st[i] = acc;
-            acc *= shape[i].max(1) as isize;
+            let dim =
+                isize::try_from(shape[i].max(1)).map_err(|_| "DLPack shape stride overflow")?;
+            acc = acc
+                .checked_mul(dim)
+                .ok_or_else(|| "DLPack stride overflow".to_string())?;
         }
         st
     };
     if strides.is_empty() {
         strides.push(1);
     }
+    let byte_offset_isize =
+        isize::try_from(dl.byte_offset).map_err(|_| "DLPack byte_offset overflow".to_string())?;
+    let elem_bytes_isize = elem_bytes as isize;
     let mut out = Vec::with_capacity(total);
-    if total > 0 && !dl.data.is_null() {
-        let base_ptr = unsafe { (dl.data as *const u8).add(dl.byte_offset as usize) };
+    if total > 0 {
+        if dl.data.is_null() {
+            return Err("DLPack tensor has null data pointer".into());
+        }
+        let raw_data = dl.data as *const u8;
         let mut coords = vec![0usize; shape.len()];
         for _ in 0..total {
             let mut elem_off = 0isize;
             for (ax, &c) in coords.iter().enumerate() {
-                elem_off += (c as isize) * strides[ax];
+                let coord_i =
+                    isize::try_from(c).map_err(|_| "DLPack coordinate overflow".to_string())?;
+                let term = coord_i
+                    .checked_mul(strides[ax])
+                    .ok_or_else(|| "DLPack element offset overflow".to_string())?;
+                elem_off = elem_off
+                    .checked_add(term)
+                    .ok_or_else(|| "DLPack element offset overflow".to_string())?;
             }
-            let ptr_elem = unsafe { base_ptr.offset(elem_off * (elem_bytes as isize)) };
+            let byte_delta = elem_off
+                .checked_mul(elem_bytes_isize)
+                .ok_or_else(|| "DLPack byte delta overflow".to_string())?;
+            if byte_delta.unsigned_abs() > MAX_DLPACK_SPAN_BYTES {
+                return Err("DLPack byte stride span exceeds safety limit".into());
+            }
+            let total_byte_off = byte_offset_isize
+                .checked_add(byte_delta)
+                .ok_or_else(|| "DLPack byte offset overflow".to_string())?;
+            if let Some(span) = max_span_bytes {
+                if total_byte_off < 0
+                    || (total_byte_off as usize)
+                        .checked_add(elem_bytes)
+                        .is_none_or(|end| end > span)
+                {
+                    return Err("DLPack element byte offset out of bounds".into());
+                }
+            }
+            let target_addr = (raw_data as usize)
+                .checked_add_signed(total_byte_off)
+                .filter(|&addr| addr != 0)
+                .ok_or_else(|| "DLPack pointer arithmetic out of address range".to_string())?;
+            let _ = target_addr;
+            let ptr_elem = unsafe { raw_data.offset(total_byte_off) };
             let slice = unsafe { std::slice::from_raw_parts(ptr_elem, elem_bytes) };
             let Some(val) = decode_dl_scalar(dl.dtype, slice) else {
                 return Err(format!(
@@ -2129,7 +2216,11 @@ pub(crate) fn read_strided_dlpack_f64_for_test(
         },
         byte_offset,
     };
-    unsafe { read_raw_dltensor(&dl) }
+    let span_bytes = buf
+        .len()
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| "DLPack test buffer size overflow".to_string())?;
+    unsafe { read_raw_dltensor_with_bounds(&dl, Some(span_bytes)) }
 }
 
 static DLPACK_GET_NAME: OnceLock<usize> = OnceLock::new();
@@ -2351,6 +2442,7 @@ impl PyWorker {
 }
 
 fn send_request(payload: JsonValue) -> Result<JsonValue, String> {
+    crate::runtime::require_cap("python")?;
     let lock = PY_WORKER.get_or_init(|| Mutex::new(None));
     let mut guard = lock.lock().map_err(|_| "python bridge mutex poisoned")?;
     if guard.is_none() {
@@ -2507,7 +2599,7 @@ pub(crate) fn py_info_val() -> Val {
 }
 
 pub(crate) fn py_import(name: &str) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let name = name.to_string();
         return api.run(move |c| c.import(&name));
     }
@@ -2516,7 +2608,7 @@ pub(crate) fn py_import(name: &str) -> Result<Val, String> {
 }
 
 pub(crate) fn py_call(callable: &Val, args: &[Val], kwargs: Option<&Val>) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let callable = callable.clone();
         let args = args.to_vec();
         let kwargs = kwargs.cloned();
@@ -2540,7 +2632,7 @@ pub(crate) fn py_call_method(
     args: &[Val],
     kwargs: Option<&Val>,
 ) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let obj = obj.clone();
         let method = method.to_string();
         let args = args.to_vec();
@@ -2560,7 +2652,7 @@ pub(crate) fn py_call_method(
 }
 
 pub(crate) fn py_get(obj: &Val, attr: &str) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let obj = obj.clone();
         let attr = attr.to_string();
         return api.run(move |c| c.get(&obj, &attr));
@@ -2574,7 +2666,7 @@ pub(crate) fn py_get(obj: &Val, attr: &str) -> Result<Val, String> {
 }
 
 pub(crate) fn py_set(obj: &Val, attr: &str, val: &Val) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let obj = obj.clone();
         let attr = attr.to_string();
         let val = val.clone();
@@ -2590,7 +2682,7 @@ pub(crate) fn py_set(obj: &Val, attr: &str, val: &Val) -> Result<Val, String> {
 }
 
 pub(crate) fn py_hasattr(obj: &Val, attr: &str) -> Result<bool, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let obj = obj.clone();
         let attr = attr.to_string();
         return api.run(move |c| c.hasattr(&obj, &attr));
@@ -2604,7 +2696,7 @@ pub(crate) fn py_hasattr(obj: &Val, attr: &str) -> Result<bool, String> {
 }
 
 pub(crate) fn py_getitem(obj: &Val, key: &Val) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let obj = obj.clone();
         let key = key.clone();
         return api.run(move |c| c.getitem(&obj, &key));
@@ -2618,7 +2710,7 @@ pub(crate) fn py_getitem(obj: &Val, key: &Val) -> Result<Val, String> {
 }
 
 pub(crate) fn py_setitem(obj: &Val, key: &Val, val: &Val) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let obj = obj.clone();
         let key = key.clone();
         let val = val.clone();
@@ -2634,7 +2726,7 @@ pub(crate) fn py_setitem(obj: &Val, key: &Val, val: &Val) -> Result<Val, String>
 }
 
 pub(crate) fn py_dir(obj: &Val) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let obj = obj.clone();
         return api.run(move |c| c.dir_of(&obj));
     }
@@ -2646,7 +2738,7 @@ pub(crate) fn py_dir(obj: &Val) -> Result<Val, String> {
 }
 
 pub(crate) fn py_str(obj: &Val) -> Result<String, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let obj = obj.clone();
         return api.run(move |c| c.str_of(&obj));
     }
@@ -2658,7 +2750,7 @@ pub(crate) fn py_str(obj: &Val) -> Result<String, String> {
 }
 
 pub(crate) fn py_repr(obj: &Val) -> Result<String, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let obj = obj.clone();
         return api.run(move |c| c.repr_of(&obj));
     }
@@ -2670,7 +2762,7 @@ pub(crate) fn py_repr(obj: &Val) -> Result<String, String> {
 }
 
 pub(crate) fn py_eval(expr: &str, locals: Option<&Val>) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let expr = expr.to_string();
         let locals = locals.cloned();
         return api.run(move |c| c.eval_expr(&expr, locals.as_ref()));
@@ -2685,7 +2777,7 @@ pub(crate) fn py_eval(expr: &str, locals: Option<&Val>) -> Result<Val, String> {
 }
 
 pub(crate) fn py_exec(code: &str) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let code = code.to_string();
         return api.run(move |c| c.exec_code(&code));
     }
@@ -2697,10 +2789,11 @@ pub(crate) fn py_exec(code: &str) -> Result<Val, String> {
 }
 
 pub(crate) fn py_free(val: &Val) -> Result<bool, String> {
+    crate::runtime::require_cap("python")?;
     let Some(id) = py_handle_id(val) else {
         return Ok(false);
     };
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         return api.run(move |c| c.free_handle(id));
     }
     let _ = send_request(json!({ "op": "release", "id": id }))?;
@@ -2708,7 +2801,8 @@ pub(crate) fn py_free(val: &Val) -> Result<bool, String> {
 }
 
 pub(crate) fn py_to_tensor(val: &Val) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    crate::runtime::require_cap("python")?;
+    if let Some(api) = checked_inproc_python()? {
         if is_py_handle(val) {
             let obj = val.clone();
             return api.run(move |c| c.export_to_tensor(&obj));
@@ -2737,7 +2831,7 @@ pub(crate) fn py_to_tensor(val: &Val) -> Result<Val, String> {
 }
 
 pub(crate) fn tensor_to_py(tval: &Val) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let tval = tval.clone();
         return api.run(move |c| c.import_from_tensor(&tval));
     }
@@ -2752,7 +2846,7 @@ pub(crate) fn tensor_to_py(tval: &Val) -> Result<Val, String> {
 }
 
 pub(crate) fn tensor_to_dlpack(tval: &Val) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    if let Some(api) = checked_inproc_python()? {
         let tval = tval.clone();
         return api.run(move |c| c.export_tensor_dlpack(&tval));
     }
@@ -2760,7 +2854,8 @@ pub(crate) fn tensor_to_dlpack(tval: &Val) -> Result<Val, String> {
 }
 
 pub(crate) fn py_from_dlpack(val: &Val) -> Result<Val, String> {
-    if let Some(api) = inproc_python() {
+    crate::runtime::require_cap("python")?;
+    if let Some(api) = checked_inproc_python()? {
         if is_py_handle(val) {
             let obj = val.clone();
             return api.run(move |c| c.dlpack_import_explicit(&obj));

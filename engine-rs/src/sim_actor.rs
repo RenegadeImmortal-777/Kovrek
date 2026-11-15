@@ -5,7 +5,7 @@ use std::{
     cell::RefCell,
     cmp::Ordering as CmpOrdering,
     collections::{BTreeMap, BinaryHeap, HashMap},
-    io::{BufRead, BufReader, Write},
+    io::{BufReader, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
@@ -821,7 +821,9 @@ fn spawn_actor_internal(
     let worker_pending = pending.clone();
     let mut worker_vm = clone_worker_vm(vm);
     let sim_ctx = current_sim();
+    let caps_snap = crate::runtime::snapshot_caps();
     let join = thread::spawn(move || {
+        let _cap_guard = crate::runtime::enter_captured_caps(caps_snap);
         let _sim_guard = SimGuard::enter(sim_ctx.clone());
         let mut state = init_state.clone();
         while let Ok(msg) = rx.recv() {
@@ -1470,21 +1472,95 @@ fn write_json_line(stream: &mut TcpStream, body: &JsonValue) -> Result<(), Strin
     stream.flush().map_err(|e| e.to_string())
 }
 
-fn handle_actor_node_conn(mut stream: TcpStream, actor_id: u64) {
+const MAX_ACTOR_RPC_BYTES: usize = 1024 * 1024;
+const MAX_ACTOR_NODE_CONNS: usize = 64;
+
+fn configured_actor_token() -> Option<String> {
+    std::env::var("KOVREK_ACTOR_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn is_loopback_bind_addr(addr: &str) -> bool {
+    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        return sa.ip().is_loopback();
+    }
+    let host_part = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    host_part.eq_ignore_ascii_case("localhost") || host_part == "127.0.0.1" || host_part == "[::1]"
+}
+
+fn read_bounded_rpc_line(stream: TcpStream, max_bytes: usize) -> Result<String, String> {
+    use std::io::Read;
+    let mut limited = BufReader::new(stream).take((max_bytes + 1) as u64);
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = limited.read(&mut tmp).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        if let Some(pos) = tmp[..n].iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&tmp[..pos]);
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > max_bytes {
+            return Err(format!("actor RPC payload exceeds {max_bytes} byte limit"));
+        }
+    }
+    if buf.len() > max_bytes {
+        return Err(format!("actor RPC payload exceeds {max_bytes} byte limit"));
+    }
+    String::from_utf8(buf).map_err(|_| "actor RPC payload must be valid UTF-8".into())
+}
+
+fn handle_actor_node_conn(
+    mut stream: TcpStream,
+    actor_id: u64,
+    required_token: Option<String>,
+    active_conns: Arc<AtomicUsize>,
+) {
+    struct ConnDropGuard(Arc<AtomicUsize>);
+    impl Drop for ConnDropGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    let _conn_guard = ConnDropGuard(active_conns);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
     let reader_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
     };
-    let mut reader = BufReader::new(reader_stream);
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) | Err(_) => return,
-        Ok(_) => {}
-    }
+    let line = match read_bounded_rpc_line(reader_stream, MAX_ACTOR_RPC_BYTES) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => return,
+        Err(msg) => {
+            let err_json = serde_json::json!({ "ok": false, "error": msg }).to_string();
+            let _ = stream.write_all(err_json.as_bytes());
+            let _ = stream.write_all(b"\n");
+            let _ = stream.flush();
+            return;
+        }
+    };
     let resp = match serde_json::from_str::<JsonValue>(line.trim()) {
         Ok(req) => {
+            if let Some(ref expected) = required_token {
+                let supplied = req.get("token").and_then(JsonValue::as_str).unwrap_or("");
+                if !crate::value::constant_time_strings_equal(supplied, expected) {
+                    let err_json = serde_json::json!({
+                        "ok": false,
+                        "error": "unauthorized actor RPC request"
+                    })
+                    .to_string();
+                    let _ = stream.write_all(err_json.as_bytes());
+                    let _ = stream.write_all(b"\n");
+                    let _ = stream.flush();
+                    return;
+                }
+            }
             let op = req.get("op").and_then(JsonValue::as_str).unwrap_or("ask");
             let timeout = req
                 .get("timeout_ms")
@@ -1507,6 +1583,7 @@ fn handle_actor_node_conn(mut stream: TcpStream, actor_id: u64) {
 }
 
 pub(crate) fn actor_node_listen(actor_id: u64, bind: Option<&Val>) -> Result<Val, String> {
+    crate::runtime::require_cap("net")?;
     let _ = actor_entry(actor_id)?;
     let bind_addr = match bind {
         None | Some(Val::Null) => "127.0.0.1:0".to_string(),
@@ -1520,6 +1597,12 @@ pub(crate) fn actor_node_listen(actor_id: u64, bind: Option<&Val>) -> Result<Val
             );
         }
     };
+    let required_token = configured_actor_token();
+    if !is_loopback_bind_addr(&bind_addr) && required_token.is_none() {
+        return Err(format!(
+            "refusing unauthenticated non-loopback actor_node_listen on '{bind_addr}'; set KOVREK_ACTOR_TOKEN or bind 127.0.0.1"
+        ));
+    }
     let listener = TcpListener::bind(&bind_addr)
         .map_err(|e| format!("actor_node_listen failed to bind '{bind_addr}': {e}"))?;
     let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
@@ -1531,12 +1614,27 @@ pub(crate) fn actor_node_listen(actor_id: u64, bind: Option<&Val>) -> Result<Val
     let node_id = NODE_IDS.fetch_add(1, Ordering::SeqCst);
     let running = Arc::new(AtomicBool::new(true));
     let running_thr = running.clone();
+    let active_conns = Arc::new(AtomicUsize::new(0));
+    let caps_snap = crate::runtime::snapshot_caps();
     let join = thread::spawn(move || {
+        let _cap_guard = crate::runtime::enter_captured_caps(caps_snap.clone());
         while running_thr.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    let prev = active_conns.fetch_add(1, Ordering::AcqRel);
+                    if prev >= MAX_ACTOR_NODE_CONNS {
+                        active_conns.fetch_sub(1, Ordering::AcqRel);
+                        drop(stream);
+                        continue;
+                    }
                     let _ = stream.set_nonblocking(false);
-                    thread::spawn(move || handle_actor_node_conn(stream, actor_id));
+                    let tok = required_token.clone();
+                    let conns = active_conns.clone();
+                    let conn_caps = caps_snap.clone();
+                    thread::spawn(move || {
+                        let _conn_cap_guard = crate::runtime::enter_captured_caps(conn_caps);
+                        handle_actor_node_conn(stream, actor_id, tok, conns);
+                    });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(5));
@@ -1565,6 +1663,7 @@ pub(crate) fn actor_node_listen(actor_id: u64, bind: Option<&Val>) -> Result<Val
 }
 
 pub(crate) fn actor_node_stop(target: &Val) -> Result<Val, String> {
+    crate::runtime::require_cap("net")?;
     let node_id = match target {
         Val::Num(n) if n.is_finite() && *n >= 0.0 => *n as u64,
         Val::Map(pairs) => match map_lookup(pairs, &Val::Str("node_id".into())) {
@@ -1638,16 +1737,16 @@ fn actor_remote_rpc(addr: &str, op: &str, payload: &Val, timeout_ms: u64) -> Res
         .map_err(|e| format!("remote actor connect '{addr}' failed: {e}"))?;
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
-    let req = serde_json::json!({
+    let mut req = serde_json::json!({
         "op": op,
         "payload": val_to_json(payload),
         "timeout_ms": timeout_ms,
     });
+    if let Some(tok) = configured_actor_token() {
+        req["token"] = serde_json::Value::String(tok);
+    }
     write_json_line(&mut stream, &req)?;
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
+    let line = read_bounded_rpc_line(stream, MAX_ACTOR_RPC_BYTES)
         .map_err(|e| format!("remote actor response read '{addr}' failed: {e}"))?;
     let parsed: JsonValue = serde_json::from_str(line.trim())
         .map_err(|e| format!("invalid remote actor response from '{addr}': {e}"))?;
@@ -1658,6 +1757,7 @@ fn actor_remote_rpc(addr: &str, op: &str, payload: &Val, timeout_ms: u64) -> Res
 }
 
 pub(crate) fn actor_remote_send(target: &Val, payload: Val) -> Result<Val, String> {
+    crate::runtime::require_cap("net")?;
     match resolve_remote_target(target)? {
         RemoteTarget::LocalActor(id) => actor_send(id, payload),
         RemoteTarget::TcpAddr(addr) => actor_remote_rpc(&addr, "send", &payload, 5_000),
@@ -1665,6 +1765,7 @@ pub(crate) fn actor_remote_send(target: &Val, payload: Val) -> Result<Val, Strin
 }
 
 pub(crate) fn actor_remote_ask(target: &Val, payload: Val, timeout_ms: u64) -> Result<Val, String> {
+    crate::runtime::require_cap("net")?;
     match resolve_remote_target(target)? {
         RemoteTarget::LocalActor(id) => actor_ask(id, payload, timeout_ms),
         RemoteTarget::TcpAddr(addr) => actor_remote_rpc(&addr, "ask", &payload, timeout_ms),

@@ -773,6 +773,7 @@ impl Vm {
                 )?
             }
             "tensor_save" => {
+                crate::runtime::require_cap("fs.write")?;
                 if a.len() != 2 {
                     return Err("tensor_save expects tensor,path".into());
                 }
@@ -796,6 +797,7 @@ impl Vm {
                 Val::Null
             }
             "tensor_load" => {
+                crate::runtime::require_cap("fs.read")?;
                 if a.len() != 1 {
                     return Err("tensor_load expects path".into());
                 }
@@ -814,7 +816,11 @@ impl Vm {
                     .and_then(JsonValue::as_array)
                     .ok_or("tensor file missing shape")?
                     .iter()
-                    .map(|v| v.as_u64().map(|n| n as usize).ok_or("invalid tensor shape"))
+                    .map(|v| {
+                        v.as_u64()
+                            .and_then(|n| usize::try_from(n).ok())
+                            .ok_or("invalid tensor shape")
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 let data = body
                     .get("data")
@@ -827,11 +833,10 @@ impl Vm {
                     .get("requires_grad")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                let size = if shape.is_empty() {
-                    1
-                } else {
-                    shape.iter().product()
-                };
+                let size = shape
+                    .iter()
+                    .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                    .ok_or("tensor shape element count overflow")?;
                 if size != data.len() {
                     return Err("tensor file shape/data mismatch".into());
                 }
@@ -1209,6 +1214,7 @@ impl Vm {
                 )?
             }
             "tensor_checkpoint_save" => {
+                crate::runtime::require_cap("fs.write")?;
                 if a.len() != 2 {
                     return Err("tensor_checkpoint_save expects map,path".into());
                 }
@@ -1245,6 +1251,7 @@ impl Vm {
                 Val::Num(pairs.len() as f64)
             }
             "tensor_checkpoint_load" => {
+                crate::runtime::require_cap("fs.read")?;
                 if a.len() != 1 {
                     return Err("tensor_checkpoint_load expects path".into());
                 }
@@ -1269,7 +1276,11 @@ impl Vm {
                         .and_then(JsonValue::as_array)
                         .ok_or("checkpoint tensor missing shape")?
                         .iter()
-                        .map(|v| v.as_u64().map(|n| n as usize).ok_or("invalid shape"))
+                        .map(|v| {
+                            v.as_u64()
+                                .and_then(|n| usize::try_from(n).ok())
+                                .ok_or("invalid shape")
+                        })
                         .collect::<Result<Vec<_>, _>>()?;
                     let data = t
                         .get("data")
@@ -1278,11 +1289,10 @@ impl Vm {
                         .iter()
                         .map(|v| v.as_f64().ok_or("invalid tensor value"))
                         .collect::<Result<Vec<_>, _>>()?;
-                    let size: usize = if shape.is_empty() {
-                        1
-                    } else {
-                        shape.iter().product()
-                    };
+                    let size = shape
+                        .iter()
+                        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                        .ok_or_else(|| format!("checkpoint tensor '{name}' shape overflow"))?;
                     if size != data.len() {
                         return Err(format!("checkpoint tensor '{name}' shape/data mismatch"));
                     }

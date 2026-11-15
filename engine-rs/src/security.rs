@@ -8,9 +8,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use rand::RngCore;
 use rand::rngs::OsRng;
-use sha2::{Digest, Sha256};
 
-use crate::value::constant_time_strings_equal;
+use crate::value::{constant_time_strings_equal, pbkdf2_hmac_sha256_bytes};
+
+fn zeroize_bytes(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    std::hint::black_box(buf);
+}
 
 pub(crate) fn random_bytes(len: usize) -> Result<Vec<u8>, String> {
     if len == 0 || len > 4096 {
@@ -265,17 +271,16 @@ pub(crate) fn verify_totp_at(
     if trimmed.len() != 6 || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
         return false;
     }
-    let max_win = window.min(10) as i64;
+    let max_win = window.min(2) as i64;
     let base_step = (timestamp_secs / 30) as i64;
+    let mut matched = 0u8;
     for delta in -max_win..=max_win {
         let step_secs = ((base_step + delta).max(0) as u64) * 30;
-        if let Ok(expected) = totp_code_at(secret_b32, step_secs, 6, 30)
-            && constant_time_strings_equal(&expected, trimmed)
-        {
-            return true;
+        if let Ok(expected) = totp_code_at(secret_b32, step_secs, 6, 30) {
+            matched |= u8::from(constant_time_strings_equal(&expected, trimmed));
         }
     }
-    false
+    matched != 0
 }
 
 pub(crate) fn totp_code_now(secret_b32: &str) -> Result<String, String> {
@@ -287,30 +292,49 @@ pub(crate) fn verify_totp_now(secret_b32: &str, code: &str, window: u32) -> bool
 }
 
 // ---------------------------------------------------------------------------
-// Pure-Rust AES-256-GCM (NIST FIPS 197 + SP 800-38D)
+// Constant-Time Pure-Rust AES-256-GCM (NIST FIPS 197 + SP 800-38D)
 // ---------------------------------------------------------------------------
 
-#[rustfmt::skip]
-const AES_SBOX: [u8; 256] = [
-    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
-    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
-    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
-    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
-    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
-    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
-    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
-    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
-    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
-    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
-    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
-    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
-    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
-    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
-    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
-    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
-];
-
+const PBKDF2_AES_ITERATIONS: u32 = 100_000;
+const PBKDF2_AES_DOMAIN: &[u8] = b"kovrek-aes256-gcm-v2\0";
 const RCON: [u8; 8] = [0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40];
+
+/// Branchless multiplication in GF(2^8) modulo Rijndael polynomial x^8 + x^4 + x^3 + x + 1.
+#[inline(always)]
+fn gf256_mul(mut a: u8, mut b: u8) -> u8 {
+    let mut p = 0u8;
+    for _ in 0..8 {
+        let b_mask = 0u8.wrapping_sub(b & 1);
+        p ^= a & b_mask;
+        let hi_mask = 0u8.wrapping_sub((a >> 7) & 1);
+        a = (a << 1) ^ (0x1b & hi_mask);
+        b >>= 1;
+    }
+    p
+}
+
+/// Branchless multiplicative inverse in GF(2^8) via a^254 (0 -> 0).
+#[inline(always)]
+fn gf256_inv(a: u8) -> u8 {
+    let a2 = gf256_mul(a, a);
+    let a3 = gf256_mul(a2, a);
+    let a6 = gf256_mul(a3, a3);
+    let a7 = gf256_mul(a6, a);
+    let a14 = gf256_mul(a7, a7);
+    let a15 = gf256_mul(a14, a);
+    let mut a240 = a15;
+    for _ in 0..4 {
+        a240 = gf256_mul(a240, a240);
+    }
+    gf256_mul(a240, a14)
+}
+
+/// Cache-timing-safe AES S-box with zero table lookups or secret-dependent branches.
+#[inline(always)]
+fn aes_sbox_ct(x: u8) -> u8 {
+    let inv = gf256_inv(x);
+    inv ^ inv.rotate_left(1) ^ inv.rotate_left(2) ^ inv.rotate_left(3) ^ inv.rotate_left(4) ^ 0x63
+}
 
 fn aes256_expand_key(key: &[u8; 32]) -> [[u8; 16]; 15] {
     let mut w = [[0u8; 4]; 60];
@@ -321,17 +345,17 @@ fn aes256_expand_key(key: &[u8; 32]) -> [[u8; 16]; 15] {
         let mut temp = w[i - 1];
         if i % 8 == 0 {
             temp = [
-                AES_SBOX[temp[1] as usize] ^ RCON[i / 8],
-                AES_SBOX[temp[2] as usize],
-                AES_SBOX[temp[3] as usize],
-                AES_SBOX[temp[0] as usize],
+                aes_sbox_ct(temp[1]) ^ RCON[i / 8],
+                aes_sbox_ct(temp[2]),
+                aes_sbox_ct(temp[3]),
+                aes_sbox_ct(temp[0]),
             ];
         } else if i % 8 == 4 {
             temp = [
-                AES_SBOX[temp[0] as usize],
-                AES_SBOX[temp[1] as usize],
-                AES_SBOX[temp[2] as usize],
-                AES_SBOX[temp[3] as usize],
+                aes_sbox_ct(temp[0]),
+                aes_sbox_ct(temp[1]),
+                aes_sbox_ct(temp[2]),
+                aes_sbox_ct(temp[3]),
             ];
         }
         for c in 0..4 {
@@ -344,12 +368,16 @@ fn aes256_expand_key(key: &[u8; 32]) -> [[u8; 16]; 15] {
             rk[r][col * 4..col * 4 + 4].copy_from_slice(&w[r * 4 + col]);
         }
     }
+    for word in &mut w {
+        zeroize_bytes(word);
+    }
     rk
 }
 
-#[inline]
+#[inline(always)]
 fn xtime(a: u8) -> u8 {
-    (a << 1) ^ (((a >> 7) & 1) * 0x1b)
+    let hi_mask = 0u8.wrapping_sub((a >> 7) & 1);
+    (a << 1) ^ (0x1b & hi_mask)
 }
 
 fn aes256_encrypt_block(rk: &[[u8; 16]; 15], input: &[u8; 16]) -> [u8; 16] {
@@ -359,7 +387,7 @@ fn aes256_encrypt_block(rk: &[[u8; 16]; 15], input: &[u8; 16]) -> [u8; 16] {
     }
     for round in 1..=14 {
         for b in &mut s {
-            *b = AES_SBOX[*b as usize];
+            *b = aes_sbox_ct(*b);
         }
         // ShiftRows (column-major: index = row + 4*col)
         let t1 = s[1];
@@ -395,19 +423,16 @@ fn aes256_encrypt_block(rk: &[[u8; 16]; 15], input: &[u8; 16]) -> [u8; 16] {
     s
 }
 
+/// Branchless constant-time multiplication in GF(2^128) for GHASH.
 fn ghash_mul(x: u128, y: u128) -> u128 {
     const R: u128 = 0xe100_0000_0000_0000_0000_0000_0000_0000;
     let mut z = 0u128;
     let mut v = y;
     for i in 0..128 {
-        if ((x >> (127 - i)) & 1) == 1 {
-            z ^= v;
-        }
-        let lsb = v & 1;
-        v >>= 1;
-        if lsb == 1 {
-            v ^= R;
-        }
+        let x_mask = 0u128.wrapping_sub((x >> (127 - i)) & 1);
+        z ^= v & x_mask;
+        let lsb_mask = 0u128.wrapping_sub(v & 1);
+        v = (v >> 1) ^ (R & lsb_mask);
     }
     z
 }
@@ -446,8 +471,16 @@ fn gctr(rk: &[[u8; 16]; 15], icb: [u8; 16], data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn derive_aes256_key(secret: &str) -> [u8; 32] {
-    Sha256::digest(secret.as_bytes()).into()
+fn derive_aes256_key_salted(secret: &str, salt: &[u8; 16]) -> [u8; 32] {
+    let mut domain_salt = Vec::with_capacity(PBKDF2_AES_DOMAIN.len() + salt.len());
+    domain_salt.extend_from_slice(PBKDF2_AES_DOMAIN);
+    domain_salt.extend_from_slice(salt);
+    let mut derived =
+        pbkdf2_hmac_sha256_bytes(secret.as_bytes(), &domain_salt, PBKDF2_AES_ITERATIONS, 32);
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&derived);
+    zeroize_bytes(&mut derived);
+    key
 }
 
 pub(crate) fn aes_gcm_seal_raw(
@@ -456,7 +489,7 @@ pub(crate) fn aes_gcm_seal_raw(
     aad: &[u8],
     plaintext: &[u8],
 ) -> (Vec<u8>, [u8; 16]) {
-    let rk = aes256_expand_key(key);
+    let mut rk = aes256_expand_key(key);
     let h = u128::from_be_bytes(aes256_encrypt_block(&rk, &[0u8; 16]));
     let mut j0 = [0u8; 16];
     j0[..12].copy_from_slice(iv);
@@ -471,6 +504,9 @@ pub(crate) fn aes_gcm_seal_raw(
     for i in 0..16 {
         tag[i] = gh[i] ^ e_j0[i];
     }
+    for round in &mut rk {
+        zeroize_bytes(round);
+    }
     (ct, tag)
 }
 
@@ -481,7 +517,7 @@ pub(crate) fn aes_gcm_open_raw(
     ciphertext: &[u8],
     tag: &[u8; 16],
 ) -> Result<Vec<u8>, String> {
-    let rk = aes256_expand_key(key);
+    let mut rk = aes256_expand_key(key);
     let h = u128::from_be_bytes(aes256_encrypt_block(&rk, &[0u8; 16]));
     let mut j0 = [0u8; 16];
     j0[..12].copy_from_slice(iv);
@@ -494,11 +530,18 @@ pub(crate) fn aes_gcm_open_raw(
         expected_tag[i] = gh[i] ^ e_j0[i];
     }
     if !constant_time_bytes_equal(&expected_tag, tag) {
+        for round in &mut rk {
+            zeroize_bytes(round);
+        }
         return Err("decryption failed: authentication tag mismatch".into());
     }
     let mut ctr0 = j0;
     inc32(&mut ctr0);
-    Ok(gctr(&rk, ctr0, ciphertext))
+    let pt = gctr(&rk, ctr0, ciphertext);
+    for round in &mut rk {
+        zeroize_bytes(round);
+    }
+    Ok(pt)
 }
 
 pub(crate) fn aes_gcm_encrypt_token(
@@ -509,12 +552,16 @@ pub(crate) fn aes_gcm_encrypt_token(
     if secret.is_empty() {
         return Err("encryption key must not be empty".into());
     }
-    let key = derive_aes256_key(secret);
+    let mut salt = [0u8; 16];
     let mut iv = [0u8; 12];
+    OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut iv);
+    let mut key = derive_aes256_key_salted(secret, &salt);
     let (ct, tag) = aes_gcm_seal_raw(&key, &iv, aad, plaintext.as_bytes());
+    zeroize_bytes(&mut key);
     Ok(format!(
-        "{}:{}:{}",
+        "v2:{}:{}:{}:{}",
+        bytes_to_hex(&salt),
         bytes_to_hex(&iv),
         bytes_to_hex(&tag),
         bytes_to_hex(&ct)
@@ -530,20 +577,26 @@ pub(crate) fn aes_gcm_decrypt_token(
         return Err("decryption key must not be empty".into());
     }
     let parts: Vec<&str> = token.trim().split(':').collect();
-    if parts.len() != 3 {
-        return Err("invalid encrypted payload format (expected iv:tag:ciphertext)".into());
+    if parts.len() != 5 || parts[0] != "v2" {
+        return Err("invalid encrypted payload format (expected v2:salt:iv:tag:ciphertext)".into());
     }
-    let iv_vec = hex_to_bytes(parts[0])?;
-    let tag_vec = hex_to_bytes(parts[1])?;
-    let ct = hex_to_bytes(parts[2])?;
+    let salt_vec = hex_to_bytes(parts[1])?;
+    let iv_vec = hex_to_bytes(parts[2])?;
+    let tag_vec = hex_to_bytes(parts[3])?;
+    let ct = hex_to_bytes(parts[4])?;
+    let salt: [u8; 16] = salt_vec
+        .try_into()
+        .map_err(|_| "invalid AES-GCM salt length (expected 16 bytes)".to_string())?;
     let iv: [u8; 12] = iv_vec
         .try_into()
         .map_err(|_| "invalid AES-GCM IV length (expected 12 bytes)".to_string())?;
     let tag: [u8; 16] = tag_vec
         .try_into()
         .map_err(|_| "invalid AES-GCM tag length (expected 16 bytes)".to_string())?;
-    let key = derive_aes256_key(secret);
-    let pt = aes_gcm_open_raw(&key, &iv, aad, &ct, &tag)?;
+    let mut key = derive_aes256_key_salted(secret, &salt);
+    let pt_res = aes_gcm_open_raw(&key, &iv, aad, &ct, &tag);
+    zeroize_bytes(&mut key);
+    let pt = pt_res?;
     String::from_utf8(pt).map_err(|e| format!("decrypted payload is not valid UTF-8: {e}"))
 }
 
@@ -561,6 +614,7 @@ pub(crate) fn is_private_ipv4(ip: Ipv4Addr) -> bool {
         || (o[0] == 172 && (16..=31).contains(&o[1]))
         || (o[0] == 192 && o[1] == 0 && o[2] == 0)
         || (o[0] == 192 && o[1] == 0 && o[2] == 2)
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
         || (o[0] == 192 && o[1] == 168)
         || (o[0] == 198 && (18..=19).contains(&o[1]))
         || (o[0] == 198 && o[1] == 51 && o[2] == 100)
@@ -576,14 +630,18 @@ pub(crate) fn is_private_ipv6(ip: Ipv6Addr) -> bool {
         return is_private_ipv4(v4);
     }
     let seg = ip.segments();
-    // Deprecated IPv4-compatible ::/96
-    if seg[..6] == [0, 0, 0, 0, 0, 0] {
+    // Deprecated IPv4-compatible ::/96 and SIIT IPv4-translated ::ffff:0:0:0/96
+    if seg[..6] == [0, 0, 0, 0, 0, 0] || seg[..6] == [0, 0, 0, 0, 0xffff, 0] {
         return is_private_ipv4(Ipv4Addr::new(
             (seg[6] >> 8) as u8,
             (seg[6] & 0xff) as u8,
             (seg[7] >> 8) as u8,
             (seg[7] & 0xff) as u8,
         ));
+    }
+    // Discard-only 100::/64 (RFC 6666)
+    if seg[..4] == [0x0100, 0, 0, 0] {
+        return true;
     }
     // NAT64 well-known 64:ff9b::/96 or local-use 64:ff9b:1::/48
     if seg[0] == 0x0064 && seg[1] == 0xff9b {
@@ -599,23 +657,22 @@ pub(crate) fn is_private_ipv6(ip: Ipv6Addr) -> bool {
             ));
         }
     }
-    // 6to4 (2002::/16) carrying embedded IPv4
-    if seg[0] == 0x2002 {
-        let embedded = Ipv4Addr::new(
-            (seg[1] >> 8) as u8,
-            (seg[1] & 0xff) as u8,
-            (seg[2] >> 8) as u8,
-            (seg[2] & 0xff) as u8,
-        );
-        if is_private_ipv4(embedded) {
-            return true;
-        }
+    // Deprecated 6to4 (2002::/16) and Teredo (2001::/32) tunneling prefixes
+    if seg[0] == 0x2002 || (seg[0] == 0x2001 && seg[1] == 0) {
+        return true;
     }
-    // ULA fc00::/7, link-local fe80::/10, deprecated site-local fec0::/10, doc 2001:db8::/32
+    // Benchmarking (2001:2::/48), ORCHIDv1/v2 (2001:10::/28, 2001:20::/28),
+    // documentation (2001:db8::/32, 3fff::/20), ULA (fc00::/7), link-local (fe80::/10),
+    // and deprecated site-local (fec0::/10).
     (seg[0] & 0xfe00) == 0xfc00
         || (seg[0] & 0xffc0) == 0xfe80
         || (seg[0] & 0xffc0) == 0xfec0
-        || (seg[0] == 0x2001 && seg[1] == 0x0db8)
+        || (seg[0] == 0x2001
+            && ((seg[1] == 0x0002 && seg[2] == 0)
+                || (seg[1] & 0xfff0) == 0x0010
+                || (seg[1] & 0xfff0) == 0x0020
+                || seg[1] == 0x0db8))
+        || (seg[0] == 0x3fff && (seg[1] & 0xf000) == 0)
 }
 
 pub(crate) fn is_private_ip_addr(ip: IpAddr) -> bool {
@@ -685,11 +742,14 @@ fn parse_numeric_ipv4_obfuscation(host: &str) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(val))
 }
 
-pub(crate) fn validate_public_url(
-    raw_url: &str,
-    allow_http: bool,
-) -> Result<ValidatedPublicUrl, String> {
+fn parse_http_url_parts(raw_url: &str, allow_http: bool) -> Result<ValidatedPublicUrl, String> {
     let trimmed = raw_url.trim();
+    if trimmed.len() > 8192 {
+        return Err("invalid URL: exceeds 8192 byte limit".into());
+    }
+    if trimmed.bytes().any(|b| b.is_ascii_control()) {
+        return Err("invalid URL: control characters are not allowed".into());
+    }
     let (scheme_raw, rest) = trimmed
         .split_once("://")
         .ok_or_else(|| "invalid URL: missing scheme".to_string())?;
@@ -704,6 +764,9 @@ pub(crate) fn validate_public_url(
     let authority = &rest[..auth_end];
     if authority.is_empty() {
         return Err("invalid URL: missing host".into());
+    }
+    if authority.bytes().any(|b| b.is_ascii_whitespace()) || !authority.is_ascii() {
+        return Err("invalid URL authority characters".into());
     }
     if authority.contains(['@', '\\']) {
         return Err("URL credentials or unsafe authority characters are not allowed".into());
@@ -742,29 +805,6 @@ pub(crate) fn validate_public_url(
     if host_norm.is_empty() {
         return Err("invalid URL: empty host".into());
     }
-    if host_norm == "localhost"
-        || host_norm.ends_with(".localhost")
-        || host_norm.ends_with(".local")
-        || host_norm.ends_with(".internal")
-        || host_norm.ends_with(".home.arpa")
-    {
-        return Err(format!("unsafe target host '{host_norm}' is blocked"));
-    }
-    let ip_candidate = host_norm
-        .split_once('%')
-        .map(|(a, _)| a)
-        .unwrap_or(&host_norm);
-    if let Ok(ip) = ip_candidate.parse::<IpAddr>()
-        && is_private_ip_addr(ip)
-    {
-        return Err(format!("unsafe target IP '{host_norm}' is blocked"));
-    }
-    if let Some(obf_v4) = parse_numeric_ipv4_obfuscation(&host_norm)
-        && is_private_ipv4(obf_v4)
-    {
-        return Err(format!("unsafe target IP '{obf_v4}' is blocked"));
-    }
-
     let authority_canonical = if host_norm.contains(':') {
         format!("[{host_norm}]")
     } else {
@@ -783,6 +823,75 @@ pub(crate) fn validate_public_url(
         origin,
         url: trimmed.to_string(),
     })
+}
+
+#[cfg_attr(not(feature = "native-services"), allow(dead_code))]
+fn is_metadata_or_unspecified_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_unspecified() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return mapped.is_unspecified() || mapped.is_link_local();
+            }
+            v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || (v6.segments()[0] == 0xfd00 && v6.segments()[1] == 0x0ec2)
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "native-services"), allow(dead_code))]
+pub(crate) fn validate_general_http_url(raw_url: &str) -> Result<ValidatedPublicUrl, String> {
+    let parsed = parse_http_url_parts(raw_url, true)?;
+    let host = &parsed.host;
+    if host == "metadata.google.internal" || host == "metadata.goog" {
+        return Err(format!("unsafe metadata host '{host}' is blocked"));
+    }
+    let ip_candidate = host.split_once('%').map(|(a, _)| a).unwrap_or(host);
+    if let Ok(ip) = ip_candidate.parse::<IpAddr>()
+        && is_metadata_or_unspecified_ip(ip)
+    {
+        return Err(format!("unsafe link-local/metadata IP '{host}' is blocked"));
+    }
+    if let Some(obf_v4) = parse_numeric_ipv4_obfuscation(host)
+        && (obf_v4.is_unspecified() || obf_v4.is_link_local())
+    {
+        return Err(format!(
+            "unsafe link-local/metadata IP '{obf_v4}' is blocked"
+        ));
+    }
+    Ok(parsed)
+}
+
+pub(crate) fn validate_public_url(
+    raw_url: &str,
+    allow_http: bool,
+) -> Result<ValidatedPublicUrl, String> {
+    let parsed = parse_http_url_parts(raw_url, allow_http)?;
+    let host_norm = &parsed.host;
+    if host_norm == "localhost"
+        || host_norm.ends_with(".localhost")
+        || host_norm.ends_with(".local")
+        || host_norm.ends_with(".internal")
+        || host_norm.ends_with(".home.arpa")
+    {
+        return Err(format!("unsafe target host '{host_norm}' is blocked"));
+    }
+    let ip_candidate = host_norm
+        .split_once('%')
+        .map(|(a, _)| a)
+        .unwrap_or(host_norm);
+    if let Ok(ip) = ip_candidate.parse::<IpAddr>()
+        && is_private_ip_addr(ip)
+    {
+        return Err(format!("unsafe target IP '{host_norm}' is blocked"));
+    }
+    if let Some(obf_v4) = parse_numeric_ipv4_obfuscation(host_norm)
+        && is_private_ipv4(obf_v4)
+    {
+        return Err(format!("unsafe target IP '{obf_v4}' is blocked"));
+    }
+    Ok(parsed)
 }
 
 pub(crate) fn resolve_public_url_addrs(
@@ -812,9 +921,134 @@ pub(crate) fn resolve_public_url_addrs(
     Ok(addrs)
 }
 
+#[cfg_attr(not(feature = "native-services"), allow(dead_code))]
+fn is_http_tchar(b: u8) -> bool {
+    matches!(
+        b,
+        b'!' | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+            | b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'a'..=b'z'
+    )
+}
+
+#[cfg_attr(not(feature = "native-services"), allow(dead_code))]
+pub(crate) fn validate_http_header_pair(
+    name: &str,
+    value: &str,
+    allow_host: bool,
+) -> Result<(), String> {
+    if name.is_empty() || name.len() > 256 || !name.bytes().all(is_http_tchar) {
+        return Err(format!("invalid HTTP header name '{name}'"));
+    }
+    if !allow_host
+        && (name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding"))
+    {
+        return Err(format!("restricted HTTP header '{name}' is not allowed"));
+    }
+    if value.len() > 16 * 1024 || value.bytes().any(|b| b != b'\t' && (b < 0x20 || b == 0x7f)) {
+        return Err(format!(
+            "invalid HTTP header value for '{name}': control characters or length overflow"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg_attr(not(feature = "native-services"), allow(dead_code))]
+pub(crate) fn read_to_end_limited<R: std::io::Read>(
+    reader: R,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    let mut limited = std::io::Read::take(reader, (max_bytes as u64).saturating_add(1));
+    std::io::Read::read_to_end(&mut limited, &mut buf).map_err(|e| e.to_string())?;
+    if buf.len() > max_bytes {
+        return Err(format!("{label} exceeded {max_bytes} byte limit"));
+    }
+    Ok(buf)
+}
+
+include!("shared_bounds.rs");
+
+#[cfg_attr(not(feature = "native-services"), allow(dead_code))]
+pub(crate) fn resolve_redirect_location(
+    base_url: &str,
+    origin: &str,
+    location: &str,
+) -> Result<String, String> {
+    let loc = location.trim();
+    if loc.bytes().any(|b| b.is_ascii_control()) {
+        return Err("redirect location contains invalid control characters".into());
+    }
+    if loc
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || loc
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+    {
+        return Ok(loc.to_string());
+    }
+    if loc.starts_with("//") {
+        let scheme = base_url
+            .split_once("://")
+            .map(|(s, _)| s)
+            .unwrap_or("https");
+        return Ok(format!("{scheme}:{loc}"));
+    }
+    if loc.starts_with('/') {
+        return Ok(format!("{origin}{loc}"));
+    }
+    Err("relative redirect without leading '/' blocked".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aes_sbox_ct_is_bijective_and_matches_fips_197() {
+        let mut seen = [false; 256];
+        for x in 0u8..=255 {
+            let y = aes_sbox_ct(x);
+            assert!(!seen[y as usize], "duplicate S-box output at 0x{x:02x}");
+            seen[y as usize] = true;
+        }
+        assert_eq!(aes_sbox_ct(0x00), 0x63);
+        assert_eq!(aes_sbox_ct(0x01), 0x7c);
+        assert_eq!(aes_sbox_ct(0x53), 0xed);
+        assert_eq!(aes_sbox_ct(0xff), 0x16);
+
+        // FIPS-197 Appendix C.3 AES-256 ECB exact known-answer vector
+        let key: [u8; 32] =
+            hex_to_bytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let pt: [u8; 16] = hex_to_bytes("00112233445566778899aabbccddeeff")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let rk = aes256_expand_key(&key);
+        let ct = aes256_encrypt_block(&rk, &pt);
+        assert_eq!(bytes_to_hex(&ct), "8ea2b7ca516745bfeafc49904b496089");
+    }
 
     #[test]
     fn aes_256_gcm_nist_vector_and_token_roundtrip() {
@@ -835,9 +1069,16 @@ mod tests {
         let dec = aes_gcm_open_raw(&key, &iv, &[], &ct, &tag).unwrap();
         assert_eq!(dec, pt);
 
-        // Token roundtrip + tamper rejection
+        // Salted PBKDF2 v2 token roundtrip, per-encryption uniqueness, and tamper/downgrade rejection
         let tok =
             aes_gcm_encrypt_token("super-secret-master-key", "kovrek-mfa-secret", b"ctx").unwrap();
+        let tok2 =
+            aes_gcm_encrypt_token("super-secret-master-key", "kovrek-mfa-secret", b"ctx").unwrap();
+        assert!(tok.starts_with("v2:"));
+        assert_ne!(
+            tok, tok2,
+            "distinct CSPRNG salts and IVs must produce distinct ciphertexts"
+        );
         assert_eq!(
             aes_gcm_decrypt_token("super-secret-master-key", &tok, b"ctx").unwrap(),
             "kovrek-mfa-secret"
@@ -846,6 +1087,12 @@ mod tests {
         assert!(aes_gcm_decrypt_token("super-secret-master-key", &tok, b"wrong-ctx").is_err());
         let tampered = format!("{}0", &tok[..tok.len() - 1]);
         assert!(aes_gcm_decrypt_token("super-secret-master-key", &tampered, b"ctx").is_err());
+        // Legacy unsalted 3-part tokens must be rejected
+        assert!(aes_gcm_decrypt_token(
+            "super-secret-master-key",
+            "000000000000000000000000:d0d1c8a799996bf0265b98b5d48ab919:cea7403d4d606b6e074ec5d3baf39d18",
+            b"ctx"
+        ).is_err());
     }
 
     #[test]
@@ -878,6 +1125,16 @@ mod tests {
             "fc00::1",
             "[::ffff:127.0.0.1]",
             "::ffff:169.254.169.254",
+            "::ffff:0:127.0.0.1",
+            "192.88.99.1",
+            "100::1",
+            "2001::1",
+            "2001:2::1",
+            "2001:20::1",
+            "2002:0808:0808::1",
+            "64:ff9b::127.0.0.1",
+            "64:ff9b:1::1",
+            "3fff::1",
         ] {
             assert!(
                 is_private_ip_str(priv_ip),
@@ -897,6 +1154,11 @@ mod tests {
         assert!(validate_public_url("http://127.1/admin", true).is_err());
         assert!(validate_public_url("http://evil.com\\@127.0.0.1/admin", true).is_err());
         assert!(validate_public_url("http://[::ffff:127.0.0.1]/admin", true).is_err());
+        assert!(validate_public_url("https://[2001::1]/admin", true).is_err());
+        assert!(validate_public_url("https://[64:ff9b::169.254.169.254]/", true).is_err());
+        assert!(validate_public_url("https://example.com\r\nHost: evil", true).is_err());
+        assert!(validate_public_url("https://ex ample.com/hook", true).is_err());
+        assert!(validate_public_url("https://évil.com/hook", true).is_err());
         assert!(validate_public_url("http://example.com/hook", false).is_err());
         let ok = validate_public_url("https://example.com/webhooks/helm", false).unwrap();
         assert_eq!(ok.origin, "https://example.com");

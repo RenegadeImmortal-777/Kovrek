@@ -37,26 +37,92 @@ case "$OS" in
 esac
 
 if [ -n "${KOVREK_VERSION:-}" ]; then
-  URL="https://github.com/$REPO/releases/download/$KOVREK_VERSION/$ASSET"
+  case "$KOVREK_VERSION" in
+    v*[!/]* )
+      case "$KOVREK_VERSION" in
+        *..*|*[!A-Za-z0-9._-]*)
+          echo "Error: invalid KOVREK_VERSION '$KOVREK_VERSION'." >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    *)
+      echo "Error: KOVREK_VERSION must start with 'v' (got '$KOVREK_VERSION')." >&2
+      exit 1
+      ;;
+  esac
+  BASE_URL="https://github.com/$REPO/releases/download/$KOVREK_VERSION"
 else
-  URL="https://github.com/$REPO/releases/latest/download/$ASSET"
+  BASE_URL="https://github.com/$REPO/releases/latest/download"
 fi
 
-mkdir -p "$BIN_DIR"
-TMP_BIN="$BIN_DIR/.kovrek.tmp.$$"
-trap 'rm -f "$TMP_BIN"' EXIT INT TERM
+URL="$BASE_URL/$ASSET"
+SUMS_URL="$BASE_URL/SHA256SUMS.txt"
 
-echo "Downloading $ASSET from $URL ..."
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$URL" -o "$TMP_BIN"
-elif command -v wget >/dev/null 2>&1; then
-  wget -qO "$TMP_BIN" "$URL"
-else
-  echo "Error: curl or wget is required to install Kovrek." >&2
+download_file() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --proto '=https' --tlsv1.2 "$1" -o "$2"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q --https-only -O "$2" "$1"
+  else
+    echo "Error: curl or wget is required to install Kovrek." >&2
+    exit 1
+  fi
+}
+
+compute_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print tolower($1)}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | awk '{print tolower($NF)}'
+  else
+    echo "Error: sha256sum, shasum, or openssl is required to verify binary integrity." >&2
+    exit 1
+  fi
+}
+
+mkdir -p "$BIN_DIR"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/kovrek-install.XXXXXX")"
+TMP_BIN="$TMP_DIR/$ASSET"
+TMP_SUMS="$TMP_DIR/SHA256SUMS.txt"
+trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
+
+echo "Downloading $ASSET and SHA256SUMS.txt from $BASE_URL ..."
+download_file "$URL" "$TMP_BIN"
+download_file "$SUMS_URL" "$TMP_SUMS"
+
+EXPECTED_SUM="$(awk -v asset="$ASSET" '
+  {
+    name = $2
+    sub(/^\*/, "", name)
+    sub(/^\.\//, "", name)
+    if (name == asset) {
+      print tolower($1)
+      exit
+    }
+  }
+' "$TMP_SUMS")"
+
+case "$EXPECTED_SUM" in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+    ;;
+  *)
+    echo "Error: could not find valid SHA-256 digest for '$ASSET' in SHA256SUMS.txt." >&2
+    exit 1
+    ;;
+esac
+
+ACTUAL_SUM="$(compute_sha256 "$TMP_BIN")"
+if [ "$ACTUAL_SUM" != "$EXPECTED_SUM" ]; then
+  echo "Error: SHA-256 verification failed for $ASSET!" >&2
+  echo "  expected: $EXPECTED_SUM" >&2
+  echo "  actual:   $ACTUAL_SUM" >&2
   exit 1
 fi
 
-chmod +x "$TMP_BIN"
+chmod 755 "$TMP_BIN"
 mv "$TMP_BIN" "$BIN_DIR/kovrek"
 
 if [ -d "$LOCAL_BIN" ] || mkdir -p "$LOCAL_BIN" 2>/dev/null; then

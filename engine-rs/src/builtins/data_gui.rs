@@ -142,6 +142,7 @@ impl Vm {
                 ])
             }
             "plot_svg" => {
+                crate::runtime::require_cap("fs.write")?;
                 if a.len() != 3 {
                     return Err("plot_svg expects path,xs,ys".into());
                 }
@@ -178,6 +179,7 @@ impl Vm {
                 Val::Null
             }
             "scatter_svg" => {
+                crate::runtime::require_cap("fs.write")?;
                 if a.len() != 3 {
                     return Err("scatter_svg expects path,xs,ys".into());
                 }
@@ -213,6 +215,7 @@ impl Vm {
                 Val::Null
             }
             "bar_svg" => {
+                crate::runtime::require_cap("fs.write")?;
                 if a.len() != 3 {
                     return Err("bar_svg expects path,labels,values".into());
                 }
@@ -741,6 +744,7 @@ impl Vm {
                 Val::List(out)
             }
             "csv_read" => {
+                crate::runtime::require_cap("fs.read")?;
                 if a.len() != 1 {
                     return Err("csv_read expects path".into());
                 }
@@ -774,6 +778,7 @@ impl Vm {
                 Val::List(rows)
             }
             "csv_write" => {
+                crate::runtime::require_cap("fs.write")?;
                 if a.len() != 2 {
                     return Err("csv_write expects path,rows".into());
                 }

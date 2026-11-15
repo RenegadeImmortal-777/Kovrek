@@ -214,7 +214,14 @@ fn encode_val(v: &Val) -> JsonValue {
     }
 }
 
-fn decode_val(j: &JsonValue) -> Result<Val, String> {
+const MAX_KVBC_DEPTH: usize = 128;
+const MAX_KVBC_SLOTS: usize = 65_536;
+const MAX_KVBC_OPS: usize = 1_000_000;
+
+fn decode_val(j: &JsonValue, depth: usize) -> Result<Val, String> {
+    if depth >= MAX_KVBC_DEPTH {
+        return Err("kvbc: value nesting exceeds max depth".into());
+    }
     let t = j
         .get("t")
         .and_then(JsonValue::as_str)
@@ -243,7 +250,7 @@ fn decode_val(j: &JsonValue) -> Result<Val, String> {
                 .and_then(JsonValue::as_array)
                 .ok_or("kvbc: invalid list")?;
             arr.iter()
-                .map(decode_val)
+                .map(|x| decode_val(x, depth + 1))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Val::List)
         }
@@ -258,7 +265,10 @@ fn decode_val(j: &JsonValue) -> Result<Val, String> {
                 if pair.len() != 2 {
                     return Err("kvbc: map entry must have 2 elements".into());
                 }
-                pairs.push((decode_val(&pair[0])?, decode_val(&pair[1])?));
+                pairs.push((
+                    decode_val(&pair[0], depth + 1)?,
+                    decode_val(&pair[1], depth + 1)?,
+                ));
             }
             Ok(Val::Map(pairs))
         }
@@ -394,8 +404,17 @@ fn json_as_usize(v: &JsonValue) -> Option<usize> {
         .or_else(|| v.as_f64().map(|n| n as usize))
 }
 
-fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
+fn decode_ops(j: &JsonValue, depth: usize) -> Result<Vec<Op>, String> {
+    if depth >= MAX_KVBC_DEPTH {
+        return Err("kvbc: bytecode nesting exceeds max depth".into());
+    }
     let arr = j.as_array().ok_or("kvbc: ops must be an array")?;
+    if arr.len() > MAX_KVBC_OPS {
+        return Err(format!(
+            "kvbc: op count {} exceeds limit {MAX_KVBC_OPS}",
+            arr.len()
+        ));
+    }
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
         let tag = item
@@ -405,6 +424,7 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
         let op = match tag {
             "Const" => Op::Const(decode_val(
                 item.get("val").ok_or("kvbc: Const missing val")?,
+                depth + 1,
             )?),
             "Load" => Op::Load(
                 item.get("name")
@@ -430,27 +450,50 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
                     .ok_or("kvbc: Store missing name")?
                     .to_string(),
             ),
-            "LoadLocal" => Op::LoadLocal(
-                item.get("slot")
+            "LoadLocal" => {
+                let slot = item
+                    .get("slot")
                     .and_then(json_as_usize)
-                    .ok_or("kvbc: LoadLocal missing slot")?,
-            ),
-            "DefineLocal" => Op::DefineLocal(
-                item.get("slot")
+                    .ok_or("kvbc: LoadLocal missing slot")?;
+                if slot >= MAX_KVBC_SLOTS {
+                    return Err(format!(
+                        "kvbc: LoadLocal slot {slot} exceeds limit {MAX_KVBC_SLOTS}"
+                    ));
+                }
+                Op::LoadLocal(slot)
+            }
+            "DefineLocal" => {
+                let slot = item
+                    .get("slot")
                     .and_then(json_as_usize)
-                    .ok_or("kvbc: DefineLocal missing slot")?,
-                item.get("const")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false),
-                item.get("type")
-                    .and_then(JsonValue::as_str)
-                    .map(ToString::to_string),
-            ),
-            "StoreLocal" => Op::StoreLocal(
-                item.get("slot")
+                    .ok_or("kvbc: DefineLocal missing slot")?;
+                if slot >= MAX_KVBC_SLOTS {
+                    return Err(format!(
+                        "kvbc: DefineLocal slot {slot} exceeds limit {MAX_KVBC_SLOTS}"
+                    ));
+                }
+                Op::DefineLocal(
+                    slot,
+                    item.get("const")
+                        .and_then(JsonValue::as_bool)
+                        .unwrap_or(false),
+                    item.get("type")
+                        .and_then(JsonValue::as_str)
+                        .map(ToString::to_string),
+                )
+            }
+            "StoreLocal" => {
+                let slot = item
+                    .get("slot")
                     .and_then(json_as_usize)
-                    .ok_or("kvbc: StoreLocal missing slot")?,
-            ),
+                    .ok_or("kvbc: StoreLocal missing slot")?;
+                if slot >= MAX_KVBC_SLOTS {
+                    return Err(format!(
+                        "kvbc: StoreLocal slot {slot} exceeds limit {MAX_KVBC_SLOTS}"
+                    ));
+                }
+                Op::StoreLocal(slot)
+            }
             "Pop" => Op::Pop,
             "Add" => Op::Add,
             "Sub" => Op::Sub,
@@ -550,7 +593,7 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
                 item.get("async")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false),
-                decode_ops(item.get("body").ok_or("kvbc: Def missing body")?)?,
+                decode_ops(item.get("body").ok_or("kvbc: Def missing body")?, depth + 1)?,
             ),
             "BuildClass" => {
                 let name = item
@@ -562,7 +605,10 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
                     .get("base_count")
                     .and_then(json_as_usize)
                     .ok_or("kvbc: BuildClass missing base_count")?;
-                let body = decode_ops(item.get("body").ok_or("kvbc: BuildClass missing body")?)?;
+                let body = decode_ops(
+                    item.get("body").ok_or("kvbc: BuildClass missing body")?,
+                    depth + 1,
+                )?;
                 Op::BuildClass(name, base_count, body)
             }
             "DefClass" => {
@@ -591,7 +637,7 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
                             .and_then(JsonValue::as_str)
                             .map(ToString::to_string),
                         m.get("async").and_then(JsonValue::as_bool).unwrap_or(false),
-                        decode_ops(m.get("body").ok_or("kvbc: method missing body")?)?,
+                        decode_ops(m.get("body").ok_or("kvbc: method missing body")?, depth + 1)?,
                     ));
                 }
                 Op::DefClass(name, parent, methods)
@@ -624,6 +670,19 @@ fn decode_ops(j: &JsonValue) -> Result<Vec<Op>, String> {
         };
         out.push(op);
     }
+    let len = out.len();
+    for op in &out {
+        match op {
+            Op::Jump(target) | Op::JumpIfFalse(target) | Op::PushHandler(target, _)
+                if *target > len =>
+            {
+                return Err(format!(
+                    "kvbc: invalid control-flow target {target} outside block len {len}"
+                ));
+            }
+            _ => {}
+        }
+    }
     Ok(out)
 }
 
@@ -640,6 +699,9 @@ pub(crate) fn encode_bytecode(code: &[Op]) -> Result<String, String> {
 }
 
 pub(crate) fn decode_bytecode(text: &str) -> Result<Vec<Op>, String> {
+    if text.len() > 64 * 1024 * 1024 {
+        return Err("kvbc: bytecode payload exceeds 64 MiB limit".into());
+    }
     let doc: JsonValue =
         serde_json::from_str(text).map_err(|e| format!("invalid kvbc JSON: {e}"))?;
     let fmt = doc
@@ -656,10 +718,10 @@ pub(crate) fn decode_bytecode(text: &str) -> Result<Vec<Op>, String> {
     let ops = doc.get("ops").ok_or("kvbc: missing ops array")?;
     let canonical_ops = serde_json::to_string(ops).map_err(|e| e.to_string())?;
     let actual_sha = format!("{:x}", Sha256::digest(canonical_ops.as_bytes()));
-    if actual_sha != expected_sha {
+    if !crate::value::constant_time_strings_equal(&actual_sha, expected_sha) {
         return Err(format!(
             "kvbc checksum mismatch: expected {expected_sha}, got {actual_sha}"
         ));
     }
-    decode_ops(ops)
+    decode_ops(ops, 0)
 }

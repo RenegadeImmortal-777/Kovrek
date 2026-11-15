@@ -157,7 +157,47 @@ pub(crate) fn current_caps() -> Option<Vec<String>> {
     })
 }
 
-struct CapGuard {
+fn cap_grant_covers(grant: &str, requested: &str) -> bool {
+    if grant == "*" || grant.eq_ignore_ascii_case("all") || grant == requested {
+        return true;
+    }
+    requested
+        .split_once('.')
+        .is_some_and(|(cat, _)| cat == grant)
+}
+
+fn cap_set_allows(grants: &HashSet<String>, cap: &str) -> bool {
+    grants.iter().any(|g| cap_grant_covers(g, cap))
+}
+
+fn attenuate_cap_sets(outer: &HashSet<String>, req_set: &HashSet<String>) -> HashSet<String> {
+    if req_set.contains("*") || req_set.contains("all") {
+        return outer.clone();
+    }
+    if outer.contains("*") || outer.contains("all") {
+        return req_set.clone();
+    }
+    let mut out = HashSet::new();
+    for g in req_set {
+        if cap_set_allows(outer, g) {
+            out.insert(g.clone());
+        }
+    }
+    for o in outer {
+        if cap_set_allows(req_set, o) {
+            out.insert(o.clone());
+        }
+    }
+    out
+}
+
+pub(crate) fn snapshot_caps() -> Option<HashSet<String>> {
+    ACTIVE_CAPS
+        .with(|cell| cell.borrow().clone())
+        .or_else(env_cap_override)
+}
+
+pub(crate) struct CapGuard {
     prev: Option<HashSet<String>>,
 }
 
@@ -168,6 +208,15 @@ impl Drop for CapGuard {
             *cell.borrow_mut() = prev;
         });
     }
+}
+
+pub(crate) fn enter_captured_caps(captured: Option<HashSet<String>>) -> CapGuard {
+    let prev = ACTIVE_CAPS.with(|cell| {
+        let old = cell.borrow().clone();
+        *cell.borrow_mut() = captured;
+        old
+    });
+    CapGuard { prev }
 }
 
 pub(crate) fn run_with_caps<T>(
@@ -185,14 +234,9 @@ pub(crate) fn run_with_caps<T>(
                 Some(req_set)
             }
         }
-        Some(outer) => {
-            if req_set.contains("*") || req_set.contains("all") {
-                Some(outer)
-            } else {
-                // Monotonic attenuation: inner scope can NEVER escalate beyond outer capabilities.
-                Some(outer.into_iter().filter(|c| req_set.contains(c)).collect())
-            }
-        }
+        // Monotonic attenuation: inner scope can NEVER escalate beyond outer capabilities,
+        // while preserving sub-capabilities when attenuating e.g. outer "fs" -> inner "fs.read".
+        Some(outer) => Some(attenuate_cap_sets(&outer, &req_set)),
     };
     ACTIVE_CAPS.with(|cell| {
         *cell.borrow_mut() = attenuated;

@@ -28,6 +28,7 @@ pub(crate) struct JitCallCtx {
     pub(crate) lists_ptr: *const JitSlice,
     pub(crate) list_count: usize,
     pub(crate) oob: u8,
+    pub(crate) depth_rem: u32,
     pub(crate) dyn_lists_ptr: *mut Vec<Vec<f64>>,
     pub(crate) dyn_slices_ptr: *mut Vec<JitSlice>,
 }
@@ -134,9 +135,9 @@ unsafe impl Send for CompiledJitFn {}
 unsafe impl Sync for CompiledJitFn {}
 
 impl CompiledJitFn {
-    pub(crate) fn invoke(&self, args: &[Val]) -> Option<Val> {
+    pub(crate) fn invoke(&self, args: &[Val]) -> Result<Option<Val>, String> {
         if args.len() != self.param_kinds.len() {
-            return None;
+            return Ok(None);
         }
         let mut raw_args = [0.0f64; 16];
         let mut heap_args: Vec<f64> = Vec::new();
@@ -163,13 +164,19 @@ impl CompiledJitFn {
 
         let arg_ptr = if args.len() <= raw_args.len() {
             for (i, (v, &kind)) in args.iter().zip(self.param_kinds.iter()).enumerate() {
-                raw_args[i] = pack_arg(v, kind, &mut flat_lists)?;
+                let Some(packed) = pack_arg(v, kind, &mut flat_lists) else {
+                    return Ok(None);
+                };
+                raw_args[i] = packed;
             }
             raw_args.as_ptr()
         } else {
             heap_args.reserve(args.len());
             for (v, &kind) in args.iter().zip(self.param_kinds.iter()) {
-                heap_args.push(pack_arg(v, kind, &mut flat_lists)?);
+                let Some(packed) = pack_arg(v, kind, &mut flat_lists) else {
+                    return Ok(None);
+                };
+                heap_args.push(packed);
             }
             heap_args.as_ptr()
         };
@@ -181,6 +188,7 @@ impl CompiledJitFn {
                 len: v.len(),
             })
             .collect();
+        const MAX_JIT_STACK_BYTES: u32 = 768 * 1024;
         let mut ctx = JitCallCtx {
             lists_ptr: if slices.is_empty() {
                 core::ptr::null()
@@ -189,20 +197,25 @@ impl CompiledJitFn {
             },
             list_count: slices.len(),
             oob: 0,
+            depth_rem: MAX_JIT_STACK_BYTES,
             dyn_lists_ptr: &mut flat_lists as *mut Vec<Vec<f64>>,
             dyn_slices_ptr: &mut slices as *mut Vec<JitSlice>,
         };
         let out = unsafe { (self.entry)(arg_ptr, args.len(), &mut ctx) };
-        if ctx.oob != 0 {
-            return None;
+        if ctx.oob == 2 {
+            return Err("call stack depth exceeded JIT stack budget (768 KiB)".into());
         }
-        Some(match self.return_kind {
-            JitReturnKind::Num => Val::Num(out),
-            JitReturnKind::Bool => Val::Bool(out != 0.0 && !out.is_nan()),
+        if ctx.oob != 0 {
+            return Ok(None);
+        }
+        Ok(match self.return_kind {
+            JitReturnKind::Num => Some(Val::Num(out)),
+            JitReturnKind::Bool => Some(Val::Bool(out != 0.0 && !out.is_nan())),
             JitReturnKind::NumList => {
                 let idx = out.to_bits() as usize;
-                let items = flat_lists.get(idx)?;
-                Val::List(items.iter().copied().map(Val::Num).collect())
+                flat_lists
+                    .get(idx)
+                    .map(|items| Val::List(items.iter().copied().map(Val::Num).collect()))
             }
         })
     }
@@ -477,24 +490,28 @@ pub(crate) fn jit_try_run(
     args: &[Val],
     call_count: u32,
     callee_lookup: &dyn Fn(&str) -> Option<FunctionDef>,
-) -> Option<Val> {
+) -> Result<Option<Val>, String> {
     if !jit_is_enabled() {
-        return None;
+        return Ok(None);
     }
     if def.is_async || def.is_generator || !def.captures.is_empty() || !def.upvalues.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let kinds = observe_runtime_param_kinds(def, args)?;
+    let Some(kinds) = observe_runtime_param_kinds(def, args) else {
+        return Ok(None);
+    };
     let key = jit_variant_key(name, def, &kinds);
     let compiled = {
-        let guard = jit_cache().lock().ok()?;
+        let Ok(guard) = jit_cache().lock() else {
+            return Ok(None);
+        };
         match guard.get(&key) {
             Some(CachedJit::Compiled(f)) => Some(f.clone()),
             Some(CachedJit::Unsupported(_)) => {
                 jit_stats_store()
                     .fallback_calls
                     .fetch_add(1, Ordering::Relaxed);
-                return None;
+                return Ok(None);
             }
             None => None,
         }
@@ -508,13 +525,13 @@ pub(crate) fn jit_try_run(
                 jit_stats_store()
                     .fallback_calls
                     .fetch_add(1, Ordering::Relaxed);
-                return None;
+                return Ok(None);
             }
         }
     } else {
-        return None;
+        return Ok(None);
     };
-    let res = compiled.invoke(args);
+    let res = compiled.invoke(args)?;
     if res.is_some() {
         jit_stats_store()
             .native_calls
@@ -524,7 +541,7 @@ pub(crate) fn jit_try_run(
             .fallback_calls
             .fetch_add(1, Ordering::Relaxed);
     }
-    res
+    Ok(res)
 }
 
 pub(crate) fn jit_info_val() -> Val {
@@ -1311,11 +1328,15 @@ fn compile_x86_64_code(
     let total_slots = local_count + plan.max_stack;
     let slot_bytes = (total_slots * 8 + 15) & !15;
     let frame_bytes = (32 + slot_bytes) as i32;
+    if frame_bytes > 2048 {
+        return Err("JIT stack frame exceeds safe 2 KiB recursion budget".into());
+    }
 
     struct Asm {
         code: Vec<u8>,
         patches: Vec<(usize, usize)>,
         epilogue_jumps: Vec<usize>,
+        abort_jumps: Vec<usize>,
     }
 
     impl Asm {
@@ -1422,7 +1443,16 @@ fn compile_x86_64_code(
         code: Vec::with_capacity(def.code.len() * 16 + 128),
         patches: Vec::new(),
         epilogue_jumps: Vec::new(),
+        abort_jumps: Vec::new(),
     };
+    let oob_off = u8::try_from(core::mem::offset_of!(JitCallCtx, oob))
+        .ok()
+        .filter(|&v| v <= 127)
+        .ok_or("JitCallCtx::oob offset out of disp8 range")?;
+    let depth_off = u8::try_from(core::mem::offset_of!(JitCallCtx, depth_rem))
+        .ok()
+        .filter(|&v| v <= 127)
+        .ok_or("JitCallCtx::depth_rem offset out of disp8 range")?;
 
     // Prologue: save rbp, rbx, r12 (keeps rsp 16-byte aligned), allocate frame, rbx = &slots[0], r12 = ctx
     asm.code.push(0x55); // push rbp
@@ -1438,6 +1468,31 @@ fn compile_x86_64_code(
     asm.code.extend_from_slice(&[0x4D, 0x89, 0xC4]); // mov r12, r8
     #[cfg(not(windows))]
     asm.code.extend_from_slice(&[0x49, 0x89, 0xD4]); // mov r12, rdx
+
+    // Abort immediately if an error/oob flag is latched or native recursion depth is exhausted.
+    asm.code
+        .extend_from_slice(&[0x41, 0x80, 0x7C, 0x24, oob_off, 0x00]); // cmp byte ptr [r12 + oob], 0
+    asm.code.extend_from_slice(&[0x74, 0x09]); // je +9
+    asm.code.extend_from_slice(&[0x66, 0x0F, 0x57, 0xC0]); // xorpd xmm0, xmm0
+    asm.code.push(0xE9);
+    asm.abort_jumps.push(asm.code.len());
+    asm.emit_i32(0);
+
+    let frame_cost = (frame_bytes as u32) + 32;
+    asm.code
+        .extend_from_slice(&[0x41, 0x81, 0x7C, 0x24, depth_off]); // cmp dword ptr [r12 + depth_rem], imm32
+    asm.emit_u32(frame_cost);
+    asm.code.extend_from_slice(&[0x73, 0x0F]); // jae +15
+    asm.code
+        .extend_from_slice(&[0x41, 0xC6, 0x44, 0x24, oob_off, 0x02]); // mov byte ptr [r12 + oob], 2
+    asm.code.extend_from_slice(&[0x66, 0x0F, 0x57, 0xC0]); // xorpd xmm0, xmm0
+    asm.code.push(0xE9);
+    asm.abort_jumps.push(asm.code.len());
+    asm.emit_i32(0);
+
+    asm.code
+        .extend_from_slice(&[0x41, 0x81, 0x6C, 0x24, depth_off]); // sub dword ptr [r12 + depth_rem], imm32
+    asm.emit_u32(frame_cost);
 
     // Copy 64-bit parameters from args_ptr into locals[0..arity]
     for i in 0..def.params.len() {
@@ -1699,6 +1754,15 @@ fn compile_x86_64_code(
                             }
                             _ => unreachable!(),
                         }
+                        if matches!(res, CallResolution::SelfCall | CallResolution::InterFn(_)) {
+                            asm.code
+                                .extend_from_slice(&[0x41, 0x80, 0x7C, 0x24, oob_off, 0x00]); // cmp byte ptr [r12 + oob], 0
+                            asm.code.extend_from_slice(&[0x74, 0x09]); // je +9
+                            asm.code.extend_from_slice(&[0x66, 0x0F, 0x57, 0xC0]); // xorpd xmm0, xmm0
+                            asm.code.push(0xE9);
+                            asm.epilogue_jumps.push(asm.code.len());
+                            asm.emit_i32(0);
+                        }
                         asm.push_xmm0(&mut depth, local_count);
                     }
                 }
@@ -1737,6 +1801,10 @@ fn compile_x86_64_code(
     }
 
     let epilogue_off = asm.code.len();
+    asm.code
+        .extend_from_slice(&[0x41, 0x81, 0x44, 0x24, depth_off]); // add dword ptr [r12 + depth_rem], imm32
+    asm.emit_u32(frame_cost);
+    let epilogue_abort_off = asm.code.len();
     asm.code.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, imm32
     asm.emit_i32(frame_bytes);
     asm.code.extend_from_slice(&[0x41, 0x5C]); // pop r12
@@ -1755,6 +1823,10 @@ fn compile_x86_64_code(
         let rel = (epilogue_off as isize - (patch_at as isize + 4)) as i32;
         asm.code[patch_at..patch_at + 4].copy_from_slice(&rel.to_le_bytes());
     }
+    for patch_at in asm.abort_jumps {
+        let rel = (epilogue_abort_off as isize - (patch_at as isize + 4)) as i32;
+        asm.code[patch_at..patch_at + 4].copy_from_slice(&rel.to_le_bytes());
+    }
 
     Ok(asm.code)
 }
@@ -1769,10 +1841,19 @@ fn compile_aarch64_code(
     let local_count = def.local_count.max(def.params.len());
     let total_slots = local_count + plan.max_stack;
     let slot_bytes = (total_slots * 8 + 15) & !15;
-    if slot_bytes >= 4096 {
-        return Err("ARM64 JIT stack frame exceeds single imm12 page".into());
+    if slot_bytes > 2048 {
+        return Err("ARM64 JIT stack frame exceeds recursion safety limit".into());
     }
     let frame_imm = slot_bytes as u32;
+    let oob_off = u32::try_from(core::mem::offset_of!(JitCallCtx, oob))
+        .ok()
+        .filter(|&v| v < 4096)
+        .ok_or("JitCallCtx::oob offset out of ARM64 imm12 range")?;
+    let depth_off = u32::try_from(core::mem::offset_of!(JitCallCtx, depth_rem))
+        .ok()
+        .filter(|&v| v.is_multiple_of(4) && v / 4 < 4096)
+        .ok_or("JitCallCtx::depth_rem offset out of ARM64 scaled imm12 range")?;
+    let depth_imm12 = depth_off / 4;
 
     enum ArmBranch {
         B(usize, usize),
@@ -1783,6 +1864,7 @@ fn compile_aarch64_code(
         words: Vec<u32>,
         branches: Vec<ArmBranch>,
         epilogue_jumps: Vec<usize>,
+        abort_jumps: Vec<usize>,
     }
 
     impl ArmAsm {
@@ -1873,6 +1955,7 @@ fn compile_aarch64_code(
         words: Vec::with_capacity(def.code.len() * 6 + 32),
         branches: Vec::new(),
         epilogue_jumps: Vec::new(),
+        abort_jumps: Vec::new(),
     };
 
     // Prologue:
@@ -1890,6 +1973,38 @@ fn compile_aarch64_code(
     asm.emit(0x9100_03F3);
     // MOV X20, X2 (ctx pointer)
     asm.emit(0xAA02_03F4);
+
+    // Abort immediately if an error/oob flag is latched or native recursion depth is exhausted.
+    // LDRB W9, [X20, #oob_off]
+    asm.emit(0x3940_0000 | (oob_off << 10) | (20 << 5) | 9);
+    // CBZ W9, +3
+    asm.emit(0x3400_0000 | (3 << 5) | 9);
+    // FMOV D0, XZR
+    asm.emit(0x9E67_03E0);
+    let abort_oob = asm.words.len();
+    asm.emit(0x1400_0000);
+    asm.abort_jumps.push(abort_oob);
+
+    let frame_cost = frame_imm + 32;
+    // LDR W9, [X20, #depth_off]
+    asm.emit(0xB940_0000 | (depth_imm12 << 10) | (20 << 5) | 9);
+    // CMP W9, #frame_cost (SUBS WZR, W9, #frame_cost)
+    asm.emit(0x7100_0000 | (frame_cost << 10) | (9 << 5) | 31);
+    // B.HS +5 (cond = 2)
+    asm.emit(0x5400_0000 | (5 << 5) | 2);
+    // MOVZ W9, #2
+    asm.emit(0x5280_0000 | (2 << 5) | 9);
+    // STRB W9, [X20, #oob_off]
+    asm.emit(0x3900_0000 | (oob_off << 10) | (20 << 5) | 9);
+    // FMOV D0, XZR
+    asm.emit(0x9E67_03E0);
+    let abort_depth = asm.words.len();
+    asm.emit(0x1400_0000);
+    asm.abort_jumps.push(abort_depth);
+
+    // SUB W9, W9, #frame_cost; STR W9, [X20, #depth_off]
+    asm.emit(0x5100_0000 | (frame_cost << 10) | (9 << 5) | 9);
+    asm.emit(0xB900_0000 | (depth_imm12 << 10) | (20 << 5) | 9);
 
     // Copy 64-bit parameters from X0 (args_ptr) into locals[0..arity]
     for i in 0..def.params.len() {
@@ -2092,6 +2207,15 @@ fn compile_aarch64_code(
                             }
                             _ => unreachable!(),
                         }
+                        if matches!(res, CallResolution::SelfCall | CallResolution::InterFn(_)) {
+                            // LDRB W9, [X20, #oob_off]; CBZ W9, +3; FMOV D0, XZR; B epilogue
+                            asm.emit(0x3940_0000 | (oob_off << 10) | (20 << 5) | 9);
+                            asm.emit(0x3400_0000 | (3 << 5) | 9);
+                            asm.emit(0x9E67_03E0);
+                            let idx = asm.words.len();
+                            asm.emit(0x1400_0000);
+                            asm.epilogue_jumps.push(idx);
+                        }
                         asm.push_d0(&mut depth, local_count)?;
                     }
                 }
@@ -2126,6 +2250,11 @@ fn compile_aarch64_code(
     }
 
     let epilogue_word = asm.words.len();
+    // LDR W9, [X20, #depth_off]; ADD W9, W9, #frame_cost; STR W9, [X20, #depth_off]
+    asm.emit(0xB940_0000 | (depth_imm12 << 10) | (20 << 5) | 9);
+    asm.emit(0x1100_0000 | (frame_cost << 10) | (9 << 5) | 9);
+    asm.emit(0xB900_0000 | (depth_imm12 << 10) | (20 << 5) | 9);
+    let epilogue_abort_word = asm.words.len();
     if frame_imm > 0 {
         // ADD SP, SP, #frame_imm
         asm.emit(0x9100_03FF | (frame_imm << 10));
@@ -2157,6 +2286,10 @@ fn compile_aarch64_code(
     }
     for idx in asm.epilogue_jumps {
         let delta = (epilogue_word as isize - idx as isize) as u32;
+        asm.words[idx] = 0x1400_0000 | (delta & 0x03FF_FFFF);
+    }
+    for idx in asm.abort_jumps {
+        let delta = (epilogue_abort_word as isize - idx as isize) as u32;
         asm.words[idx] = 0x1400_0000 | (delta & 0x03FF_FFFF);
     }
 

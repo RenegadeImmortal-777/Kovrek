@@ -5,11 +5,14 @@
 use crate::ast::{CallArg, Expr, Pattern, SeqElem, Stmt};
 use crate::lexer::Tok;
 
+const MAX_PARSE_DEPTH: usize = 64;
+
 pub(crate) struct Parser {
     t: Vec<Tok>,
     lines: Vec<usize>,
     i: usize,
     track_lines: bool,
+    depth: usize,
 }
 impl Parser {
     pub(crate) fn new(t: Vec<Tok>) -> Self {
@@ -19,6 +22,7 @@ impl Parser {
             lines: vec![0; len],
             i: 0,
             track_lines: false,
+            depth: 0,
         }
     }
     pub(crate) fn new_with_lines(tokens: Vec<(Tok, usize)>) -> Self {
@@ -28,6 +32,7 @@ impl Parser {
             lines,
             i: 0,
             track_lines: false,
+            depth: 0,
         }
     }
     pub(crate) fn new_with_debug_lines(tokens: Vec<(Tok, usize)>) -> Self {
@@ -37,7 +42,22 @@ impl Parser {
             lines,
             i: 0,
             track_lines: true,
+            depth: 0,
         }
+    }
+    fn with_depth<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return Err(self.fmt_err(format!(
+                "syntax nesting exceeded max recursion depth ({MAX_PARSE_DEPTH})"
+            )));
+        }
+        self.depth += 1;
+        let res = f(self);
+        self.depth -= 1;
+        res
     }
     fn parse_class_stmt(&mut self, decorators: Vec<Expr>) -> Result<Stmt, String> {
         let name = match self.bump() {
@@ -138,6 +158,9 @@ impl Parser {
         Ok(v)
     }
     fn block(&mut self) -> Result<Vec<Stmt>, String> {
+        self.with_depth(Self::block_inner)
+    }
+    fn block_inner(&mut self) -> Result<Vec<Stmt>, String> {
         self.need(&Tok::Lb, "expected '{'")?;
         let mut v = vec![];
         while !matches!(self.cur(), Tok::Rb | Tok::Eof) {
@@ -147,6 +170,9 @@ impl Parser {
         Ok(v)
     }
     fn stmt(&mut self) -> Result<Stmt, String> {
+        self.with_depth(Self::stmt_inner)
+    }
+    fn stmt_inner(&mut self) -> Result<Stmt, String> {
         if matches!(self.cur(), Tok::Id(s) if s == "pass") {
             self.i += 1;
             self.eat(&Tok::Semi);
@@ -690,6 +716,9 @@ impl Parser {
         }
     }
     fn expr(&mut self) -> Result<Expr, String> {
+        self.with_depth(Self::expr_inner)
+    }
+    fn expr_inner(&mut self) -> Result<Expr, String> {
         let then_branch = self.logic_or()?;
         if self.eat(&Tok::If) {
             let cond = self.logic_or()?;
@@ -810,6 +839,9 @@ impl Parser {
         Ok(e)
     }
     fn unary(&mut self) -> Result<Expr, String> {
+        self.with_depth(Self::unary_inner)
+    }
+    fn unary_inner(&mut self) -> Result<Expr, String> {
         if self.eat(&Tok::Await) {
             return Ok(Expr::Await(Box::new(self.unary()?)));
         }
@@ -1158,6 +1190,9 @@ impl Parser {
     }
 
     fn parse_pattern(&mut self) -> Result<Pattern, String> {
+        self.with_depth(Self::parse_pattern_inner)
+    }
+    fn parse_pattern_inner(&mut self) -> Result<Pattern, String> {
         let mut pat = self.parse_or_pattern()?;
         while self.eat(&Tok::As) {
             let name = match self.bump() {

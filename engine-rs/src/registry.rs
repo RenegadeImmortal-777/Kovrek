@@ -41,17 +41,64 @@ fn offline_mode() -> bool {
 
 #[cfg(feature = "native-services")]
 fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let response = reqwest::blocking::get(url).map_err(|e| e.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "HTTP request to {url} returned status {}",
-            response.status()
-        ));
+    const MAX_REGISTRY_BYTES: usize = 64 * 1024 * 1024;
+    let initial = crate::security::validate_general_http_url(url)?;
+    let initial_is_public = crate::security::validate_public_url(&initial.url, true).is_ok();
+    let initial_scheme = initial.scheme.clone();
+    let mut current_url = initial.url;
+
+    for hop in 0..=5usize {
+        let mut builder = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none());
+        let (target_url, target_origin) = if initial_is_public {
+            let validated = crate::security::validate_public_url(&current_url, true)?;
+            let addrs = crate::security::resolve_public_url_addrs(&validated)?;
+            builder = builder.resolve_to_addrs(&validated.host, &addrs);
+            (validated.url, validated.origin)
+        } else {
+            let validated = crate::security::validate_general_http_url(&current_url)?;
+            (validated.url, validated.origin)
+        };
+        let client = builder.build().map_err(|e| e.to_string())?;
+        let response = client.get(&target_url).send().map_err(|e| e.to_string())?;
+        if response.status().is_redirection() && hop < 5 {
+            let Some(loc) = response.headers().get(reqwest::header::LOCATION) else {
+                return Err(format!(
+                    "HTTP redirect from {target_url} missing Location header"
+                ));
+            };
+            let loc_str = loc.to_str().map_err(|e| e.to_string())?;
+            let next_raw =
+                crate::security::resolve_redirect_location(&target_url, &target_origin, loc_str)?;
+            if initial_is_public {
+                let next_val = crate::security::validate_public_url(&next_raw, true)?;
+                if initial_scheme == "https" && next_val.scheme == "http" {
+                    return Err(
+                        "HTTPS to HTTP downgrade redirect blocked in registry client".into(),
+                    );
+                }
+                let _ = crate::security::resolve_public_url_addrs(&next_val)?;
+                current_url = next_val.url;
+            } else {
+                current_url = crate::security::validate_general_http_url(&next_raw)?.url;
+            }
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(format!(
+                "HTTP request to {target_url} returned status {}",
+                response.status()
+            ));
+        }
+        return crate::security::read_to_end_limited(
+            response,
+            MAX_REGISTRY_BYTES,
+            &format!("registry response from {target_url}"),
+        );
     }
-    response
-        .bytes()
-        .map(|b| b.to_vec())
-        .map_err(|e| e.to_string())
+    Err(format!("too many HTTP redirects for {url}"))
 }
 
 #[cfg(not(feature = "native-services"))]
@@ -396,7 +443,11 @@ pub(crate) fn semver_matches(version: &str, constraint: &str) -> bool {
 /// Validate an unscoped (`foo`) or scoped (`@org/pkg`) Kovrek package name.
 pub(crate) fn validate_package_name(name: &str) -> Result<(), String> {
     let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed.contains('\\') {
+    if trimmed.is_empty()
+        || trimmed.contains('\\')
+        || trimmed.contains(':')
+        || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
         return Err(format!("unsafe package name '{name}'"));
     }
     if let Some(rest) = trimmed.strip_prefix('@') {
@@ -421,6 +472,22 @@ pub(crate) fn validate_package_name(name: &str) -> Result<(), String> {
         return Err(format!("invalid package name '{name}'"));
     }
     Ok(())
+}
+
+#[cfg(feature = "native-services")]
+fn is_loopback_registry_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("https://"))
+        .unwrap_or(&lower);
+    let host_port = rest.split('/').next().unwrap_or("");
+    host_port == "127.0.0.1"
+        || host_port.starts_with("127.0.0.1:")
+        || host_port == "localhost"
+        || host_port.starts_with("localhost:")
+        || host_port == "[::1]"
+        || host_port.starts_with("[::1]:")
 }
 
 /// Split `name[@constraint]`, supporting scoped names like `@org/pkg@^1.2.0`.
@@ -717,12 +784,24 @@ fn install_platform_native_artifact(
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let resolved = resolve_pkg_ref(pkg_base, raw_url);
+    let expected_sha_opt = nat
+        .get("sha256")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if (resolved.starts_with("http://") || resolved.starts_with("https://"))
+        && expected_sha_opt.is_none()
+    {
+        return Err(format!(
+            "refusing remote native binary '{resolved}' without 'sha256' pin"
+        ));
+    }
     let bytes = fetch_package_file(&resolved)?;
-    if let Some(expected_sha) = nat.get("sha256").and_then(JsonValue::as_str) {
+    if let Some(expected_sha) = expected_sha_opt {
         let mut h = Sha256::new();
         h.update(&bytes);
         let actual = format!("{:x}", h.finalize());
-        if actual != expected_sha {
+        if !actual.eq_ignore_ascii_case(expected_sha) {
             return Err(format!(
                 "native artifact sha256 mismatch for '{}': expected {expected_sha}, got {actual}",
                 target.display()
@@ -1058,6 +1137,7 @@ pub(crate) fn pkg_publish() -> Result<(), String> {
         .get("name")
         .and_then(JsonValue::as_str)
         .ok_or("manifest missing name")?;
+    validate_package_name(name)?;
     let version = manifest
         .get("version")
         .and_then(JsonValue::as_str)
@@ -1109,12 +1189,27 @@ pub(crate) fn pkg_publish() -> Result<(), String> {
                 };
                 let client = reqwest::blocking::Client::new();
                 let payload = serde_json::to_string(&bundle).map_err(|e| e.to_string())?;
-                let resp = client
+                let auth_token = env::var("KOVREK_REGISTRY_TOKEN")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        if is_loopback_registry_url(&remote_url) {
+                            fs::read_to_string(home.join(".registry-token"))
+                                .ok()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                        } else {
+                            None
+                        }
+                    });
+                let mut req = client
                     .post(&publish_url)
-                    .header("Content-Type", "application/json")
-                    .body(payload)
-                    .send()
-                    .map_err(|e| e.to_string())?;
+                    .header("Content-Type", "application/json");
+                if let Some(tok) = auth_token {
+                    req = req.header("Authorization", format!("Bearer {tok}"));
+                }
+                let resp = req.body(payload).send().map_err(|e| e.to_string())?;
                 if !resp.status().is_success() {
                     return Err(format!(
                         "remote registry publish returned HTTP {}",
@@ -1319,7 +1414,7 @@ fn find_trusted_secret_by_id(key_id: &str) -> Option<String> {
     None
 }
 
-fn hash_directory_excluding_sig(dir: &Path) -> Result<String, String> {
+pub(crate) fn hash_directory_excluding_sig(dir: &Path) -> Result<String, String> {
     let mut files = Vec::new();
     collect_files_excluding(dir, &mut files)?;
     files.sort();
@@ -1353,23 +1448,28 @@ fn collect_files_excluding(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Str
     Ok(())
 }
 
-fn verify_package_dir_sig(dir: &Path) -> Result<bool, String> {
-    let sig_path = dir.join("kovrek.sig.json");
-    if !sig_path.is_file() {
-        return Ok(false);
+fn verify_sig_json_value(
+    sig: &JsonValue,
+    actual_sha: &str,
+    dir: Option<&Path>,
+    label: &str,
+) -> Result<bool, String> {
+    let alg = sig
+        .get("algorithm")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("hmac-sha256");
+    if alg != "hmac-sha256" {
+        return Err(format!(
+            "unsupported signature algorithm '{alg}' in {label}"
+        ));
     }
-    let sig: JsonValue =
-        serde_json::from_str(&fs::read_to_string(&sig_path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
     let expected_sha = sig
         .get("sha256")
         .and_then(JsonValue::as_str)
         .ok_or("kovrek.sig.json missing sha256")?;
-    let actual_sha = hash_directory_excluding_sig(dir)?;
     if actual_sha != expected_sha {
         return Err(format!(
-            "package signature hash mismatch in {}: expected {expected_sha}, got {actual_sha}",
-            dir.display()
+            "package signature hash mismatch in {label}: expected {expected_sha}, got {actual_sha}"
         ));
     }
     let key_id = sig
@@ -1380,20 +1480,84 @@ fn verify_package_dir_sig(dir: &Path) -> Result<bool, String> {
         .get("signature")
         .and_then(JsonValue::as_str)
         .ok_or("kovrek.sig.json missing signature")?;
-    if let Some(secret) = find_trusted_secret_by_id(key_id) {
-        let expected_sig = hmac_sha256_hex(&secret, &format!("kovrek-pkg-v1:{expected_sha}"));
-        if !constant_time_strings_equal(&expected_sig, signature) {
+    let secret = find_trusted_secret_by_id(key_id)
+        .ok_or_else(|| format!("untrusted or unknown signing key '{key_id}' in {label}"))?;
+    let fmt_ver = sig.get("format").and_then(JsonValue::as_u64).unwrap_or(1);
+    let signed_payload = match fmt_ver {
+        2 => {
+            let sig_pkg = sig
+                .get("package")
+                .and_then(JsonValue::as_str)
+                .ok_or("kovrek.sig.json v2 missing package")?;
+            let sig_ver = sig
+                .get("version")
+                .and_then(JsonValue::as_str)
+                .ok_or("kovrek.sig.json v2 missing version")?;
+            if let Some(d) = dir
+                && let Ok(raw_m) = fs::read_to_string(d.join("kovrek.json"))
+                && let Ok(m) = serde_json::from_str::<JsonValue>(&raw_m)
+            {
+                if let Some(mpkg) = m.get("name").and_then(JsonValue::as_str)
+                    && mpkg != sig_pkg
+                {
+                    return Err(format!(
+                        "signature package mismatch in {label}: signed '{sig_pkg}', manifest '{mpkg}'"
+                    ));
+                }
+                if let Some(mver) = m.get("version").and_then(JsonValue::as_str)
+                    && mver != sig_ver
+                {
+                    return Err(format!(
+                        "signature version mismatch in {label}: signed '{sig_ver}', manifest '{mver}'"
+                    ));
+                }
+            }
+            format!("kovrek-pkg-v2:{sig_pkg}:{sig_ver}:{expected_sha}")
+        }
+        1 => format!("kovrek-pkg-v1:{expected_sha}"),
+        other => {
             return Err(format!(
-                "invalid HMAC signature in {} (key_id={key_id})",
-                dir.display()
+                "unsupported kovrek.sig.json format version {other} in {label}"
             ));
         }
+    };
+    let expected_sig = hmac_sha256_hex(&secret, &signed_payload);
+    if !constant_time_strings_equal(&expected_sig, signature) {
+        return Err(format!(
+            "invalid HMAC signature in {label} (key_id={key_id})"
+        ));
     }
     Ok(true)
 }
 
+fn verify_package_dir_sig(dir: &Path) -> Result<bool, String> {
+    let sig_path = dir.join("kovrek.sig.json");
+    if !sig_path.is_file() {
+        return Ok(false);
+    }
+    let sig: JsonValue =
+        serde_json::from_str(&fs::read_to_string(&sig_path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let actual_sha = hash_directory_excluding_sig(dir)?;
+    verify_sig_json_value(&sig, &actual_sha, Some(dir), &dir.display().to_string())
+}
+
+fn sanitize_key_name(name: &str) -> Result<&str, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('.')
+        || trimmed.contains("..")
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err(format!("unsafe signing key name '{name}'"));
+    }
+    Ok(trimmed)
+}
+
 pub(crate) fn pkg_keygen(name: Option<&str>) -> Result<(), String> {
-    let key_name = name.unwrap_or("default");
+    let key_name = sanitize_key_name(name.unwrap_or("default"))?;
     let mut raw = [0u8; 32];
     rand::thread_rng().fill(&mut raw);
     let secret: String = raw.iter().map(|b| format!("{b:02x}")).collect();
@@ -1412,11 +1576,10 @@ pub(crate) fn pkg_keygen(name: Option<&str>) -> Result<(), String> {
         "secret": secret,
         "created_at": chrono::Utc::now().to_rfc3339()
     });
-    fs::write(
+    crate::server::write_secret_file(
         &path,
-        serde_json::to_string_pretty(&obj).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+        &serde_json::to_string_pretty(&obj).map_err(|e| e.to_string())?,
+    )?;
     println!(
         "Generated Kovrek signing key '{key_name}' (key_id={key_id}) -> {}",
         path.display()
@@ -1431,7 +1594,6 @@ pub(crate) fn pkg_sign(dir: Option<&Path>, key_name: Option<&str>) -> Result<(),
     };
     let (key_id, secret) = find_signing_key(key_name)?;
     let sha = hash_directory_excluding_sig(&target)?;
-    let signature = hmac_sha256_hex(&secret, &format!("kovrek-pkg-v1:{sha}"));
     let (pkg_name, version) = fs::read_to_string(target.join("kovrek.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<JsonValue>(&s).ok())
@@ -1448,8 +1610,12 @@ pub(crate) fn pkg_sign(dir: Option<&Path>, key_name: Option<&str>) -> Result<(),
             )
         })
         .unwrap_or_else(|| ("package".into(), "0.0.0".into()));
+    let signature = hmac_sha256_hex(
+        &secret,
+        &format!("kovrek-pkg-v2:{pkg_name}:{version}:{sha}"),
+    );
     let sig_obj = serde_json::json!({
-        "format": 1,
+        "format": 2,
         "algorithm": "hmac-sha256",
         "package": pkg_name,
         "version": version,
@@ -1483,11 +1649,20 @@ pub(crate) fn pkg_verify(target: Option<&str>) -> Result<(), String> {
                 .and_then(JsonValue::as_str)
                 .unwrap_or("bundle");
             verify_bundle_json(&bundle)?;
+            if let Some(sig) = bundle.get("signature").filter(|s| !s.is_null()) {
+                let bsha = bundle
+                    .get("sha256")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("");
+                let _ = verify_sig_json_value(sig, bsha, None, name)?;
+            }
             println!("Verified package bundle '{name}'");
             return Ok(());
         }
         if p.is_dir() {
-            let _ = verify_package_dir_sig(&p)?;
+            if !verify_package_dir_sig(&p)? {
+                return Err(format!("unsigned package directory {}", p.display()));
+            }
             println!("Verified package directory {}", p.display());
             return Ok(());
         }
@@ -1497,7 +1672,9 @@ pub(crate) fn pkg_verify(target: Option<&str>) -> Result<(), String> {
         if !pkg_dir.is_dir() {
             return Err(format!("installed package or path '{t}' not found"));
         }
-        let _ = verify_package_dir_sig(&pkg_dir)?;
+        if !verify_package_dir_sig(&pkg_dir)? {
+            return Err(format!("unsigned installed package '{t}'"));
+        }
         println!("Verified installed package '{t}'");
         return Ok(());
     }
@@ -1800,29 +1977,59 @@ pub(crate) fn pkg_pack(dir: Option<&Path>, out: Option<&Path>) -> Result<(), Str
 
 pub(crate) fn unpack_bundle_to_dir(bundle: &JsonValue, dest: &Path) -> Result<(), String> {
     verify_bundle_json(bundle)?;
+    let files = bundle["files"].as_object().ok_or("bundle missing files")?;
+    let mut staged_files = Vec::with_capacity(files.len());
+    for (rel, b64) in files {
+        let safe = safe_package_relative_path(rel)?;
+        let norm = safe.to_string_lossy().replace('\\', "/");
+        if norm == "kovrek.sig.json" || norm == "kovrek.lock" {
+            return Err(format!(
+                "bundle files cannot contain reserved file '{norm}'"
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(
+                b64.as_str()
+                    .ok_or("bundle file payload must be base64 string")?,
+            )
+            .map_err(|e| e.to_string())?;
+        staged_files.push((safe, bytes));
+    }
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let stage = parent.join(format!(".kovrek-stage-{}", uuid::Uuid::new_v4()));
+    let write_stage = (|| -> Result<(), String> {
+        fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
+        for (safe, bytes) in staged_files {
+            let out = stage.join(safe);
+            if let Some(p) = out.parent() {
+                fs::create_dir_all(p).map_err(|e| e.to_string())?;
+            }
+            fs::write(out, bytes).map_err(|e| e.to_string())?;
+        }
+        if let Some(sig) = bundle.get("signature").filter(|s| !s.is_null()) {
+            fs::write(
+                stage.join("kovrek.sig.json"),
+                serde_json::to_string_pretty(sig).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            let _ = verify_package_dir_sig(&stage)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = write_stage {
+        let _ = fs::remove_dir_all(&stage);
+        return Err(e);
+    }
     if dest.exists() {
         fs::remove_dir_all(dest).map_err(|e| e.to_string())?;
     }
-    fs::create_dir_all(dest).map_err(|e| e.to_string())?;
-    let files = bundle["files"].as_object().ok_or("bundle missing files")?;
-    for (rel, b64) in files {
-        let safe = safe_package_relative_path(rel)?;
-        let out = dest.join(safe);
-        if let Some(parent) = out.parent() {
-            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64.as_str().unwrap_or(""))
-            .map_err(|e| e.to_string())?;
-        fs::write(out, bytes).map_err(|e| e.to_string())?;
-    }
-    if let Some(sig) = bundle.get("signature").filter(|s| !s.is_null()) {
-        fs::write(
-            dest.join("kovrek.sig.json"),
-            serde_json::to_string_pretty(sig).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        let _ = verify_package_dir_sig(dest)?;
+    if let Err(e) = fs::rename(&stage, dest) {
+        let _ = fs::remove_dir_all(&stage);
+        return Err(e.to_string());
     }
     Ok(())
 }
@@ -1835,9 +2042,14 @@ pub(crate) fn pkg_unpack(bundle_path: &Path, dest: Option<&Path>) -> Result<(), 
         .get("name")
         .and_then(JsonValue::as_str)
         .unwrap_or("package");
-    let out_dir = dest
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(name));
+    validate_package_name(name)?;
+    let out_dir = match dest {
+        Some(d) => d.to_path_buf(),
+        None => {
+            let rel = safe_package_relative_path(name)?;
+            Path::new(".").join(rel)
+        }
+    };
     unpack_bundle_to_dir(&bundle, &out_dir)?;
     println!("Unpacked {name} -> {}", out_dir.display());
     Ok(())
@@ -1888,6 +2100,7 @@ pub(crate) fn pkg_py_bridge(
     let mod_name = pypi_name.trim();
     if mod_name.is_empty()
         || mod_name.starts_with('.')
+        || mod_name.starts_with('-')
         || !mod_name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
@@ -1899,7 +2112,7 @@ pub(crate) fn pkg_py_bridge(
         let mut last_err = String::new();
         for py in ["python", "python3", "py"] {
             match std::process::Command::new(py)
-                .args(["-m", "pip", "install", mod_name])
+                .args(["-m", "pip", "install", "--", mod_name])
                 .status()
             {
                 Ok(st) if st.success() => {
@@ -2044,6 +2257,8 @@ pub(crate) fn pkg_js_bridge(
     let raw = npm_name.trim();
     if raw.is_empty()
         || raw.starts_with('.')
+        || raw.starts_with('-')
+        || raw.contains("..")
         || !raw
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@' | '/'))
@@ -2082,12 +2297,14 @@ pub(crate) fn pkg_js_bridge(
                 "-File",
                 &npm_bin,
                 "install",
+                "--no-save",
+                "--",
                 raw,
             ]);
             c
         } else {
             let mut c = std::process::Command::new(&npm_bin);
-            c.args(["install", raw]);
+            c.args(["install", "--no-save", "--", raw]);
             c
         };
         let status = cmd.current_dir(&dest).status().map_err(|e| e.to_string())?;

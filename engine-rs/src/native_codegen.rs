@@ -2032,18 +2032,26 @@ pub(crate) fn wasm_run(
     export_name: &str,
     args: &[f64],
 ) -> Result<(f64, Vec<String>), String> {
+    const MAX_WASM_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+    const MAX_WASM_CALL_DEPTH: usize = 1024;
+
     let m = parse_wasm_module(bytes)?;
     let fn_idx = *m
         .exports
         .get(export_name)
         .ok_or_else(|| format!("wasm: export '{export_name}' not found"))?;
     let mut globals = m.global_inits.clone();
-    let mut memory = vec![0u8; (m.initial_pages.max(1) as usize) * 65_536];
+    let init_bytes = (m.initial_pages.max(1) as usize)
+        .checked_mul(65_536)
+        .filter(|&n| n <= MAX_WASM_MEMORY_BYTES)
+        .ok_or("wasm: initial memory exceeds 64 MiB limit")?;
+    let mut memory = vec![0u8; init_bytes];
     for (off, seg) in &m.data_segments {
         let start = *off as usize;
         let end = start
             .checked_add(seg.len())
-            .ok_or("wasm: data segment overflow")?;
+            .filter(|&n| n <= MAX_WASM_MEMORY_BYTES)
+            .ok_or("wasm: data segment exceeds 64 MiB limit")?;
         if end > memory.len() {
             memory.resize(end, 0);
         }
@@ -2109,68 +2117,89 @@ pub(crate) fn wasm_run(
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn exec_fn(
+    #[derive(Clone, Copy)]
+    struct WasmLabel {
+        target_ip: usize,
+        stack_height: usize,
+        is_loop: bool,
+    }
+
+    struct WasmFrame<'a> {
+        func: &'a WasmParsedFunc,
+        sig: &'a WasmTypeSig,
+        locals: Vec<WasmVal>,
+        labels: Vec<WasmLabel>,
+        stack: Vec<WasmVal>,
+        ip: usize,
+    }
+
+    enum FrameStep {
+        Returned(Option<WasmVal>),
+        Call(u32, Vec<WasmVal>),
+    }
+
+    fn exec_wasm_import(
         m: &WasmModule,
         fn_idx: u32,
         args: &[WasmVal],
-        globals: &mut Vec<WasmVal>,
-        memory: &mut Vec<u8>,
+        memory: &mut [u8],
         prints: &mut Vec<String>,
         wasi_line_buf: &mut Vec<u8>,
-        steps: &mut usize,
     ) -> Result<Option<WasmVal>, String> {
-        let imp_count = m.imports.len() as u32;
-        if fn_idx < imp_count {
-            let (mod_n, field_n, _) = &m.imports[fn_idx as usize];
-            if mod_n == "env" && field_n == "print_num" {
-                let val = args
-                    .first()
-                    .copied()
-                    .unwrap_or(WasmVal::F64(0.0))
-                    .as_f64()?;
-                let formatted = format_wasm_val(val, memory);
-                println!("{formatted}");
-                prints.push(formatted);
-                return Ok(None);
-            }
-            if mod_n == "wasi_snapshot_preview1" && field_n == "fd_write" {
-                let _fd = args.first().copied().unwrap_or(WasmVal::I32(1)).as_i32()?;
-                let iovs_ptr = args.get(1).copied().unwrap_or(WasmVal::I32(0)).as_i32()?;
-                let iovs_len = args.get(2).copied().unwrap_or(WasmVal::I32(0)).as_i32()?;
-                let nw_ptr = args.get(3).copied().unwrap_or(WasmVal::I32(0)).as_i32()?;
-                let mut total_written = 0u32;
-                for i in 0..iovs_len.max(0) as usize {
-                    let hdr_r = mem_eff_range(memory, iovs_ptr, (i * 8) as u32, 8)?;
-                    let buf_ptr = u32::from_le_bytes(
-                        memory[hdr_r.start..hdr_r.start + 4].try_into().unwrap(),
-                    );
-                    let buf_len = u32::from_le_bytes(
-                        memory[hdr_r.start + 4..hdr_r.start + 8].try_into().unwrap(),
-                    );
-                    let slice_r = mem_eff_range(memory, buf_ptr as i32, 0, buf_len as usize)?;
-                    for &b in &memory[slice_r] {
-                        if b == b'\n' {
-                            if wasi_line_buf.last() == Some(&b'\r') {
-                                wasi_line_buf.pop();
-                            }
-                            let line = String::from_utf8_lossy(wasi_line_buf).into_owned();
-                            wasi_line_buf.clear();
-                            println!("{line}");
-                            prints.push(line);
-                        } else {
-                            wasi_line_buf.push(b);
-                        }
-                    }
-                    total_written = total_written.saturating_add(buf_len);
-                }
-                let nw_r = mem_eff_range(memory, nw_ptr, 0, 4)?;
-                memory[nw_r].copy_from_slice(&total_written.to_le_bytes());
-                return Ok(Some(WasmVal::I32(0)));
-            }
-            return Err(format!("wasm: unknown host import {mod_n}.{field_n}"));
+        let (mod_n, field_n, _) = &m.imports[fn_idx as usize];
+        if mod_n == "env" && field_n == "print_num" {
+            let val = args
+                .first()
+                .copied()
+                .unwrap_or(WasmVal::F64(0.0))
+                .as_f64()?;
+            let formatted = format_wasm_val(val, memory);
+            println!("{formatted}");
+            prints.push(formatted);
+            return Ok(None);
         }
+        if mod_n == "wasi_snapshot_preview1" && field_n == "fd_write" {
+            let _fd = args.first().copied().unwrap_or(WasmVal::I32(1)).as_i32()?;
+            let iovs_ptr = args.get(1).copied().unwrap_or(WasmVal::I32(0)).as_i32()?;
+            let iovs_len = args.get(2).copied().unwrap_or(WasmVal::I32(0)).as_i32()?;
+            let nw_ptr = args.get(3).copied().unwrap_or(WasmVal::I32(0)).as_i32()?;
+            let mut total_written = 0u32;
+            for i in 0..iovs_len.max(0) as usize {
+                let hdr_r = mem_eff_range(memory, iovs_ptr, (i * 8) as u32, 8)?;
+                let buf_ptr =
+                    u32::from_le_bytes(memory[hdr_r.start..hdr_r.start + 4].try_into().unwrap());
+                let buf_len = u32::from_le_bytes(
+                    memory[hdr_r.start + 4..hdr_r.start + 8].try_into().unwrap(),
+                );
+                let slice_r = mem_eff_range(memory, buf_ptr as i32, 0, buf_len as usize)?;
+                for &b in &memory[slice_r] {
+                    if b == b'\n' {
+                        if wasi_line_buf.last() == Some(&b'\r') {
+                            wasi_line_buf.pop();
+                        }
+                        let line = String::from_utf8_lossy(wasi_line_buf).into_owned();
+                        wasi_line_buf.clear();
+                        println!("{line}");
+                        prints.push(line);
+                    } else {
+                        wasi_line_buf.push(b);
+                    }
+                }
+                total_written = total_written.saturating_add(buf_len);
+            }
+            let nw_r = mem_eff_range(memory, nw_ptr, 0, 4)?;
+            memory[nw_r].copy_from_slice(&total_written.to_le_bytes());
+            return Ok(Some(WasmVal::I32(0)));
+        }
+        Err(format!("wasm: unknown host import {mod_n}.{field_n}"))
+    }
 
+    fn build_wasm_frame<'a>(
+        m: &'a WasmModule,
+        fn_idx: u32,
+        args: &[WasmVal],
+    ) -> Result<WasmFrame<'a>, String> {
+        let imp_count = m.imports.len() as u32;
         let func = m
             .internal_funcs
             .get((fn_idx - imp_count) as usize)
@@ -2186,7 +2215,6 @@ pub(crate) fn wasm_run(
                 args.len()
             ));
         }
-
         let mut locals = Vec::with_capacity(sig.params.len() + func.extra_locals.len());
         locals.extend_from_slice(args);
         for &lt in &func.extra_locals {
@@ -2196,16 +2224,29 @@ pub(crate) fn wasm_run(
                 _ => WasmVal::F64(0.0),
             });
         }
+        Ok(WasmFrame {
+            func,
+            sig,
+            locals,
+            labels: Vec::new(),
+            stack: Vec::new(),
+            ip: 0,
+        })
+    }
 
-        #[derive(Clone, Copy)]
-        struct Label {
-            target_ip: usize,
-            stack_height: usize,
-            is_loop: bool,
-        }
-        let mut labels: Vec<Label> = Vec::new();
-        let mut stack: Vec<WasmVal> = Vec::new();
-        let mut ip = 0usize;
+    fn run_frame_until_call_or_ret(
+        m: &WasmModule,
+        frame: &mut WasmFrame<'_>,
+        globals: &mut [WasmVal],
+        memory: &mut [u8],
+        steps: &mut usize,
+    ) -> Result<FrameStep, String> {
+        let func = frame.func;
+        let sig = frame.sig;
+        let locals = &mut frame.locals;
+        let labels = &mut frame.labels;
+        let stack = &mut frame.stack;
+        let mut ip = frame.ip;
 
         while ip < func.insns.len() {
             *steps += 1;
@@ -2221,7 +2262,7 @@ pub(crate) fn wasm_run(
                     end_idx,
                 } => {
                     let res_arity = usize::from(*block_type != WASM_VOID);
-                    labels.push(Label {
+                    labels.push(WasmLabel {
                         target_ip: *end_idx + 1,
                         stack_height: stack.len() + res_arity,
                         is_loop: false,
@@ -2233,7 +2274,7 @@ pub(crate) fn wasm_run(
                     end_idx,
                 } => {
                     let _ = (*block_type, end_idx);
-                    labels.push(Label {
+                    labels.push(WasmLabel {
                         target_ip: ip + 1,
                         stack_height: stack.len(),
                         is_loop: true,
@@ -2247,7 +2288,7 @@ pub(crate) fn wasm_run(
                 } => {
                     let cond = stack.pop().ok_or("wasm: if stack underflow")?.as_i32()?;
                     let res_arity = usize::from(*block_type != WASM_VOID);
-                    labels.push(Label {
+                    labels.push(WasmLabel {
                         target_ip: *end_idx + 1,
                         stack_height: stack.len() + res_arity,
                         is_loop: false,
@@ -2282,7 +2323,7 @@ pub(crate) fn wasm_run(
                     if take {
                         let d = *depth as usize;
                         if d >= labels.len() {
-                            return Ok(stack.pop());
+                            return Ok(FrameStep::Returned(stack.pop()));
                         }
                         let target_pos = labels.len() - 1 - d;
                         let lbl = labels[target_pos];
@@ -2299,11 +2340,11 @@ pub(crate) fn wasm_run(
                     }
                 }
                 WasmInsn::Return => {
-                    return Ok(if sig.results.is_empty() {
+                    return Ok(FrameStep::Returned(if sig.results.is_empty() {
                         None
                     } else {
                         Some(stack.pop().ok_or("wasm: missing return value")?)
-                    });
+                    }));
                 }
                 WasmInsn::Call(callee) => {
                     let c_tid = if (*callee as usize) < m.imports.len() {
@@ -2317,19 +2358,8 @@ pub(crate) fn wasm_run(
                         return Err("wasm: call underflow".into());
                     }
                     let cargs = stack.split_off(stack.len() - ac);
-                    if let Some(rv) = exec_fn(
-                        m,
-                        *callee,
-                        &cargs,
-                        globals,
-                        memory,
-                        prints,
-                        wasi_line_buf,
-                        steps,
-                    )? {
-                        stack.push(rv);
-                    }
-                    ip += 1;
+                    frame.ip = ip + 1;
+                    return Ok(FrameStep::Call(*callee, cargs));
                 }
                 WasmInsn::Drop => {
                     stack.pop().ok_or("wasm: drop underflow")?;
@@ -2580,11 +2610,62 @@ pub(crate) fn wasm_run(
                 }
             }
         }
-        Ok(if sig.results.is_empty() {
+        Ok(FrameStep::Returned(if sig.results.is_empty() {
             None
         } else {
             Some(stack.pop().unwrap_or(WasmVal::F64(0.0)))
-        })
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn exec_fn(
+        m: &WasmModule,
+        fn_idx: u32,
+        args: &[WasmVal],
+        globals: &mut [WasmVal],
+        memory: &mut [u8],
+        prints: &mut Vec<String>,
+        wasi_line_buf: &mut Vec<u8>,
+        steps: &mut usize,
+    ) -> Result<Option<WasmVal>, String> {
+        let imp_count = m.imports.len() as u32;
+        if fn_idx < imp_count {
+            return exec_wasm_import(m, fn_idx, args, memory, prints, wasi_line_buf);
+        }
+        let mut call_stack = vec![build_wasm_frame(m, fn_idx, args)?];
+        loop {
+            let step = {
+                let frame = call_stack.last_mut().ok_or("wasm: empty call stack")?;
+                run_frame_until_call_or_ret(m, frame, globals, memory, steps)?
+            };
+            match step {
+                FrameStep::Returned(rv) => {
+                    call_stack.pop();
+                    if let Some(caller) = call_stack.last_mut() {
+                        if let Some(val) = rv {
+                            caller.stack.push(val);
+                        }
+                    } else {
+                        return Ok(rv);
+                    }
+                }
+                FrameStep::Call(callee, cargs) => {
+                    if callee < imp_count {
+                        if let Some(rv) =
+                            exec_wasm_import(m, callee, &cargs, memory, prints, wasi_line_buf)?
+                            && let Some(caller) = call_stack.last_mut()
+                        {
+                            caller.stack.push(rv);
+                        }
+                    } else {
+                        if call_stack.len() >= MAX_WASM_CALL_DEPTH {
+                            return Err("wasm: call stack overflow".into());
+                        }
+                        call_stack.push(build_wasm_frame(m, callee, &cargs)?);
+                    }
+                }
+            }
+        }
     }
 
     let wargs: Vec<WasmVal> = args.iter().map(|&x| WasmVal::F64(x)).collect();

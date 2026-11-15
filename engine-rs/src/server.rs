@@ -5,14 +5,14 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value as JsonValue;
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 
 use crate::pipeline::{load_source, prepare_vm};
 use crate::registry::{safe_package_relative_path, unpack_bundle_to_dir};
-use crate::value::Val;
+use crate::value::{Val, constant_time_strings_equal};
 
 pub(crate) const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 pub(crate) const REGISTRY_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -86,29 +86,234 @@ pub(crate) fn json_error_response(status: u16, message: &str) -> Response<Box<dy
 }
 
 pub(crate) fn resolve_static_path(dir: &Path, request_url: &str) -> Option<PathBuf> {
-    let raw = request_url.split('?').next().unwrap_or("/");
+    const MAX_STATIC_FILE_BYTES: u64 = 64 * 1024 * 1024;
+    let raw = request_url.split(['?', '#']).next().unwrap_or("/");
+    if raw.bytes().any(|b| b.is_ascii_control()) || raw.contains(['\\', ':']) {
+        return None;
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("%2e")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || lower.contains("%00")
+    {
+        return None;
+    }
     let rel = raw.trim_start_matches('/');
     let rel_path = if rel.is_empty() {
         PathBuf::from("index.html")
     } else {
         safe_package_relative_path(rel).ok()?
     };
+    for comp in rel_path.components() {
+        if let std::path::Component::Normal(seg) = comp {
+            let s = seg.to_str()?;
+            if s.contains(':') || (s.starts_with('.') && s != ".well-known") {
+                return None;
+            }
+        }
+    }
     let mut candidate = dir.join(rel_path);
     if candidate.is_dir() {
         candidate = candidate.join("index.html");
     }
     let canon_dir = dir.canonicalize().ok()?;
     let canon_file = candidate.canonicalize().ok()?;
-    if canon_file.starts_with(&canon_dir) && canon_file.is_file() {
+    if canon_file.starts_with(&canon_dir)
+        && canon_file.is_file()
+        && canon_file
+            .metadata()
+            .is_ok_and(|m| m.len() <= MAX_STATIC_FILE_BYTES)
+    {
         Some(canon_file)
     } else {
         None
     }
 }
 
+pub(crate) fn write_secret_file(path: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        f.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, content).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn default_bind_host() -> String {
+    std::env::var("KOVREK_BIND_HOST")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+fn is_loopback_bind_host(host: &str) -> bool {
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    trimmed.eq_ignore_ascii_case("localhost")
+        || trimmed
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn actual_server_port(server: &Server, fallback_port: u16) -> u16 {
+    server
+        .server_addr()
+        .to_ip()
+        .map(|sa| sa.port())
+        .unwrap_or(fallback_port)
+}
+
+fn req_header<'a>(req: &'a Request, name: &str) -> Option<&'a str> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str().trim())
+}
+
+fn is_valid_host_header(host: &str, bind_host: &str, port: u16) -> bool {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if bind_host == "0.0.0.0" || bind_host == "::" || bind_host == "[::]" {
+        return !trimmed.contains('/')
+            && !trimmed.contains('@')
+            && !trimmed.contains(char::is_whitespace);
+    }
+    let bh = bind_host.trim_start_matches('[').trim_end_matches(']');
+    let expected_bh_host = if bh.contains(':') {
+        format!("[{bh}]")
+    } else {
+        bh.to_string()
+    };
+    let candidates = [
+        "127.0.0.1".to_string(),
+        format!("127.0.0.1:{port}"),
+        "localhost".to_string(),
+        format!("localhost:{port}"),
+        "[::1]".to_string(),
+        format!("[::1]:{port}"),
+        expected_bh_host.clone(),
+        format!("{expected_bh_host}:{port}"),
+    ];
+    candidates.iter().any(|c| trimmed.eq_ignore_ascii_case(c))
+}
+
+fn is_valid_local_origin(origin: &str, bind_host: &str, port: u16) -> bool {
+    let trimmed = origin.trim().trim_end_matches('/');
+    let bh = bind_host.trim_start_matches('[').trim_end_matches(']');
+    let bh_host = if bh.contains(':') {
+        format!("[{bh}]")
+    } else {
+        bh.to_string()
+    };
+    let mut allowed = vec![
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+        format!("http://[::1]:{port}"),
+        format!("http://{bh_host}:{port}"),
+    ];
+    if port == 80 {
+        allowed.push("http://127.0.0.1".into());
+        allowed.push("http://localhost".into());
+        allowed.push("http://[::1]".into());
+        allowed.push(format!("http://{bh_host}"));
+    }
+    allowed.iter().any(|a| trimmed.eq_ignore_ascii_case(a))
+}
+
+pub(crate) fn authorize_control_plane_request(
+    req: &Request,
+    expected_token: &str,
+    bind_host: &str,
+    port: u16,
+    require_json_post: bool,
+) -> Result<(), (u16, &'static str)> {
+    if let Some(host) = req_header(req, "Host")
+        && !is_valid_host_header(host, bind_host, port)
+    {
+        return Err((403, "forbidden Host header"));
+    }
+    if let Some(origin) = req_header(req, "Origin")
+        && !is_valid_local_origin(origin, bind_host, port)
+    {
+        return Err((403, "forbidden cross-origin request"));
+    }
+    let bearer = req_header(req, "Authorization").and_then(|v| {
+        if v.len() >= 7 && v[..7].eq_ignore_ascii_case("bearer ") {
+            Some(v[7..].trim())
+        } else {
+            None
+        }
+    });
+    let alt = req_header(req, "X-Kovrek-Token");
+    let supplied = bearer.or(alt).unwrap_or("");
+    if expected_token.is_empty() || !constant_time_strings_equal(supplied, expected_token) {
+        return Err((401, "unauthorized: valid bearer token required"));
+    }
+    if require_json_post && req.method().as_str().eq_ignore_ascii_case("POST") {
+        let ct = req_header(req, "Content-Type").unwrap_or("");
+        let media = ct.split(';').next().unwrap_or("").trim();
+        if !media.eq_ignore_ascii_case("application/json") {
+            return Err((415, "Content-Type must be application/json"));
+        }
+    }
+    Ok(())
+}
+
+fn allowed_registry_static_path(root: &Path, raw_url: &str) -> Option<PathBuf> {
+    let url_path = raw_url.split('?').next().unwrap_or("/");
+    let trimmed = url_path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let rel = safe_package_relative_path(trimmed).ok()?;
+    let mut comps = rel.components();
+    let first = match comps.next() {
+        Some(Component::Normal(s)) => s.to_string_lossy().to_string(),
+        _ => return None,
+    };
+    if !matches!(first.as_str(), "bundles" | "packages" | "registry") {
+        return None;
+    }
+    if rel
+        .components()
+        .any(|c| matches!(c, Component::Normal(s) if s.to_string_lossy().starts_with('.')))
+    {
+        return None;
+    }
+    let candidate = root.join(&rel);
+    let canon_root = fs::canonicalize(root).ok()?;
+    let canon_cand = fs::canonicalize(&candidate).ok()?;
+    if canon_cand.starts_with(&canon_root) && canon_cand.is_file() {
+        Some(canon_cand)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn serve_directory(dir: &Path, port: u16) -> Result<(), String> {
-    let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
-    println!("Kovrek web server: http://127.0.0.1:{port}");
+    let bind_host = default_bind_host();
+    let server = Server::http(format!("{bind_host}:{port}")).map_err(|e| e.to_string())?;
+    let actual_port = actual_server_port(&server, port);
+    println!("Kovrek web server: http://{bind_host}:{actual_port}");
     println!("Serving {}", dir.display());
     for req in server.incoming_requests() {
         let mut response = if let Some(path) = resolve_static_path(dir, req.url()) {
@@ -150,8 +355,10 @@ pub(crate) fn serve_routes(routes_file: &Path, port: u16) -> Result<(), String> 
         .get("routes")
         .and_then(JsonValue::as_object)
         .ok_or("web route file requires a 'routes' object")?;
-    let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
-    println!("Kovrek API server: http://127.0.0.1:{port}");
+    let bind_host = default_bind_host();
+    let server = Server::http(format!("{bind_host}:{port}")).map_err(|e| e.to_string())?;
+    let actual_port = actual_server_port(&server, port);
+    println!("Kovrek API server: http://{bind_host}:{actual_port}");
     println!("Routes: {}", routes.len());
     for mut req in server.incoming_requests() {
         let path = req.url().split('?').next().unwrap_or("/").to_string();
@@ -305,9 +512,12 @@ pub(crate) fn serve_kovrek_app(
         .and_then(JsonValue::as_u64)
         .map(|n| (n as usize).clamp(1024, 64 * 1024 * 1024))
         .unwrap_or(DEFAULT_MAX_BODY_BYTES);
-    let server =
-        std::sync::Arc::new(Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?);
-    println!("Kovrek dynamic app: http://127.0.0.1:{port}");
+    let bind_host = default_bind_host();
+    let server = std::sync::Arc::new(
+        Server::http(format!("{bind_host}:{port}")).map_err(|e| e.to_string())?,
+    );
+    let actual_port = actual_server_port(&server, port);
+    println!("Kovrek dynamic app: http://{bind_host}:{actual_port}");
     println!("Handlers: {} (workers: {workers})", routes.len());
     let routes = std::sync::Arc::new(routes);
     let static_dir = std::sync::Arc::new(static_dir);
@@ -437,15 +647,43 @@ pub(crate) fn serve_kovrek_app(
 }
 
 pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
-    let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
-    println!("Kovrek Package Registry Server: http://127.0.0.1:{port}");
-    println!("Root {}", dir.display());
+    let bind_host = default_bind_host();
+    let publish_token = if let Some(tok) = std::env::var("KOVREK_REGISTRY_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        tok
+    } else {
+        let tok = crate::security::random_token_urlsafe(32)?;
+        write_secret_file(&dir.join(".registry-token"), &tok)?;
+        tok
+    };
+    let server = Server::http(format!("{bind_host}:{port}")).map_err(|e| e.to_string())?;
+    let actual_port = actual_server_port(&server, port);
+    println!("Kovrek Package Registry Server: http://{bind_host}:{actual_port}");
+    println!("Root {} (publish auth required)", dir.display());
     for mut req in server.incoming_requests() {
         let method = req.method().as_str().to_string();
         let path = req.url().split('?').next().unwrap_or("/").to_string();
         let mut response = if method == "POST"
             && (path == "/publish" || path == "/registry/publish")
         {
+            if let Err((status, msg)) =
+                authorize_control_plane_request(&req, &publish_token, &bind_host, actual_port, true)
+            {
+                let mut r = Response::from_string(serde_json::json!({ "error": msg }).to_string())
+                    .with_status_code(StatusCode(status));
+                if let Ok(h) = Header::from_bytes(
+                    &b"Content-Type"[..],
+                    &b"application/json; charset=utf-8"[..],
+                ) {
+                    r.add_header(h);
+                }
+                apply_security_headers(&mut r);
+                req.respond(r).map_err(|e| e.to_string())?;
+                continue;
+            }
             let resp = match read_request_body_limited(&mut req, REGISTRY_MAX_BODY_BYTES) {
                 Ok(body) => match serde_json::from_str::<JsonValue>(&body) {
                     Ok(bundle) => {
@@ -458,21 +696,26 @@ pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
                             .get("entry")
                             .and_then(JsonValue::as_str)
                             .unwrap_or("src/main.kvr");
-                        let sha256 = bundle
-                            .get("sha256")
-                            .and_then(JsonValue::as_str)
-                            .unwrap_or("");
-                        if name.is_empty() || name.contains('/') || name.contains('\\') {
-                            Response::from_string("invalid package name")
+                        if let Err(e) = crate::registry::validate_package_name(name) {
+                            Response::from_string(format!("invalid package name: {e}"))
+                                .with_status_code(StatusCode(400))
+                        } else if let Err(e) = safe_package_relative_path(entry) {
+                            Response::from_string(format!("invalid package entry: {e}"))
                                 .with_status_code(StatusCode(400))
                         } else {
                             let pkg_dir = dir.join("packages").join(name);
-                            match unpack_bundle_to_dir(&bundle, &pkg_dir) {
-                                Ok(()) => {
+                            match unpack_bundle_to_dir(&bundle, &pkg_dir).and_then(|()| {
+                                let verified_sha =
+                                    crate::registry::hash_directory_excluding_sig(&pkg_dir)?;
+                                Ok(verified_sha)
+                            }) {
+                                Ok(verified_sha) => {
                                     let bundles_dir = dir.join("bundles");
-                                    let _ = fs::create_dir_all(&bundles_dir);
-                                    let _ =
-                                        fs::write(bundles_dir.join(format!("{name}.kvpkg")), &body);
+                                    let bundle_dest = bundles_dir.join(format!("{name}.kvpkg"));
+                                    if let Some(parent) = bundle_dest.parent() {
+                                        let _ = fs::create_dir_all(parent);
+                                    }
+                                    let _ = fs::write(&bundle_dest, &body);
                                     let index_path = dir.join("registry").join("index.json");
                                     if let Some(parent) = index_path.parent() {
                                         let _ = fs::create_dir_all(parent);
@@ -492,7 +735,7 @@ pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
                                         "entry": entry,
                                         "source": format!("../packages/{name}"),
                                         "bundle_path": format!("/bundles/{name}.kvpkg"),
-                                        "sha256": sha256
+                                        "sha256": verified_sha
                                     });
                                     if let Some(deps) = bundle.get("dependencies") {
                                         meta["dependencies"] = deps.clone();
@@ -511,7 +754,7 @@ pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
                                                 let ok_json = serde_json::json!({
                                                     "published": name,
                                                     "version": version,
-                                                    "sha256": sha256
+                                                    "sha256": verified_sha
                                                 });
                                                 Response::from_string(ok_json.to_string())
                                             }
@@ -557,7 +800,7 @@ pub(crate) fn serve_registry(dir: &Path, port: u16) -> Result<(), String> {
                 Err(_) => Response::from_string("404 Registry index not found")
                     .with_status_code(StatusCode(404)),
             }
-        } else if let Some(sp) = resolve_static_path(dir, req.url()) {
+        } else if let Some(sp) = allowed_registry_static_path(dir, req.url()) {
             match fs::read(&sp) {
                 Ok(data) => Response::from_data(data),
                 Err(_) => Response::from_string("500 Read error").with_status_code(StatusCode(500)),
@@ -1140,34 +1383,75 @@ pub(crate) fn handle_notebook_api_request(
 }
 
 pub(crate) fn serve_notebook(dir: &Path, port: u16) -> Result<(), String> {
+    let bind_host = default_bind_host();
+    let auth_token = std::env::var("KOVREK_NOTEBOOK_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(Ok)
+        .unwrap_or_else(|| crate::security::random_token_urlsafe(32))?;
+    let notebook_caps: Option<Vec<String>> = std::env::var("KOVREK_NOTEBOOK_CAPS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            if !is_loopback_bind_host(&bind_host) {
+                Some(vec!["math".into(), "io".into(), "fs.read".into()])
+            } else {
+                None
+            }
+        });
+
     let storage = dir.join(".kovrek-notebook.json");
     let session = std::sync::Arc::new(std::sync::Mutex::new(NotebookSession::new(Some(
         storage.clone(),
     ))));
-    let server = Server::http(format!("0.0.0.0:{port}")).map_err(|e| e.to_string())?;
-    println!("Kovrek Notebook server: http://127.0.0.1:{port}");
+    let server = Server::http(format!("{bind_host}:{port}")).map_err(|e| e.to_string())?;
+    let actual_port = actual_server_port(&server, port);
+    println!("Kovrek Notebook server: http://{bind_host}:{actual_port}/#token={auth_token}");
     println!("Workspace: {}", dir.display());
+    if let Some(ref caps) = notebook_caps {
+        println!("Notebook sandbox caps: {}", caps.join(", "));
+    }
 
     const UI_HTML: &str = r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>Kovrek Notebook</title>
 <style>body{font-family:system-ui,sans-serif;max-width:900px;margin:2rem auto;background:#0f172a;color:#e2e8f0}
 textarea{width:100%;height:90px;background:#1e293b;color:#f8fafc;border:1px solid #334155;padding:.6rem;font-family:monospace}
+input{padding:.4rem;background:#1e293b;color:#f8fafc;border:1px solid #334155}
 button{background:#38bdf8;color:#0f172a;border:0;padding:.45rem 1rem;border-radius:6px;font-weight:600;cursor:pointer;margin:.4rem .3rem 0 0}
 pre{background:#020617;padding:.75rem;border-radius:6px;white-space:pre-wrap}</style></head>
 <body><h1>Kovrek Reactive Notebook</h1>
-<div><input id="cid" value="cell1" style="padding:.4rem;background:#1e293b;color:#f8fafc;border:1px solid #334155"/>
+<div style="margin-bottom:.5rem"><input id="tok" type="password" placeholder="Notebook Bearer Token" style="width:24rem"/>
+<input id="cid" value="cell1"/>
 <button onclick="runCell()">Run Cell</button><button onclick="resetNb()">Reset Session</button></div>
 <textarea id="src" placeholder="let x = 21 * 2;&#10;print(x);"></textarea>
 <pre id="out">Ready.</pre>
 <script>
-async function runCell(){const r=await fetch('/api/notebook/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:cid.value,source:src.value})});const d=await r.json();out.textContent=JSON.stringify(d,null,2);}
-async function resetNb(){await fetch('/api/notebook/reset',{method:'POST'});out.textContent='Session reset.';}
+(()=>{const h=location.hash||'';const m=h.match(/token=([^&]+)/);if(m){try{sessionStorage.setItem('kovrek_nb_tok',decodeURIComponent(m[1]));}catch(_){}history.replaceState(null,'',location.pathname+location.search);}try{tok.value=sessionStorage.getItem('kovrek_nb_tok')||'';}catch(_){}tok.addEventListener('change',()=>{try{sessionStorage.setItem('kovrek_nb_tok',tok.value);}catch(_){}});})();
+function authHdrs(){const t=(tok.value||'').trim();return t?{'Content-Type':'application/json','Authorization':'Bearer '+t}:{'Content-Type':'application/json'};}
+async function runCell(){const r=await fetch('/api/notebook/run',{method:'POST',headers:authHdrs(),body:JSON.stringify({id:cid.value,source:src.value})});const d=await r.json();out.textContent=JSON.stringify(d,null,2);}
+async function resetNb(){const r=await fetch('/api/notebook/reset',{method:'POST',headers:authHdrs(),body:'{}'});const d=await r.json();out.textContent=JSON.stringify(d,null,2);}
 </script></body></html>"#;
 
     for mut req in server.incoming_requests() {
         let method = req.method().as_str().to_string();
         let url = req.url().split('?').next().unwrap_or("/").to_string();
         let mut response = if method == "GET" && url == "/" {
+            if let Some(host) = req_header(&req, "Host")
+                && !is_valid_host_header(host, &bind_host, actual_port)
+            {
+                let mut r =
+                    Response::from_string("403 Forbidden Host").with_status_code(StatusCode(403));
+                apply_security_headers(&mut r);
+                req.respond(r).map_err(|e| e.to_string())?;
+                continue;
+            }
             let mut r = Response::from_string(UI_HTML);
             if let Ok(h) =
                 Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..])
@@ -1176,19 +1460,42 @@ async function resetNb(){await fetch('/api/notebook/reset',{method:'POST'});out.
             }
             if let Ok(csp) = Header::from_bytes(
                 &b"Content-Security-Policy"[..],
-                &b"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; base-uri 'self'; frame-ancestors 'none'; object-src 'none'"[..],
+                &b"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: blob:; base-uri 'self'; frame-ancestors 'none'; form-action 'none'; object-src 'none'"[..],
             ) {
                 r.add_header(csp);
             }
             r
         } else {
+            if let Err((status, msg)) =
+                authorize_control_plane_request(&req, &auth_token, &bind_host, actual_port, true)
+            {
+                let mut r = Response::from_string(serde_json::json!({ "error": msg }).to_string())
+                    .with_status_code(StatusCode(status));
+                if let Ok(h) = Header::from_bytes(
+                    &b"Content-Type"[..],
+                    &b"application/json; charset=utf-8"[..],
+                ) {
+                    r.add_header(h);
+                }
+                apply_security_headers(&mut r);
+                req.respond(r).map_err(|e| e.to_string())?;
+                continue;
+            }
             let body_res = if method == "POST" {
                 read_request_body_limited(&mut req, DEFAULT_MAX_BODY_BYTES)
             } else {
                 Ok(String::new())
             };
             let (status, ctype, text) = match body_res {
-                Ok(body) => handle_notebook_api_request(&session, &method, &url, &body),
+                Ok(body) => {
+                    if let Some(ref caps) = notebook_caps {
+                        crate::runtime::run_with_caps(caps.clone(), || {
+                            Ok(handle_notebook_api_request(&session, &method, &url, &body))
+                        })?
+                    } else {
+                        handle_notebook_api_request(&session, &method, &url, &body)
+                    }
+                }
                 Err(BodyReadError::TooLarge(limit)) => (
                     413,
                     "application/json",

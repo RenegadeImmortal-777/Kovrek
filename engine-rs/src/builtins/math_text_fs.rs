@@ -92,6 +92,17 @@ fn big_out_to_val(out: BigOut) -> Val {
     }
 }
 
+fn build_bounded_regex(pattern: &str) -> Result<Regex, String> {
+    if pattern.len() > 16_384 {
+        return Err("regex pattern exceeds 16 KiB limit".into());
+    }
+    regex::RegexBuilder::new(pattern)
+        .size_limit(1024 * 1024)
+        .dfa_size_limit(1024 * 1024)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 impl Vm {
     pub(crate) fn call_builtin_math_text_fs(
         &mut self,
@@ -131,7 +142,7 @@ impl Vm {
                     Val::Str(s) => s,
                     _ => return Err("text must be String".into()),
                 };
-                Val::Bool(Regex::new(p).map_err(|e| e.to_string())?.is_match(t))
+                Val::Bool(build_bounded_regex(p)?.is_match(t))
             }
             "regex_replace" => {
                 if a.len() != 3 {
@@ -150,8 +161,7 @@ impl Vm {
                     _ => return Err("replacement must be String".into()),
                 };
                 Val::Str(
-                    Regex::new(p)
-                        .map_err(|e| e.to_string())?
+                    build_bounded_regex(p)?
                         .replace_all(t, r.as_str())
                         .to_string(),
                 )
@@ -169,8 +179,7 @@ impl Vm {
                     _ => return Err("text must be String".into()),
                 };
                 Val::List(
-                    Regex::new(p)
-                        .map_err(|e| e.to_string())?
+                    build_bounded_regex(p)?
                         .split(t)
                         .map(|x| Val::Str(x.to_string()))
                         .collect(),
@@ -188,7 +197,7 @@ impl Vm {
                     Val::Str(s) => s,
                     _ => return Err("text must be String".into()),
                 };
-                let re = Regex::new(p).map_err(|e| e.to_string())?;
+                let re = build_bounded_regex(p)?;
                 Val::List(
                     re.find_iter(t)
                         .map(|m| Val::Str(m.as_str().to_string()))
@@ -414,10 +423,10 @@ impl Vm {
                     _ => return Err("text must be String".into()),
                 };
                 let count = match a[1] {
-                    Val::Num(n) => n.max(0.0) as usize,
+                    Val::Num(n) => n,
                     _ => return Err("count must be Number".into()),
                 };
-                Val::Str(text.repeat(count))
+                Val::Str(crate::value::repeat_str_bounded(text, count)?)
             }
             "chars" => {
                 if a.len() != 1 {
@@ -556,6 +565,8 @@ impl Vm {
                 )
             }
             "copy_file" => {
+                crate::runtime::require_cap("fs.read")?;
+                crate::runtime::require_cap("fs.write")?;
                 if a.len() != 2 {
                     return Err("copy_file expects source,destination".into());
                 }
@@ -570,6 +581,8 @@ impl Vm {
                 Val::Num(fs::copy(src, dst).map_err(|e| e.to_string())? as f64)
             }
             "move_file" => {
+                crate::runtime::require_cap("fs.read")?;
+                crate::runtime::require_cap("fs.write")?;
                 if a.len() != 2 {
                     return Err("move_file expects source,destination".into());
                 }
@@ -585,6 +598,7 @@ impl Vm {
                 Val::Null
             }
             "file_size" => {
+                crate::runtime::require_cap("fs.read")?;
                 if a.len() != 1 {
                     return Err("file_size expects path".into());
                 }
@@ -595,6 +609,7 @@ impl Vm {
                 Val::Num(fs::metadata(p).map_err(|e| e.to_string())?.len() as f64)
             }
             "is_file" => {
+                crate::runtime::require_cap("fs.read")?;
                 if a.len() != 1 {
                     return Err("is_file expects path".into());
                 }
@@ -605,6 +620,7 @@ impl Vm {
                 Val::Bool(Path::new(p).is_file())
             }
             "is_dir" => {
+                crate::runtime::require_cap("fs.read")?;
                 if a.len() != 1 {
                     return Err("is_dir expects path".into());
                 }
@@ -639,6 +655,7 @@ impl Vm {
                 Val::Null
             }
             "path_exists" => {
+                crate::runtime::require_cap("fs.read")?;
                 if a.len() != 1 {
                     return Err("path_exists expects path".into());
                 }
@@ -648,12 +665,15 @@ impl Vm {
                 };
                 Val::Bool(Path::new(p).exists())
             }
-            "cwd" => Val::Str(
-                env::current_dir()
-                    .map_err(|e| e.to_string())?
-                    .display()
-                    .to_string(),
-            ),
+            "cwd" => {
+                crate::runtime::require_cap("fs.read")?;
+                Val::Str(
+                    env::current_dir()
+                        .map_err(|e| e.to_string())?
+                        .display()
+                        .to_string(),
+                )
+            }
             "env_get" => {
                 crate::runtime::require_cap("env")?;
                 if a.len() != 1 {
@@ -750,13 +770,18 @@ impl Vm {
                     return Err("randint expects min,max".into());
                 }
                 let lo = match a[0] {
-                    Val::Num(n) => n as i64,
+                    Val::Num(n) if n.is_finite() => n as i64,
+                    Val::Num(_) => return Err("randint min must be finite".into()),
                     _ => return Err("min must be Number".into()),
                 };
                 let hi = match a[1] {
-                    Val::Num(n) => n as i64,
+                    Val::Num(n) if n.is_finite() => n as i64,
+                    Val::Num(_) => return Err("randint max must be finite".into()),
                     _ => return Err("max must be Number".into()),
                 };
+                if lo > hi {
+                    return Err(format!("randint requires min <= max, got {lo}..={hi}"));
+                }
                 Val::Num(rand::thread_rng().gen_range(lo..=hi) as f64)
             }
             "input" => {

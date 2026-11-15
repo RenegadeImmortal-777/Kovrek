@@ -173,14 +173,34 @@ impl Vm {
                     None => (vdir, None),
                 };
                 let pkg_manifest_path = pkg_dir.join("kovrek.json");
+                let pkg_json = if pkg_manifest_path.is_file() {
+                    let pkg_txt =
+                        fs::read_to_string(&pkg_manifest_path).map_err(|e| e.to_string())?;
+                    Some(serde_json::from_str::<JsonValue>(&pkg_txt).map_err(|e| e.to_string())?)
+                } else {
+                    None
+                };
+                if let Some(pkg_entry) = pkg_json
+                    .as_ref()
+                    .and_then(|m| m.get("entry"))
+                    .and_then(JsonValue::as_str)
+                {
+                    let _ = crate::registry::safe_package_relative_path(pkg_entry)?;
+                }
                 let entry_owned = manifest_meta
                     .and_then(|m| m.get("entry"))
                     .and_then(JsonValue::as_str)
+                    .or_else(|| {
+                        pkg_json
+                            .as_ref()
+                            .and_then(|m| m.get("entry"))
+                            .and_then(JsonValue::as_str)
+                    })
                     .map(str::to_string)
                     .or(ws_entry)
                     .unwrap_or_else(|| "main.kvr".to_string());
-                let entry = entry_owned.as_str();
-                let path = pkg_dir.join(entry);
+                let entry_rel = crate::registry::safe_package_relative_path(entry_owned.as_str())?;
+                let path = pkg_dir.join(entry_rel);
                 let module_vm = if path.is_file() {
                     let source = load_source(path.to_string_lossy().as_ref())?;
                     let mut mvm = Vm::new(compile_source(&source)?);
@@ -245,99 +265,83 @@ impl Vm {
                     }
                 }
                 // Bind any native `kovrek_plugin_v1` shared library declared by package kovrek.json
-                let pkg_manifest_path = pkg_dir.join("kovrek.json");
-                if pkg_manifest_path.is_file() {
-                    if let Ok(pkg_txt) = fs::read_to_string(&pkg_manifest_path) {
-                        if let Ok(pkg_json) = serde_json::from_str::<JsonValue>(&pkg_txt) {
-                            if let Some(native) = pkg_json
-                                .get("native")
-                                .and_then(crate::registry::select_native_spec)
-                            {
-                                let ext = crate::plugin::platform_shared_ext();
-                                let raw_lib = native
-                                    .get("library")
-                                    .and_then(JsonValue::as_str)
-                                    .unwrap_or("plugin");
-                                let mut lib_path = pkg_dir.join(raw_lib);
-                                if lib_path.extension().is_none() {
-                                    lib_path.set_extension(ext);
-                                }
-                                if !lib_path.is_file() {
-                                    if let Some(src_rel) =
-                                        native.get("source").and_then(JsonValue::as_str)
-                                    {
-                                        let src_path = pkg_dir.join(src_rel);
-                                        if src_path.is_file() {
-                                            let _ = crate::plugin::build_rust_plugin(
-                                                &src_path, &lib_path,
-                                            );
-                                        }
-                                    }
-                                }
-                                if lib_path.is_file() {
-                                    let loaded = crate::plugin::load_plugin(&lib_path)?;
-                                    exports.push((
-                                        Val::Str("__native_plugin".into()),
-                                        loaded.info_val(),
-                                    ));
-                                    for (fn_name, exp) in &loaded.exports {
-                                        let (params, param_named, code) = if let Some(arity) =
-                                            exp.arity
-                                        {
-                                            let mut p = Vec::with_capacity(arity);
-                                            let mut named = Vec::with_capacity(arity);
-                                            let mut ops = Vec::with_capacity(arity + 4);
-                                            ops.push(Op::Const(Val::Str(loaded.id.clone())));
-                                            ops.push(Op::Const(Val::Str(fn_name.clone())));
-                                            for idx in 0..arity {
-                                                p.push((format!("arg{idx}"), None));
-                                                named.push(false);
-                                                ops.push(Op::LoadLocal(idx));
-                                            }
-                                            ops.push(Op::Call(
-                                                "__plugin_trampoline".into(),
-                                                2 + arity,
-                                            ));
-                                            ops.push(Op::Return);
-                                            (p, named, ops)
-                                        } else {
-                                            (
-                                                vec![("args".into(), Some("*".into()))],
-                                                vec![false],
-                                                vec![
-                                                    Op::Const(Val::Str(loaded.id.clone())),
-                                                    Op::Const(Val::Str(fn_name.clone())),
-                                                    Op::LoadLocal(0),
-                                                    Op::Call("__plugin_trampoline_list".into(), 3),
-                                                    Op::Return,
-                                                ],
-                                            )
-                                        };
-                                        let qualified = format!("{prefix}{fn_name}");
-                                        let fn_def = FunctionDef {
-                                            params: Arc::new(params),
-                                            return_type: None,
-                                            is_async: false,
-                                            is_generator: false,
-                                            local_count: exp.arity.unwrap_or(1),
-                                            param_named: Arc::new(param_named),
-                                            code: Arc::new(code),
-                                            captures: Arc::new(HashMap::new()),
-                                            capture_types: Arc::new(HashMap::new()),
-                                            upvalues: Arc::new(HashMap::new()),
-                                            debug_name: fn_name.clone(),
-                                            debug_scope: 0,
-                                        };
-                                        register_named_function_object(&qualified, fn_def.clone())?;
-                                        Arc::make_mut(&mut self.funcs)
-                                            .insert(qualified.clone(), fn_def);
-                                        exports.push((
-                                            Val::Str(fn_name.clone()),
-                                            Val::Function(qualified),
-                                        ));
-                                    }
-                                }
+                if let Some(native) = pkg_json
+                    .as_ref()
+                    .and_then(|m| m.get("native"))
+                    .and_then(crate::registry::select_native_spec)
+                {
+                    crate::runtime::require_cap("ffi")?;
+                    let ext = crate::plugin::platform_shared_ext();
+                    let raw_lib = native
+                        .get("library")
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("plugin");
+                    let rel_lib = crate::registry::safe_package_relative_path(raw_lib)?;
+                    let mut lib_path = pkg_dir.join(rel_lib);
+                    if lib_path.extension().is_none() {
+                        lib_path.set_extension(ext);
+                    }
+                    if !lib_path.is_file() {
+                        if let Some(src_rel) = native.get("source").and_then(JsonValue::as_str) {
+                            crate::runtime::require_cap("process")?;
+                            crate::runtime::require_cap("fs.write")?;
+                            let safe_src_rel =
+                                crate::registry::safe_package_relative_path(src_rel)?;
+                            let src_path = pkg_dir.join(safe_src_rel);
+                            if src_path.is_file() {
+                                let _ = crate::plugin::build_rust_plugin(&src_path, &lib_path);
                             }
+                        }
+                    }
+                    if lib_path.is_file() {
+                        let loaded = crate::plugin::load_plugin(&lib_path)?;
+                        exports.push((Val::Str("__native_plugin".into()), loaded.info_val()));
+                        for (fn_name, exp) in &loaded.exports {
+                            let (params, param_named, code) = if let Some(arity) = exp.arity {
+                                let mut p = Vec::with_capacity(arity);
+                                let mut named = Vec::with_capacity(arity);
+                                let mut ops = Vec::with_capacity(arity + 4);
+                                ops.push(Op::Const(Val::Str(loaded.id.clone())));
+                                ops.push(Op::Const(Val::Str(fn_name.clone())));
+                                for idx in 0..arity {
+                                    p.push((format!("arg{idx}"), None));
+                                    named.push(false);
+                                    ops.push(Op::LoadLocal(idx));
+                                }
+                                ops.push(Op::Call("__plugin_trampoline".into(), 2 + arity));
+                                ops.push(Op::Return);
+                                (p, named, ops)
+                            } else {
+                                (
+                                    vec![("args".into(), Some("*".into()))],
+                                    vec![false],
+                                    vec![
+                                        Op::Const(Val::Str(loaded.id.clone())),
+                                        Op::Const(Val::Str(fn_name.clone())),
+                                        Op::LoadLocal(0),
+                                        Op::Call("__plugin_trampoline_list".into(), 3),
+                                        Op::Return,
+                                    ],
+                                )
+                            };
+                            let qualified = format!("{prefix}{fn_name}");
+                            let fn_def = FunctionDef {
+                                params: Arc::new(params),
+                                return_type: None,
+                                is_async: false,
+                                is_generator: false,
+                                local_count: exp.arity.unwrap_or(1),
+                                param_named: Arc::new(param_named),
+                                code: Arc::new(code),
+                                captures: Arc::new(HashMap::new()),
+                                capture_types: Arc::new(HashMap::new()),
+                                upvalues: Arc::new(HashMap::new()),
+                                debug_name: fn_name.clone(),
+                                debug_scope: 0,
+                            };
+                            register_named_function_object(&qualified, fn_def.clone())?;
+                            Arc::make_mut(&mut self.funcs).insert(qualified.clone(), fn_def);
+                            exports.push((Val::Str(fn_name.clone()), Val::Function(qualified)));
                         }
                     }
                 }

@@ -7195,4 +7195,699 @@ assert(not verify_webhook("whsec_wrong", "1700000000", "{{\"ev\":\"ok\"}}", sig)
         run_source(&http_test).expect("kvhttp upgrade should execute cleanly");
         let _ = fs::remove_dir_all(&dir);
     }
+
+    fn mk_tmp(tag: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("kovrek_{tag}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn unhackable_capability_sandbox_attenuation_propagation_and_guards() {
+        let dir = mk_tmp("unhackable_cap_sandbox");
+        let probe_file = dir.join("probe.txt");
+        fs::write(&probe_file, "ok").unwrap();
+        let probe_esc = probe_file.to_string_lossy().replace('\\', "\\\\");
+        let copy_dst_esc = dir.join("copy.txt").to_string_lossy().replace('\\', "\\\\");
+
+        // 1. Category-to-subcap attenuation ("fs" -> "fs.read") preserves allowed subcap,
+        //    while outer "fs.read" -> inner "fs" never escalates to "fs.write".
+        // 2. Spawned background threads inherit caller capability restrictions.
+        // 3. Mutating KOVREK_CAPS via env_set fails even with "process" cap.
+        // 4. All previously unguarded filesystem/FFI/plugin/python/actor/wasm builtins fail with CapabilityError.
+        let src = format!(
+            r##"
+let r1 = cap_restrict(["fs"], fn() {{
+    return cap_restrict(["fs.read"], fn() {{
+        return read_file("{probe_esc}");
+    }});
+}});
+if r1 != "ok" {{ assert(false); }}
+
+let escalated = false;
+cap_restrict(["fs.read"], fn() {{
+    cap_restrict(["fs"], fn() {{
+        try {{
+            write_file("{copy_dst_esc}", "bad");
+            escalated = true;
+        }} catch err {{
+            if not contains(str(err), "CapabilityError") {{
+                escalated = true;
+            }}
+        }}
+    }});
+}});
+assert(not escalated);
+
+let kovrek_caps_mutated = false;
+cap_restrict(["process"], fn() {{
+    try {{
+        env_set("KOVREK_CAPS", "all");
+        kovrek_caps_mutated = true;
+    }} catch err {{
+        if not contains(str(err), "KOVREK_CAPS") {{
+            kovrek_caps_mutated = true;
+        }}
+    }}
+}});
+assert(not kovrek_caps_mutated);
+
+let checks = cap_restrict(["math"], fn() {{
+    let t = spawn(fn() {{
+        let blocked = 0;
+        let fake_py = {{"__py_handle__": 1, "__py_type__": "str"}};
+        try {{ read_file("{probe_esc}"); }} catch err {{ if contains(str(err), "CapabilityError") {{ blocked = blocked + 1; }} }}
+        try {{ copy_file("{probe_esc}", "{copy_dst_esc}"); }} catch err {{ if contains(str(err), "CapabilityError") {{ blocked = blocked + 1; }} }}
+        try {{ is_file("{probe_esc}"); }} catch err {{ if contains(str(err), "CapabilityError") {{ blocked = blocked + 1; }} }}
+        try {{ cwd(); }} catch err {{ if contains(str(err), "CapabilityError") {{ blocked = blocked + 1; }} }}
+        try {{ csv_read("{probe_esc}"); }} catch err {{ if contains(str(err), "CapabilityError") {{ blocked = blocked + 1; }} }}
+        try {{ plot_svg("{copy_dst_esc}", [1, 2], [3, 4]); }} catch err {{ if contains(str(err), "CapabilityError") {{ blocked = blocked + 1; }} }}
+        try {{ ffi_available("missing.dll"); }} catch err {{ if contains(str(err), "CapabilityError") {{ blocked = blocked + 1; }} }}
+        try {{ plugin_list(); }} catch err {{ if contains(str(err), "CapabilityError") {{ blocked = blocked + 1; }} }}
+        try {{ py_free(fake_py); }} catch err {{ if contains(str(err), "CapabilityError") {{ blocked = blocked + 1; }} }}
+        try {{ fake_py.upper(); }} catch err {{ if contains(str(err), "CapabilityError") {{ blocked = blocked + 1; }} }}
+        try {{ wasm_run("missing.wasm", "main"); }} catch err {{ if contains(str(err), "CapabilityError") {{ blocked = blocked + 1; }} }}
+        return blocked;
+    }}, []);
+    return await_task(t);
+}});
+assert(checks == 11);
+"##
+        );
+        run_source(&src).expect("capability hardening assertions must pass");
+
+        #[cfg(feature = "native-services")]
+        {
+            let sq_src = format!(
+                r##"
+let sql_blocked = false;
+cap_restrict(["math"], fn() {{
+    try {{
+        sqlite_query("{probe_esc}", "SELECT 1");
+    }} catch err {{
+        sql_blocked = contains(str(err), "CapabilityError");
+    }}
+}});
+assert(sql_blocked);
+"##
+            );
+            run_source(&sq_src).expect("sqlite capability guard must hold");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unhackable_aot_capability_sandbox_and_kovrek_caps_lockdown() {
+        let dir = mk_tmp("unhackable_aot_caps");
+        let probe = dir.join("data.txt");
+        let blocked_out = dir.join("out.txt");
+        fs::write(&probe, "hello-aot").unwrap();
+        let probe_esc = probe.to_string_lossy().replace('\\', "\\\\");
+        let out_esc = blocked_out.to_string_lossy().replace('\\', "\\\\");
+
+        let src = format!(
+            r##"
+let read_ok = cap_restrict(["fs.read"], fn() {{
+    let content = read_file("{probe_esc}");
+    assert(content == "hello-aot");
+    let write_blocked = false;
+    try {{
+        write_file("{out_esc}", "nope");
+    }} catch err {{
+        write_blocked = contains(str(err), "CapabilityError");
+    }}
+    assert(write_blocked);
+    return true;
+}});
+assert(read_ok);
+
+let cap_tamper_blocked = false;
+try {{
+    env_set("KOVREK_CAPS", "all");
+}} catch err {{
+    cap_tamper_blocked = true;
+}}
+assert(cap_tamper_blocked);
+"##
+        );
+        let exe = dir.join(if cfg!(windows) {
+            "aot_cap_test.exe"
+        } else {
+            "aot_cap_test"
+        });
+        crate::aot::compile_source_to_native(&src, &exe).unwrap();
+
+        // Unrestricted binary passes internal cap_restrict + KOVREK_CAPS tamper check
+        let out1 = std::process::Command::new(&exe)
+            .env_remove("KOVREK_CAPS")
+            .output()
+            .unwrap();
+        assert!(
+            out1.status.success(),
+            "AOT capability test failed: {}",
+            String::from_utf8_lossy(&out1.stderr)
+        );
+        assert!(!blocked_out.exists());
+
+        // External KOVREK_CAPS=math blocks fs.read at process boundary
+        let out2 = std::process::Command::new(&exe)
+            .env("KOVREK_CAPS", "math")
+            .output()
+            .unwrap();
+        assert!(
+            !out2.status.success(),
+            "AOT binary with KOVREK_CAPS=math must fail when reading files"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unhackable_registry_signing_flag_injection_and_atomic_unpack_staging() {
+        let dir = mk_tmp("unhackable_pkg_hardening");
+        let home = dir.join("home");
+        let pkg = dir.join("pkg");
+        let dest = dir.join("unpack_target");
+        fs::create_dir_all(pkg.join("src")).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("sentinel.txt"), "keep-me").unwrap();
+        fs::write(
+            pkg.join("kovrek.json"),
+            r#"{"name":"safe_pkg","version":"1.0.0","entry":"src/lib.kvr","packages":{}}"#,
+        )
+        .unwrap();
+        fs::write(pkg.join("src").join("lib.kvr"), "fn ok() { return 1; }\n").unwrap();
+
+        let _guard = EnvCwdGuard::enter(
+            &pkg,
+            &[("KOVREK_HOME", Some(home.to_string_lossy().as_ref()))],
+        );
+
+        // Unsigned package directory must fail verification (fail-closed)
+        assert!(crate::registry::pkg_verify(pkg.to_str()).is_err());
+
+        // Forged unknown key_id signature must fail verification
+        fs::write(
+            pkg.join("kovrek.sig.json"),
+            r#"{"format":2,"algorithm":"hmac-sha256","key_id":"unknown_key_id","name":"safe_pkg","version":"1.0.0","sha256":"00","signature":"00"}"#,
+        )
+        .unwrap();
+        assert!(crate::registry::pkg_verify(pkg.to_str()).is_err());
+        let _ = fs::remove_file(pkg.join("kovrek.sig.json"));
+
+        // Sign legitimately and pack bundle
+        crate::registry::pkg_keygen(Some("rel_key")).unwrap();
+        crate::registry::pkg_sign(Some(pkg.as_path()), Some("rel_key")).unwrap();
+        crate::registry::pkg_verify(pkg.to_str()).unwrap();
+        let bundle_path = dir.join("safe_pkg.kvpkg");
+        crate::registry::pkg_pack(Some(pkg.as_path()), Some(bundle_path.as_path())).unwrap();
+
+        // Tamper bundle signature and ensure unpack fails WITHOUT clobbering existing dest files
+        let bad_bundle_path = dir.join("tampered.kvpkg");
+        let mut bundle: JsonValue =
+            serde_json::from_str(&fs::read_to_string(&bundle_path).unwrap()).unwrap();
+        bundle["signature"]["signature"] = JsonValue::String("deadbeef".into());
+        fs::write(
+            &bad_bundle_path,
+            serde_json::to_string_pretty(&bundle).unwrap(),
+        )
+        .unwrap();
+        assert!(crate::registry::pkg_unpack(&bad_bundle_path, Some(dest.as_path())).is_err());
+        assert_eq!(
+            fs::read_to_string(dest.join("sentinel.txt")).unwrap(),
+            "keep-me",
+            "failed bundle unpack must not clobber destination directory"
+        );
+
+        // Bundle with traversal name and no output arg must be rejected
+        let mut trav_bundle: JsonValue =
+            serde_json::from_str(&fs::read_to_string(&bundle_path).unwrap()).unwrap();
+        trav_bundle["name"] = JsonValue::String("../escape".into());
+        let trav_path = dir.join("trav.kvpkg");
+        fs::write(
+            &trav_path,
+            serde_json::to_string_pretty(&trav_bundle).unwrap(),
+        )
+        .unwrap();
+        assert!(crate::registry::pkg_unpack(&trav_path, None).is_err());
+
+        // Python & JS bridge flag injection rejection
+        assert!(crate::registry::pkg_py_bridge("--index-url=http://evil", None, false).is_err());
+        assert!(crate::registry::pkg_py_bridge("../evilpkg", None, false).is_err());
+        assert!(crate::registry::pkg_js_bridge("--registry=http://evil", None, false).is_err());
+        assert!(crate::registry::pkg_js_bridge("../evilpkg", None, false).is_err());
+
+        drop(_guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unhackable_wasm_memory_limit_and_call_depth_limit() {
+        // Minimal valid Wasm declaring initial_pages = 2048 (128 MiB > 64 MiB limit)
+        let huge_mem_wasm: Vec<u8> = vec![
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + v1
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type 0: () -> ()
+            0x03, 0x02, 0x01, 0x00, // func 0 -> type 0
+            0x05, 0x04, 0x01, 0x00, 0x80, 0x10, // memory: flags=0, initial=2048 (uleb128)
+            0x07, 0x08, 0x01, 0x04, b'm', b'a', b'i', b'n', 0x00, 0x00, // export "main"
+            0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b, // code: empty fn
+        ];
+        let mem_err = crate::native_codegen::wasm_run(&huge_mem_wasm, "main", &[]).unwrap_err();
+        assert!(mem_err.contains("64 MiB"), "unexpected error: {mem_err}");
+
+        // Minimal valid Wasm triggering infinite mutual/self recursion before step budget
+        let rec_wasm: Vec<u8> = vec![
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + v1
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type 0: () -> ()
+            0x03, 0x02, 0x01, 0x00, // func 0 -> type 0
+            0x07, 0x08, 0x01, 0x04, b'm', b'a', b'i', b'n', 0x00, 0x00, // export "main"
+            0x0a, 0x06, 0x01, 0x04, 0x00, 0x10, 0x00, 0x0b, // code: call 0; end
+        ];
+        let rec_err = crate::native_codegen::wasm_run(&rec_wasm, "main", &[]).unwrap_err();
+        assert!(
+            rec_err.contains("call stack overflow"),
+            "unexpected error: {rec_err}"
+        );
+    }
+
+    #[cfg(feature = "native-services")]
+    #[test]
+    fn unhackable_network_control_plane_and_actor_rpc_auth() {
+        use std::io::{Read as _, Write as _};
+
+        fn send_raw_http(addr: &str, raw_req: &str) -> String {
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            stream.write_all(raw_req.as_bytes()).unwrap();
+            let mut resp = String::new();
+            let _ = stream.read_to_string(&mut resp);
+            resp
+        }
+
+        let dir = mk_tmp("unhackable_net_cp");
+        let srv_home = dir.join("srv_home");
+        let nb_dir = dir.join("nb_dir");
+        fs::create_dir_all(&srv_home).unwrap();
+        fs::create_dir_all(&nb_dir).unwrap();
+
+        let reg_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let reg_port = reg_probe.local_addr().unwrap().port();
+        drop(reg_probe);
+
+        let nb_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let nb_port = nb_probe.local_addr().unwrap().port();
+        drop(nb_probe);
+
+        let _guard = EnvCwdGuard::enter(
+            &dir,
+            &[
+                ("KOVREK_BIND_HOST", Some("127.0.0.1")),
+                ("KOVREK_REGISTRY_TOKEN", Some("test-reg-token-secret")),
+                ("KOVREK_NOTEBOOK_TOKEN", Some("test-nb-token-secret")),
+                ("KOVREK_NOTEBOOK_CAPS", Some("math")),
+                ("KOVREK_ACTOR_TOKEN", None),
+            ],
+        );
+
+        let srv_home_thr = srv_home.clone();
+        std::thread::spawn(move || {
+            let _ = crate::server::serve_registry(&srv_home_thr, reg_port);
+        });
+        let nb_dir_thr = nb_dir.clone();
+        std::thread::spawn(move || {
+            let _ = crate::server::serve_notebook(&nb_dir_thr, nb_port);
+        });
+
+        let reg_addr = format!("127.0.0.1:{reg_port}");
+        let nb_addr = format!("127.0.0.1:{nb_port}");
+        let mut ready = false;
+        for _ in 0..40 {
+            if std::net::TcpStream::connect(&reg_addr).is_ok()
+                && std::net::TcpStream::connect(&nb_addr).is_ok()
+            {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(ready, "registry and notebook servers failed to listen");
+
+        fn send_raw_post(
+            addr: &str,
+            path: &str,
+            host_hdr: &str,
+            extra_headers: &str,
+            content_type: &str,
+            body: &str,
+        ) -> String {
+            let req = format!(
+                "POST {path} HTTP/1.1\r\nHost: {host_hdr}\r\n{extra_headers}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            send_raw_http(addr, &req)
+        }
+
+        // Registry control-plane checks:
+        assert!(
+            send_raw_http(
+                &reg_addr,
+                &format!(
+                    "GET /keys/ci.json HTTP/1.1\r\nHost: {reg_addr}\r\nConnection: close\r\n\r\n"
+                )
+            )
+            .starts_with("HTTP/1.1 404")
+        );
+        assert!(
+            send_raw_http(
+                &reg_addr,
+                &format!(
+                    "GET /.registry-token HTTP/1.1\r\nHost: {reg_addr}\r\nConnection: close\r\n\r\n"
+                )
+            )
+            .starts_with("HTTP/1.1 404")
+        );
+        assert!(
+            send_raw_post(
+                &reg_addr,
+                "/publish",
+                &reg_addr,
+                "",
+                "application/json",
+                "{}",
+            )
+            .starts_with("HTTP/1.1 401")
+        );
+        assert!(
+            send_raw_post(
+                &reg_addr,
+                "/publish",
+                &reg_addr,
+                "Origin: https://evil.example\r\nAuthorization: Bearer test-reg-token-secret\r\n",
+                "application/json",
+                "{}",
+            )
+            .starts_with("HTTP/1.1 403")
+        );
+        assert!(
+            send_raw_post(
+                &reg_addr,
+                "/publish",
+                "evil.example:9999",
+                "Authorization: Bearer test-reg-token-secret\r\n",
+                "application/json",
+                "{}",
+            )
+            .starts_with("HTTP/1.1 403")
+        );
+        assert!(
+            send_raw_post(
+                &reg_addr,
+                "/publish",
+                &reg_addr,
+                "Authorization: Bearer test-reg-token-secret\r\n",
+                "text/plain",
+                "{}",
+            )
+            .starts_with("HTTP/1.1 415")
+        );
+
+        // Notebook control-plane & capability sandbox checks:
+        let ui_html = send_raw_http(
+            &nb_addr,
+            &format!("GET / HTTP/1.1\r\nHost: {nb_addr}\r\nConnection: close\r\n\r\n"),
+        );
+        assert!(ui_html.starts_with("HTTP/1.1 200"));
+        assert!(!ui_html.contains("test-nb-token-secret"));
+        assert!(
+            send_raw_post(
+                &nb_addr,
+                "/api/notebook/run",
+                &nb_addr,
+                "",
+                "application/json",
+                r#"{"id":"a","source":"1+2"}"#,
+            )
+            .starts_with("HTTP/1.1 401")
+        );
+        let ok_nb = send_raw_post(
+            &nb_addr,
+            "/api/notebook/run",
+            &nb_addr,
+            "Authorization: Bearer test-nb-token-secret\r\n",
+            "application/json",
+            r#"{"id":"a","source":"1+2"}"#,
+        );
+        assert!(ok_nb.starts_with("HTTP/1.1 200"));
+        assert!(ok_nb.contains("\"value\":\"3\""));
+        let blocked_nb = send_raw_post(
+            &nb_addr,
+            "/api/notebook/run",
+            &nb_addr,
+            "Authorization: Bearer test-nb-token-secret\r\n",
+            "application/json",
+            r#"{"id":"b","source":"read_file(\"x\")"}"#,
+        );
+        assert!(blocked_nb.contains("CapabilityError"));
+
+        // Actor RPC non-loopback bind without KOVREK_ACTOR_TOKEN must fail closed
+        assert!(run_source(r#"actor_node_listen("0.0.0.0:0");"#).is_err());
+
+        drop(_guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unhackable_wave2_parser_kvbc_dlpack_ssrf_and_sandbox_defenses() {
+        use sha2::{Digest, Sha256};
+
+        let dir = mk_tmp("wave2_sec");
+        fs::create_dir_all(dir.join("vendor").join("evilpkg")).unwrap();
+        let _guard = EnvCwdGuard::enter(&dir, &[]);
+
+        // 1. Parser recursion bounds block stack-overflow DoS cleanly
+        let deep_parens = format!("{}1{}", "(".repeat(120), ")".repeat(120));
+        let paren_err = run_source(&deep_parens).unwrap_err();
+        assert!(paren_err.contains("depth"), "unexpected err: {paren_err}");
+
+        let deep_brace_src = format!("{}let x = 1;{}", "if true { ".repeat(120), " }".repeat(120));
+        let brace_err = run_source(&deep_brace_src).unwrap_err();
+        assert!(brace_err.contains("depth"), "unexpected err: {brace_err}");
+
+        // 2. Crafted .kvbc control-flow / local-slot / checksum tampering must reject
+        let make_signed_kvbc = |ops_json: serde_json::Value| -> String {
+            let canonical = serde_json::to_string(&ops_json).unwrap();
+            let sha = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+            serde_json::json!({
+                "format": "kovrek-bc-v1",
+                "sha256": sha,
+                "ops": ops_json,
+            })
+            .to_string()
+        };
+        let oob_jump = make_signed_kvbc(serde_json::json!([
+            { "op": "Jump", "target": 999 },
+            { "op": "Halt" }
+        ]));
+        assert!(crate::bytecode::decode_bytecode(&oob_jump).is_err());
+
+        let oob_handler = make_signed_kvbc(serde_json::json!([
+            { "op": "PushHandler", "target": 999, "name": "e" },
+            { "op": "Halt" }
+        ]));
+        assert!(crate::bytecode::decode_bytecode(&oob_handler).is_err());
+
+        let huge_slot = make_signed_kvbc(serde_json::json!([
+            { "op": "Const", "val": { "t": "num", "v": 1.0 } },
+            { "op": "DefineLocal", "slot": 100000, "const": false, "type": null },
+            { "op": "Halt" }
+        ]));
+        assert!(crate::bytecode::decode_bytecode(&huge_slot).is_err());
+
+        let tampered_sha = serde_json::json!({
+            "format": "kovrek-bc-v1",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "ops": [{ "op": "Halt" }]
+        })
+        .to_string();
+        assert!(crate::bytecode::decode_bytecode(&tampered_sha).is_err());
+
+        // 3. VM + JIT recursion / OOM / panic bounds
+        assert!(run_source(r#"fn bomb(n) { return bomb(n + 1); } bomb(0);"#).is_err());
+        let jit_self_bomb = r#"
+fn jbomb(n) { if n <= 0 { return 0; } return 1 + jbomb(n - 1); }
+assert(jit_compile(jbomb) == true);
+let wk = 0;
+while wk < 24 {
+    let _ = jbomb(2);
+    wk = wk + 1;
+}
+assert(jbomb(10) == 10);
+jbomb(20000);
+"#;
+        assert!(run_source(jit_self_bomb).is_err());
+        let jit_mutual_bomb = r#"
+fn ja(n) { if n <= 0 { return 0; } return 1 + jb(n - 1); }
+fn jb(n) { if n <= 0 { return 0; } return 1 + ja(n - 1); }
+assert(jit_compile(ja) == true);
+assert(jit_compile(jb) == true);
+let wk = 0;
+while wk < 24 {
+    let _ = ja(2);
+    wk = wk + 1;
+}
+assert(ja(10) == 10);
+ja(20000);
+"#;
+        assert!(run_source(jit_mutual_bomb).is_err());
+        assert!(run_source(r#"let s = "a" * 100000000;"#).is_err());
+        assert!(run_source(r#"let x = [1] * 10000000;"#).is_err());
+        assert!(run_source(r#"let z = "1".zfill(100000000);"#).is_err());
+        assert!(run_source(r#"let r = repeat("x", 100000000);"#).is_err());
+        assert!(run_source(r#"let bad = randint(10, 1);"#).is_err());
+        assert!(run_source(r#"let nan_s = "a" * (0.0 / 0.0);"#).is_err());
+        assert!(run_source(r#"let re = regex_match(repeat("a", 20000), "a");"#).is_err());
+
+        // 4. Unsafe DLPack overflow / negative dim / OOB negative byte offset bounds
+        let dl_buf = vec![1.0_f64, 2.0, 3.0, 4.0];
+        assert!(
+            crate::py_bridge::read_strided_dlpack_f64_for_test(
+                &dl_buf,
+                &[1_i64 << 30, 1_i64 << 34],
+                None,
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::py_bridge::read_strided_dlpack_f64_for_test(&dl_buf, &[-1], None, 0).is_err()
+        );
+        assert!(
+            crate::py_bridge::read_strided_dlpack_f64_for_test(&dl_buf, &[2], Some(&[-100]), 0)
+                .is_err()
+        );
+
+        // 5. Tensor fs capability checks + shape integer-overflow prevention + env_set blocklist
+        let t_path = dir.join("tensor.json");
+        let t_esc = t_path.to_string_lossy().replace('\\', "\\\\");
+        assert!(
+            run_source(&format!(
+                r#"cap_restrict(["io"], fn() {{ tensor_save(tensor([1.0], false), "{t_esc}"); }});"#
+            ))
+            .unwrap_err()
+            .contains("CapabilityError")
+        );
+        assert!(
+            run_source(&format!(
+                r#"cap_restrict(["io"], fn() {{ tensor_load("{t_esc}"); }});"#
+            ))
+            .unwrap_err()
+            .contains("CapabilityError")
+        );
+        // Wrapping overflow attempt: 2^32 * 2^32 == 0 in 64-bit wrapping multiplication, matching empty data!
+        fs::write(
+            &t_path,
+            r#"{"format":"kovrek.tensor.v1","shape":[4294967296,4294967296],"data":[]}"#,
+        )
+        .unwrap();
+        assert!(run_source(&format!(r#"tensor_load("{t_esc}");"#)).is_err());
+
+        // Native plugin import must require `ffi` capability even if caller holds `fs.read`
+        fs::write(
+            dir.join("kovrek.json"),
+            r#"{"name":"wave2-app","version":"0.1.0","packages":{"evilpkg":"0.1.0"}}"#,
+        )
+        .unwrap();
+        let pkg_dir = dir.join("vendor").join("evilpkg");
+        fs::write(pkg_dir.join("main.kvr"), "let ok = 1;\n").unwrap();
+        fs::write(
+            pkg_dir.join(format!("plugin.{}", crate::plugin::platform_shared_ext())),
+            b"not-a-valid-dll",
+        )
+        .unwrap();
+        fs::write(
+            pkg_dir.join("kovrek.json"),
+            r#"{"name":"evilpkg","version":"0.1.0","entry":"main.kvr","native":{"library":"plugin"}}"#,
+        )
+        .unwrap();
+        let pkg_cap_res =
+            run_source(r#"cap_restrict(["fs.read"], fn() { import_package("evilpkg"); });"#);
+        // Path traversal entry inside kovrek.json must be blocked
+        fs::write(
+            pkg_dir.join("kovrek.json"),
+            r#"{"name":"evilpkg","version":"0.1.0","entry":"../../evil.kvr"}"#,
+        )
+        .unwrap();
+        let pkg_trav_res = run_source(r#"import_package("evilpkg");"#);
+        assert!(
+            pkg_cap_res.unwrap_err().contains("CapabilityError"),
+            "native package import bypassed ffi capability check"
+        );
+        assert!(pkg_trav_res.is_err());
+
+        assert!(run_source(r#"env_set("LD_PRELOAD", "/tmp/evil.so");"#).is_err());
+        assert!(run_source(r#"env_set("KOVREK_ACTOR_TOKEN", "forged");"#).is_err());
+        assert!(run_source(r#"env_set("KOVREK_NOTEBOOK_TOKEN", "forged");"#).is_err());
+        assert!(run_source(r#"env_set("A=B", "1");"#).is_err());
+        assert!(run_source(r#"env_set("", "1");"#).is_err());
+
+        // 6. Static path dotfiles / ADS / encoded traversal + HTTP header/URL hardening
+        let web_dir = dir.join("web");
+        fs::create_dir_all(web_dir.join(".git")).unwrap();
+        fs::create_dir_all(web_dir.join(".well-known")).unwrap();
+        fs::write(web_dir.join("index.html"), "ok").unwrap();
+        fs::write(web_dir.join(".env"), "SECRET=1").unwrap();
+        fs::write(web_dir.join(".git").join("config"), "[core]").unwrap();
+        fs::write(
+            web_dir.join(".well-known").join("security.txt"),
+            "Contact: mailto:sec@example.com",
+        )
+        .unwrap();
+        assert!(crate::server::resolve_static_path(&web_dir, "/index.html").is_some());
+        assert!(
+            crate::server::resolve_static_path(&web_dir, "/.well-known/security.txt").is_some()
+        );
+        assert!(crate::server::resolve_static_path(&web_dir, "/.env").is_none());
+        assert!(crate::server::resolve_static_path(&web_dir, "/.git/config").is_none());
+        assert!(
+            crate::server::resolve_static_path(&web_dir, "/index.html:Zone.Identifier").is_none()
+        );
+        assert!(crate::server::resolve_static_path(&web_dir, "/%2e%2e/tensor.json").is_none());
+
+        assert!(crate::security::validate_http_header_pair("X-Bad\r\nEvil", "1", false).is_err());
+        assert!(crate::security::validate_http_header_pair("X-Ok", "a\r\nb", false).is_err());
+        assert!(crate::security::validate_http_header_pair("Host", "127.0.0.1", false).is_err());
+        assert!(
+            crate::security::validate_http_header_pair("Authorization", "Bearer tok", false)
+                .is_ok()
+        );
+        assert!(
+            crate::security::validate_general_http_url("http://169.254.169.254/latest/meta-data/")
+                .is_err()
+        );
+        assert!(crate::security::validate_general_http_url("http://0.0.0.0:80/").is_err());
+        assert!(
+            crate::security::validate_general_http_url("http://metadata.google.internal/").is_err()
+        );
+        assert!(crate::security::validate_general_http_url("http://127.0.0.1:8080/health").is_ok());
+        #[cfg(feature = "native-services")]
+        {
+            assert!(
+                run_source(
+                    r#"http_request_safe("GET", "https://example.com", {"Host": "127.0.0.1"}, null, 1000);"#
+                )
+                .is_err()
+            );
+            assert!(
+                run_source(
+                    r#"http_request_safe("GET", "https://example.com", {"X-Test": "a\r\nb"}, null, 1000);"#
+                )
+                .is_err()
+            );
+        }
+
+        drop(_guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

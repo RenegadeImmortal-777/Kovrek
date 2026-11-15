@@ -55,6 +55,10 @@ use crate::vm::{Vm, collect_generator, generators, resume_generator};
 
 fn wasm_bytes_from_val(v: &Val) -> Result<Vec<u8>, String> {
     match v {
+        Val::Str(path) => {
+            crate::runtime::require_cap("fs.read")?;
+            fs::read(path).map_err(|e| format!("failed to read wasm '{path}': {e}"))
+        }
         Val::List(xs) => xs
             .iter()
             .map(|b| match b {
@@ -62,7 +66,6 @@ fn wasm_bytes_from_val(v: &Val) -> Result<Vec<u8>, String> {
                 _ => Err("wasm bytes List entries must be integers in 0..=255".to_string()),
             })
             .collect(),
-        Val::Str(path) => fs::read(path).map_err(|e| format!("failed to read '{path}': {e}")),
         _ => Err("expected wasm byte List or .wasm file path String".into()),
     }
 }
@@ -148,9 +151,49 @@ fn parse_sqlite_tx_item(item: &Val) -> Result<(String, Vec<rusqlite::types::Valu
 }
 
 #[cfg(feature = "native-services")]
+const DEFAULT_HTTP_MAX_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(feature = "native-services")]
+const DEFAULT_HTTP_TIMEOUT_MS: u64 = 30_000;
+
+fn checked_finite_range(v: &Val, name: &str, min: f64, max: f64) -> Result<f64, String> {
+    match v {
+        Val::Num(n) if n.is_finite() => Ok(n.clamp(min, max)),
+        Val::Num(_) => Err(format!("{name} must be a finite Number")),
+        _ => Err(format!("{name} must be Number")),
+    }
+}
+
+#[cfg(feature = "native-services")]
+fn validated_http_headers(headers: &[(Val, Val)]) -> Result<Vec<(String, String)>, String> {
+    if headers.len() > 128 {
+        return Err("too many HTTP headers (max 128)".into());
+    }
+    let mut out = Vec::with_capacity(headers.len());
+    for (k, v) in headers {
+        let key_str = k.show();
+        let val_str = v.show();
+        security::validate_http_header_pair(&key_str, &val_str, false)?;
+        out.push((key_str, val_str));
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "native-services")]
+fn serialize_http_body(body_val: &Val) -> Result<Option<String>, String> {
+    if matches!(body_val, Val::Null) {
+        Ok(None)
+    } else {
+        Ok(Some(match body_val {
+            Val::Str(s) => s.clone(),
+            other => json_stringify_value(other)?,
+        }))
+    }
+}
+
+#[cfg(feature = "native-services")]
 fn response_to_http_val(
     response: reqwest::blocking::Response,
-    max_bytes: Option<usize>,
+    max_bytes: usize,
 ) -> Result<Val, String> {
     let status = response.status();
     let header_pairs = response
@@ -163,19 +206,8 @@ fn response_to_http_val(
             )
         })
         .collect::<Vec<_>>();
-    let body = if let Some(limit) = max_bytes {
-        let mut buf = Vec::new();
-        response
-            .take((limit + 1) as u64)
-            .read_to_end(&mut buf)
-            .map_err(|e| e.to_string())?;
-        if buf.len() > limit {
-            return Err(format!("safe HTTP response exceeded {limit} byte limit"));
-        }
-        String::from_utf8_lossy(&buf).to_string()
-    } else {
-        response.text().map_err(|e| e.to_string())?
-    };
+    let buf = security::read_to_end_limited(response, max_bytes, "HTTP response")?;
+    let body = String::from_utf8_lossy(&buf).into_owned();
     Ok(Val::Map(vec![
         (Val::Str("status".into()), Val::Num(status.as_u16() as f64)),
         (Val::Str("ok".into()), Val::Bool(status.is_success())),
@@ -185,26 +217,83 @@ fn response_to_http_val(
 }
 
 #[cfg(feature = "native-services")]
-fn resolve_redirect_location(
-    base_url: &str,
-    origin: &str,
-    location: &str,
-) -> Result<String, String> {
-    let loc = location.trim();
-    if loc.starts_with("http://") || loc.starts_with("https://") {
-        return Ok(loc.to_string());
+fn execute_general_http_response(
+    method_text: &str,
+    url_raw: &str,
+    headers: &[(Val, Val)],
+    body_val: &Val,
+    timeout_ms: u64,
+) -> Result<reqwest::blocking::Response, String> {
+    let checked_headers = validated_http_headers(headers)?;
+    let initial_parsed = security::validate_general_http_url(url_raw)?;
+    let initial_is_public = security::validate_public_url(&initial_parsed.url, true).is_ok();
+    let initial_origin = initial_parsed.origin.clone();
+    let max_redirects = 5usize;
+    let clamped_timeout = timeout_ms.clamp(1, 300_000);
+
+    let mut current_url = initial_parsed.url;
+    let mut current_method =
+        reqwest::Method::from_bytes(method_text.as_bytes()).map_err(|e| e.to_string())?;
+    let mut current_body = serialize_http_body(body_val)?;
+
+    for hop in 0..=max_redirects {
+        let mut builder = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(clamped_timeout))
+            .redirect(reqwest::redirect::Policy::none());
+        let (target_url, target_origin) = if initial_is_public {
+            let validated = security::validate_public_url(&current_url, true)?;
+            let addrs = security::resolve_public_url_addrs(&validated)?;
+            builder = builder.resolve_to_addrs(&validated.host, &addrs);
+            (validated.url, validated.origin)
+        } else {
+            let validated = security::validate_general_http_url(&current_url)?;
+            (validated.url, validated.origin)
+        };
+        let client = builder.build().map_err(|e| e.to_string())?;
+        let mut request = client.request(current_method.clone(), &target_url);
+        for (key_str, val_str) in &checked_headers {
+            if target_origin != initial_origin
+                && (key_str.eq_ignore_ascii_case("authorization")
+                    || key_str.eq_ignore_ascii_case("proxy-authorization")
+                    || key_str.eq_ignore_ascii_case("cookie")
+                    || key_str.eq_ignore_ascii_case("x-kovrek-token"))
+            {
+                continue;
+            }
+            request = request.header(key_str.as_str(), val_str.as_str());
+        }
+        if let Some(ref body_str) = current_body {
+            request = request.body(body_str.clone());
+        }
+        let response = request.send().map_err(|e| e.to_string())?;
+        if response.status().is_redirection() && hop < max_redirects {
+            let Some(loc) = response.headers().get(reqwest::header::LOCATION) else {
+                return Ok(response);
+            };
+            let loc_str = loc.to_str().map_err(|e| e.to_string())?;
+            let next_raw =
+                security::resolve_redirect_location(&target_url, &target_origin, loc_str)?;
+            if initial_is_public {
+                let next_val = security::validate_public_url(&next_raw, true)?;
+                let _ = security::resolve_public_url_addrs(&next_val)?;
+                current_url = next_val.url;
+            } else {
+                let next_val = security::validate_general_http_url(&next_raw)?;
+                current_url = next_val.url;
+            }
+            if (301..=303).contains(&response.status().as_u16())
+                && current_method != reqwest::Method::GET
+                && current_method != reqwest::Method::HEAD
+            {
+                current_method = reqwest::Method::GET;
+                current_body = None;
+            }
+            continue;
+        }
+        return Ok(response);
     }
-    if loc.starts_with("//") {
-        let scheme = base_url
-            .split_once("://")
-            .map(|(s, _)| s)
-            .unwrap_or("https");
-        return Ok(format!("{scheme}:{loc}"));
-    }
-    if loc.starts_with('/') {
-        return Ok(format!("{origin}{loc}"));
-    }
-    Err("relative redirect without leading '/' blocked in safe HTTP mode".into())
+    Err("too many redirects".into())
 }
 
 #[cfg(feature = "native-services")]
@@ -216,13 +305,14 @@ fn execute_safe_http(
     timeout_ms: u64,
     opts: Option<&Vec<(Val, Val)>>,
 ) -> Result<Val, String> {
+    let checked_headers = validated_http_headers(headers)?;
     let allow_http = opts
         .and_then(|m| map_lookup(m, &Val::Str("allow_http".into())))
         .is_none_or(Val::truthy);
     let max_redirects = opts
         .and_then(|m| map_lookup(m, &Val::Str("max_redirects".into())))
         .and_then(|v| match v {
-            Val::Num(n) => Some((*n as i64).clamp(0, 5) as usize),
+            Val::Num(n) if n.is_finite() => Some((*n as i64).clamp(0, 5) as usize),
             _ => None,
         })
         .unwrap_or(3);
@@ -232,22 +322,18 @@ fn execute_safe_http(
     let max_resp_bytes = opts
         .and_then(|m| map_lookup(m, &Val::Str("max_response_bytes".into())))
         .and_then(|v| match v {
-            Val::Num(n) if *n >= 1024.0 => Some((*n as usize).min(64 * 1024 * 1024)),
+            Val::Num(n) if n.is_finite() && *n >= 1024.0 => {
+                Some((*n as usize).min(64 * 1024 * 1024))
+            }
             _ => None,
         })
         .unwrap_or(DEFAULT_SAFE_HTTP_MAX_BYTES);
 
+    let clamped_timeout = timeout_ms.clamp(1, 300_000);
     let mut current_url = url_raw.to_string();
     let mut current_method =
         reqwest::Method::from_bytes(method_text.as_bytes()).map_err(|e| e.to_string())?;
-    let mut current_body = if matches!(body_val, Val::Null) {
-        None
-    } else {
-        Some(match body_val {
-            Val::Str(s) => s.clone(),
-            other => json_stringify_value(other)?,
-        })
-    };
+    let mut current_body = serialize_http_body(body_val)?;
 
     let initial_origin = security::validate_public_url(&current_url, allow_http)?.origin;
 
@@ -255,21 +341,23 @@ fn execute_safe_http(
         let validated = security::validate_public_url(&current_url, allow_http)?;
         let addrs = security::resolve_public_url_addrs(&validated)?;
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_millis(timeout_ms))
+            .no_proxy()
+            .timeout(Duration::from_millis(clamped_timeout))
             .redirect(reqwest::redirect::Policy::none())
-            .resolve(&validated.host, addrs[0])
+            .resolve_to_addrs(&validated.host, &addrs)
             .build()
             .map_err(|e| e.to_string())?;
         let mut request = client.request(current_method.clone(), &validated.url);
-        for (k, v) in headers {
-            let key_str = k.show();
+        for (key_str, val_str) in &checked_headers {
             if validated.origin != initial_origin
                 && (key_str.eq_ignore_ascii_case("authorization")
-                    || key_str.eq_ignore_ascii_case("cookie"))
+                    || key_str.eq_ignore_ascii_case("proxy-authorization")
+                    || key_str.eq_ignore_ascii_case("cookie")
+                    || key_str.eq_ignore_ascii_case("x-kovrek-token"))
             {
                 continue;
             }
-            request = request.header(key_str, v.show());
+            request = request.header(key_str.as_str(), val_str.as_str());
         }
         if let Some(ref body_str) = current_body {
             request = request.body(body_str.clone());
@@ -277,11 +365,15 @@ fn execute_safe_http(
         let response = request.send().map_err(|e| e.to_string())?;
         if response.status().is_redirection() && hop < max_redirects {
             let Some(loc) = response.headers().get(reqwest::header::LOCATION) else {
-                return response_to_http_val(response, Some(max_resp_bytes));
+                return response_to_http_val(response, max_resp_bytes);
             };
             let loc_str = loc.to_str().map_err(|e| e.to_string())?;
-            let next_raw = resolve_redirect_location(&validated.url, &validated.origin, loc_str)?;
+            let next_raw =
+                security::resolve_redirect_location(&validated.url, &validated.origin, loc_str)?;
             let next_val = security::validate_public_url(&next_raw, allow_http)?;
+            if validated.scheme == "https" && next_val.scheme == "http" {
+                return Err("HTTPS to HTTP downgrade redirect blocked in safe HTTP mode".into());
+            }
             if !allow_cross_origin && next_val.origin != initial_origin {
                 return Err("cross-origin redirect blocked in safe HTTP mode".into());
             }
@@ -295,7 +387,7 @@ fn execute_safe_http(
             current_url = next_val.url;
             continue;
         }
-        return response_to_http_val(response, Some(max_resp_bytes));
+        return response_to_http_val(response, max_resp_bytes);
     }
     Err("too many redirects".into())
 }
@@ -341,14 +433,9 @@ impl Vm {
                     Val::Str(s) => s,
                     _ => return Err("salt must be String".into()),
                 };
-                let iterations = match a[2] {
-                    Val::Num(n) => n.max(1.0) as u32,
-                    _ => return Err("iterations must be Number".into()),
-                };
-                let bytes = match a[3] {
-                    Val::Num(n) => n.max(1.0) as usize,
-                    _ => return Err("bytes must be Number".into()),
-                };
+                let iterations =
+                    checked_finite_range(&a[2], "iterations", 1.0, 5_000_000.0)? as u32;
+                let bytes = checked_finite_range(&a[3], "bytes", 1.0, 4096.0)? as usize;
                 Val::Str(pbkdf2_sha256_hex(password, salt, iterations, bytes))
             }
             "constant_time_equal" => {
@@ -368,7 +455,7 @@ impl Vm {
             "random_bytes_hex" => {
                 let n_bytes = match a.as_slice() {
                     [] => 32usize,
-                    [Val::Num(n)] => (*n).max(1.0) as usize,
+                    [v] => checked_finite_range(v, "random_bytes_hex count", 1.0, 4096.0)? as usize,
                     _ => return Err("random_bytes_hex expects optional byte count Number".into()),
                 };
                 Val::Str(security::random_bytes_hex(n_bytes)?)
@@ -376,7 +463,7 @@ impl Vm {
             "random_token" => {
                 let n_bytes = match a.as_slice() {
                     [] => 32usize,
-                    [Val::Num(n)] => (*n).max(1.0) as usize,
+                    [v] => checked_finite_range(v, "random_token count", 1.0, 4096.0)? as usize,
                     _ => return Err("random_token expects optional byte count Number".into()),
                 };
                 Val::Str(security::random_token_urlsafe(n_bytes)?)
@@ -631,29 +718,10 @@ impl Vm {
                     Val::Map(p) => p,
                     _ => return Err("headers must be Map".into()),
                 };
-                let timeout = match a[4] {
-                    Val::Num(n) => n.max(1.0) as u64,
-                    _ => return Err("timeout_ms must be Number".into()),
-                };
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_millis(timeout))
-                    .build()
-                    .map_err(|e| e.to_string())?;
-                let method = reqwest::Method::from_bytes(method_text.as_bytes())
-                    .map_err(|e| e.to_string())?;
-                let mut request = client.request(method, url);
-                for (k, v) in headers {
-                    request = request.header(k.show(), v.show());
-                }
-                if !matches!(a[3], Val::Null) {
-                    let body = match &a[3] {
-                        Val::Str(s) => s.clone(),
-                        other => json_stringify_value(other)?,
-                    };
-                    request = request.body(body);
-                }
-                let response = request.send().map_err(|e| e.to_string())?;
-                response_to_http_val(response, None)?
+                let timeout = checked_finite_range(&a[4], "timeout_ms", 1.0, 300_000.0)? as u64;
+                let response =
+                    execute_general_http_response(method_text, url, headers, &a[3], timeout)?;
+                response_to_http_val(response, DEFAULT_HTTP_MAX_BYTES)?
             }
             #[cfg(feature = "native-services")]
             "http_request_safe" => {
@@ -676,10 +744,7 @@ impl Vm {
                     Val::Map(p) => p,
                     _ => return Err("headers must be Map".into()),
                 };
-                let timeout = match a[4] {
-                    Val::Num(n) => n.max(1.0) as u64,
-                    _ => return Err("timeout_ms must be Number".into()),
-                };
+                let timeout = checked_finite_range(&a[4], "timeout_ms", 1.0, 300_000.0)? as u64;
                 let opts = match a.get(5) {
                     Some(Val::Map(m)) => Some(m),
                     Some(Val::Null) | None => None,
@@ -708,35 +773,19 @@ impl Vm {
                     Val::Map(items) => items.clone(),
                     _ => return Err("http_stream headers must be Map".into()),
                 };
-                let timeout = match a[4] {
-                    Val::Num(n) => n.max(1.0) as u64,
-                    _ => return Err("http_stream timeout_ms must be Number".into()),
-                };
+                let timeout =
+                    checked_finite_range(&a[4], "http_stream timeout_ms", 1.0, 300_000.0)? as u64;
                 let on_line = a[5].clone();
                 if !self.is_callable_val(&on_line) {
                     return Err("http_stream on_line_fn must be callable".into());
                 }
-                let client = reqwest::blocking::Client::builder()
-                    .timeout(std::time::Duration::from_millis(timeout))
-                    .build()
-                    .map_err(|e| e.to_string())?;
-                let method = reqwest::Method::from_bytes(method_text.as_bytes())
-                    .map_err(|e| e.to_string())?;
-                let mut request = client.request(method, url);
-                for (k, v) in headers {
-                    request = request.header(k.show(), v.show());
-                }
-                if !matches!(a[3], Val::Null) {
-                    let body = match &a[3] {
-                        Val::Str(s) => s.clone(),
-                        other => json_stringify_value(other)?,
-                    };
-                    request = request.body(body);
-                }
-                let response = request.send().map_err(|e| e.to_string())?;
+                let response =
+                    execute_general_http_response(&method_text, &url, &headers, &a[3], timeout)?;
                 let status = response.status();
                 let mut line_count = 0usize;
-                for line_res in std::io::BufRead::lines(std::io::BufReader::new(response)) {
+                for line_res in std::io::BufRead::lines(std::io::BufReader::new(
+                    std::io::Read::take(response, DEFAULT_HTTP_MAX_BYTES as u64),
+                )) {
                     let line = line_res.map_err(|e| e.to_string())?;
                     line_count += 1;
                     let keep_going = self.invoke_callable_sync(&on_line, vec![Val::Str(line)])?;
@@ -760,11 +809,16 @@ impl Vm {
                     Val::Str(s) => s,
                     _ => return Err("url must be String".into()),
                 };
-                let text = reqwest::blocking::get(url)
-                    .map_err(|e| e.to_string())?
-                    .text()
-                    .map_err(|e| e.to_string())?;
-                Val::Str(text)
+                let response = execute_general_http_response(
+                    "GET",
+                    url,
+                    &[],
+                    &Val::Null,
+                    DEFAULT_HTTP_TIMEOUT_MS,
+                )?;
+                let bytes =
+                    security::read_to_end_limited(response, DEFAULT_HTTP_MAX_BYTES, "http_get")?;
+                Val::Str(String::from_utf8_lossy(&bytes).into_owned())
             }
             #[cfg(feature = "native-services")]
             "http_post" => {
@@ -776,27 +830,22 @@ impl Vm {
                     Val::Str(s) => s,
                     _ => return Err("url must be String".into()),
                 };
-                let body = match &a[1] {
-                    Val::Str(s) => s.clone(),
-                    other => json_stringify_value(other)?,
-                };
-                let text = reqwest::blocking::Client::new()
-                    .post(url)
-                    .body(body)
-                    .send()
-                    .map_err(|e| e.to_string())?
-                    .text()
-                    .map_err(|e| e.to_string())?;
-                Val::Str(text)
+                let response = execute_general_http_response(
+                    "POST",
+                    url,
+                    &[],
+                    &a[1],
+                    DEFAULT_HTTP_TIMEOUT_MS,
+                )?;
+                let bytes =
+                    security::read_to_end_limited(response, DEFAULT_HTTP_MAX_BYTES, "http_post")?;
+                Val::Str(String::from_utf8_lossy(&bytes).into_owned())
             }
             "sleep_ms" => {
                 if a.len() != 1 {
                     return Err("sleep_ms expects milliseconds".into());
                 }
-                let ms = match a[0] {
-                    Val::Num(n) => n.max(0.0) as u64,
-                    _ => return Err("milliseconds must be Number".into()),
-                };
+                let ms = checked_finite_range(&a[0], "milliseconds", 0.0, 300_000.0)? as u64;
                 thread::sleep(std::time::Duration::from_millis(ms));
                 Val::Null
             }
@@ -811,6 +860,7 @@ impl Vm {
             "path_separator" => Val::Str(std::path::MAIN_SEPARATOR.to_string()),
             #[cfg(feature = "native-services")]
             "sqlite_exec" => {
+                crate::runtime::require_cap("fs.write")?;
                 if a.len() != 2 {
                     return Err("sqlite_exec expects path,sql".into());
                 }
@@ -828,6 +878,7 @@ impl Vm {
             }
             #[cfg(feature = "native-services")]
             "sqlite_query" => {
+                crate::runtime::require_cap("fs.read")?;
                 if a.len() != 2 {
                     return Err("sqlite_query expects path,sql".into());
                 }
@@ -844,6 +895,7 @@ impl Vm {
             }
             #[cfg(feature = "native-services")]
             "sqlite_exec_params" => {
+                crate::runtime::require_cap("fs.write")?;
                 if a.len() != 3 {
                     return Err("sqlite_exec_params expects path,sql,params".into());
                 }
@@ -869,6 +921,7 @@ impl Vm {
             }
             #[cfg(feature = "native-services")]
             "sqlite_query_params" => {
+                crate::runtime::require_cap("fs.read")?;
                 if a.len() != 3 {
                     return Err("sqlite_query_params expects path,sql,params".into());
                 }
@@ -1267,6 +1320,7 @@ impl Vm {
                 }
             }
             "ffi_available" => {
+                crate::runtime::require_cap("ffi")?;
                 if a.len() != 1 {
                     return Err("ffi_available expects library path".into());
                 }
@@ -1277,6 +1331,7 @@ impl Vm {
                 Val::Bool(unsafe { Library::new(path) }.is_ok())
             }
             "ffi_i32" => {
+                crate::runtime::require_cap("ffi")?;
                 if a.len() != 3 {
                     return Err("ffi_i32 expects library,symbol,args".into());
                 }
@@ -1339,6 +1394,7 @@ impl Vm {
                 Val::Num(result as f64)
             }
             "ffi_i64" => {
+                crate::runtime::require_cap("ffi")?;
                 if a.len() != 3 {
                     return Err("ffi_i64 expects library,symbol,args".into());
                 }
@@ -1390,6 +1446,7 @@ impl Vm {
                 Val::Num(result as f64)
             }
             "ffi_f64" => {
+                crate::runtime::require_cap("ffi")?;
                 if a.len() != 3 {
                     return Err("ffi_f64 expects library,symbol,args".into());
                 }
@@ -1457,6 +1514,7 @@ impl Vm {
                 crate::py_bridge::py_import(name)?
             }
             "py_call" => {
+                crate::runtime::require_cap("python")?;
                 if a.is_empty() || a.len() > 3 {
                     return Err("py_call expects (callable[, args[, kwargs]])".into());
                 }
@@ -1468,6 +1526,7 @@ impl Vm {
                 crate::py_bridge::py_call(&a[0], &args, a.get(2))?
             }
             "py_get" => {
+                crate::runtime::require_cap("python")?;
                 if a.len() != 2 {
                     return Err("py_get expects (py_obj, attr)".into());
                 }
@@ -1477,6 +1536,7 @@ impl Vm {
                 crate::py_bridge::py_get(&a[0], attr)?
             }
             "py_set" => {
+                crate::runtime::require_cap("python")?;
                 if a.len() != 3 {
                     return Err("py_set expects (py_obj, attr, value)".into());
                 }
@@ -1486,6 +1546,7 @@ impl Vm {
                 crate::py_bridge::py_set(&a[0], attr, &a[2])?
             }
             "py_dir" => {
+                crate::runtime::require_cap("python")?;
                 if a.len() != 1 {
                     return Err("py_dir expects py_obj".into());
                 }
@@ -1518,12 +1579,14 @@ impl Vm {
                 crate::py_bridge::py_info_val()
             }
             "py_free" => {
+                crate::runtime::require_cap("python")?;
                 if a.len() != 1 {
                     return Err("py_free expects Python handle".into());
                 }
                 Val::Bool(crate::py_bridge::py_free(&a[0])?)
             }
             "py_to_tensor" => {
+                crate::runtime::require_cap("python")?;
                 if a.len() != 1 {
                     return Err("py_to_tensor expects Python buffer/ndarray handle".into());
                 }
@@ -1613,6 +1676,7 @@ impl Vm {
                 crate::plugin::load_plugin(Path::new(path))?.info_val()
             }
             "plugin_info" => {
+                crate::runtime::require_cap("ffi")?;
                 if a.len() != 1 {
                     return Err("plugin_info expects plugin handle or name".into());
                 }
@@ -1632,12 +1696,14 @@ impl Vm {
                 crate::plugin::get_loaded_plugin(&key)?.info_val()
             }
             "plugin_list" => {
+                crate::runtime::require_cap("ffi")?;
                 if !a.is_empty() {
                     return Err("plugin_list expects 0 arguments".into());
                 }
                 Val::List(crate::plugin::list_loaded_plugins())
             }
             "plugin_call" => {
+                crate::runtime::require_cap("ffi")?;
                 if a.len() < 2 || a.len() > 3 {
                     return Err("plugin_call expects (plugin, fn_name[, args])".into());
                 }
@@ -1666,6 +1732,9 @@ impl Vm {
                 p.call(fn_name, &call_args)?
             }
             "plugin_build" => {
+                crate::runtime::require_cap("ffi")?;
+                crate::runtime::require_cap("process")?;
+                crate::runtime::require_cap("fs.write")?;
                 if a.is_empty() || a.len() > 2 {
                     return Err("plugin_build expects (source_rs_path[, out_lib_path])".into());
                 }
@@ -1691,6 +1760,7 @@ impl Vm {
                 Val::Str(built.to_string_lossy().to_string())
             }
             "__plugin_trampoline" => {
+                crate::runtime::require_cap("ffi")?;
                 if a.len() < 2 {
                     return Err("__plugin_trampoline expects plugin_id,fn_name,...".into());
                 }
@@ -1784,6 +1854,7 @@ impl Vm {
                 ])
             }
             "__plugin_trampoline_list" => {
+                crate::runtime::require_cap("ffi")?;
                 if a.len() != 3 {
                     return Err("__plugin_trampoline_list expects plugin_id,fn_name,args".into());
                 }
@@ -2081,18 +2152,21 @@ impl Vm {
                 crate::sim_actor::actor_node_listen(id as u64, a.get(1))?
             }
             "actor_node_stop" => {
+                crate::runtime::require_cap("net")?;
                 if a.len() != 1 {
                     return Err("actor_node_stop expects (node_id_or_map)".into());
                 }
                 crate::sim_actor::actor_node_stop(&a[0])?
             }
             "actor_remote_send" => {
+                crate::runtime::require_cap("net")?;
                 if a.len() != 2 {
                     return Err("actor_remote_send expects (target, message)".into());
                 }
                 crate::sim_actor::actor_remote_send(&a[0], a[1].clone())?
             }
             "actor_remote_ask" => {
+                crate::runtime::require_cap("net")?;
                 if a.len() < 2 || a.len() > 3 {
                     return Err("actor_remote_ask expects (target, message[, timeout_ms])".into());
                 }

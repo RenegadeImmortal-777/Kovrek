@@ -831,7 +831,9 @@ fn spawn_app_worker_pool(
             let limit_opt = cfg.max_requests;
             let max_body = cfg.max_body_bytes;
             let cnt = handled.clone();
+            let caps_snap = crate::runtime::snapshot_caps();
             thread::spawn(move || {
+                let _cap_guard = crate::runtime::enter_captured_caps(caps_snap);
                 while !stop.load(Ordering::SeqCst) {
                     if let Some(limit) = limit_opt
                         && cnt.load(Ordering::SeqCst) >= limit as u64
@@ -1275,7 +1277,8 @@ pub(crate) fn call_builtin_universal_arch(
             }
             let k = str_arg(&args[0], "key")?;
             let v = str_arg(&args[1], "value")?;
-            // Safety: explicit user call to env_set builtin.
+            crate::security::validate_env_assignment(&k, &v)?;
+            // Safety: explicit user call to env_set builtin after capability and allowlist validation.
             unsafe { env::set_var(k, v) };
             Val::Bool(true)
         }

@@ -163,6 +163,7 @@ pub(crate) struct Vm {
     pub(crate) profile_total_ns: u64,
     profile_stack: Vec<(String, std::time::Instant, u64)>,
     pub(crate) profile_stats: HashMap<String, ProfileFnStats>,
+    pub(crate) nested_depth: usize,
 }
 
 static GENERATORS: OnceLock<Mutex<HashMap<u64, Vm>>> = OnceLock::new();
@@ -273,6 +274,7 @@ impl Vm {
             profile_total_ns: 0,
             profile_stack: Vec::new(),
             profile_stats: HashMap::new(),
+            nested_depth: 0,
         }
     }
     pub(crate) fn clone_worker(&self) -> Self {
@@ -312,6 +314,7 @@ impl Vm {
             profile_total_ns: 0,
             profile_stack: Vec::new(),
             profile_stats: HashMap::new(),
+            nested_depth: 0,
         }
     }
     fn nested_from_prepared(&self, prepared: PreparedCall) -> Self {
@@ -351,6 +354,7 @@ impl Vm {
             profile_total_ns: 0,
             profile_stack: Vec::new(),
             profile_stats: HashMap::new(),
+            nested_depth: self.nested_depth.saturating_add(1),
         }
     }
     fn child_debug_scope(&self, def_ip: usize, sub_idx: usize) -> usize {
@@ -761,7 +765,11 @@ impl Vm {
             (Val::Str("gc".into()), gc),
         ]))
     }
-    fn push_prepared_frame(&mut self, prepared: PreparedCall) {
+    fn push_prepared_frame(&mut self, prepared: PreparedCall) -> Result<(), String> {
+        const MAX_VM_FRAMES: usize = 16_384;
+        if self.frames.len() >= MAX_VM_FRAMES {
+            return Err(format!("call stack depth exceeded limit ({MAX_VM_FRAMES})"));
+        }
         let enter_auto = !prepared.is_generator && self.should_auto_arena(&prepared.code);
         let prof_name = if self.profiling {
             Some(prepared.debug_name.clone())
@@ -816,6 +824,7 @@ impl Vm {
         if let Some(name) = prof_name {
             self.profile_enter(&name);
         }
+        Ok(())
     }
     fn restore_frame(&mut self, caller: CallFrame) {
         if caller.dap_pushed {
@@ -893,7 +902,7 @@ impl Vm {
             if let Some(res) =
                 crate::jit::jit_try_run(&def.debug_name, &def, &args, count, &|fname| {
                     self.resolve_jit_callee(fname)
-                })
+                })?
             {
                 if let Some(t0) = jit_t0 {
                     let elapsed = t0.elapsed().as_nanos() as u64;
@@ -906,7 +915,7 @@ impl Vm {
         let mut prepared = self.prepare_call_kw(def, args, kwargs)?;
         prepared.active_class = active_class;
         prepared.active_self = active_self;
-        self.push_prepared_frame(prepared);
+        self.push_prepared_frame(prepared)?;
         Ok(())
     }
     fn call_def_kw_ctx(
@@ -934,9 +943,12 @@ impl Vm {
     fn spawn_prepared_task(&self, prepared: PreparedCall, kind: &str) -> Result<Val, String> {
         let expected_return = prepared.return_type.clone();
         let mut nested = self.nested_from_prepared(prepared);
+        nested.nested_depth = 0;
         let id = TASK_IDS.fetch_add(1, Ordering::Relaxed);
         let label = kind.to_string();
+        let caps_snap = crate::runtime::snapshot_caps();
         let handle = thread::spawn(move || {
+            let _cap_guard = crate::runtime::enter_captured_caps(caps_snap);
             let result = nested.execute()?;
             if let Some(expected) = expected_return {
                 if !nested.value_matches(&result, &expected) {
@@ -981,6 +993,12 @@ impl Vm {
         debug_name: String,
         debug_scope: usize,
     ) -> Result<Val, String> {
+        const MAX_VM_NESTED_DEPTH: usize = 128;
+        if caller.nested_depth >= MAX_VM_NESTED_DEPTH {
+            return Err(format!(
+                "nested call recursion depth exceeded limit ({MAX_VM_NESTED_DEPTH})"
+            ));
+        }
         if is_generator {
             if let Some(expected) = return_type {
                 if expected != "Generator" && expected != "Any" {
@@ -1067,6 +1085,7 @@ impl Vm {
             profile_total_ns: 0,
             profile_stack: Vec::new(),
             profile_stats: HashMap::new(),
+            nested_depth: self.nested_depth,
         }
     }
     fn run_prepared_call(&self, prepared: PreparedCall) -> Result<Val, String> {
@@ -2852,6 +2871,7 @@ impl Vm {
                 sorted.into_iter().next().unwrap()
             }
             "py_call" => {
+                crate::runtime::require_cap("python")?;
                 if pos.is_empty() {
                     return Err("py_call expects callable".into());
                 }
@@ -4144,6 +4164,12 @@ impl Vm {
                 self.stack.push(self.locals[slot].clone());
             }
             Op::DefineLocal(slot, is_const, ty) => {
+                const MAX_VM_LOCAL_SLOTS: usize = 65_536;
+                if slot >= MAX_VM_LOCAL_SLOTS {
+                    return Err(format!(
+                        "local slot index {slot} exceeds limit {MAX_VM_LOCAL_SLOTS}"
+                    ));
+                }
                 let v = self.pop()?;
                 if slot >= self.locals.len() {
                     self.locals.resize(slot + 1, Val::Null);
@@ -4170,6 +4196,12 @@ impl Vm {
                 }
             }
             Op::StoreLocal(slot) => {
+                const MAX_VM_LOCAL_SLOTS: usize = 65_536;
+                if slot >= MAX_VM_LOCAL_SLOTS {
+                    return Err(format!(
+                        "local slot index {slot} exceeds limit {MAX_VM_LOCAL_SLOTS}"
+                    ));
+                }
                 if slot < self.local_consts.len() && self.local_consts[slot] {
                     return Err("cannot assign to constant local".into());
                 }
@@ -4347,15 +4379,10 @@ impl Vm {
                 self.stack.push(match (a, b) {
                     (Val::Num(x), Val::Num(y)) => Val::Num(x * y),
                     (Val::Str(s), Val::Num(n)) | (Val::Num(n), Val::Str(s)) => {
-                        Val::Str(s.repeat(n.max(0.0) as usize))
+                        Val::Str(crate::value::repeat_str_bounded(&s, n)?)
                     }
                     (Val::List(items), Val::Num(n)) | (Val::Num(n), Val::List(items)) => {
-                        let count = n.max(0.0) as usize;
-                        let mut out = Vec::with_capacity(items.len() * count);
-                        for _ in 0..count {
-                            out.extend(items.iter().cloned());
-                        }
-                        Val::List(out)
+                        Val::List(crate::value::repeat_list_bounded(&items, n)?)
                     }
                     _ => return Err("numeric operation requires numbers".into()),
                 });
@@ -4714,21 +4741,10 @@ impl Vm {
                             }
                             Val::Str(out)
                         }
-                        "zfill" => {
-                            let width = match args.first() {
-                                Some(Val::Num(n)) => (*n).max(0.0) as usize,
-                                _ => return Err("str.zfill expects width Number".into()),
-                            };
-                            let char_len = s.chars().count();
-                            if char_len >= width {
-                                Val::Str(s)
-                            } else if let Some(rest) = s.strip_prefix(['+', '-']) {
-                                let sign = &s[..1];
-                                Val::Str(format!("{sign}{}{rest}", "0".repeat(width - char_len)))
-                            } else {
-                                Val::Str(format!("{}{s}", "0".repeat(width - char_len)))
-                            }
-                        }
+                        "zfill" => match args.first() {
+                            Some(Val::Num(n)) => Val::Str(crate::value::zfill_str_bounded(&s, *n)?),
+                            _ => return Err("str.zfill expects width Number".into()),
+                        },
                         "isdigit" => {
                             Val::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
                         }
@@ -4842,12 +4858,20 @@ impl Vm {
                 self.stack.push(value);
             }
             Op::JumpIfFalse(p) => {
+                if p > self.code.len() {
+                    return Err(format!("invalid jump target {p} (len {})", self.code.len()));
+                }
                 let a = self.pop()?;
                 if !a.truthy() {
                     self.ip = p
                 }
             }
-            Op::Jump(p) => self.ip = p,
+            Op::Jump(p) => {
+                if p > self.code.len() {
+                    return Err(format!("invalid jump target {p} (len {})", self.code.len()));
+                }
+                self.ip = p
+            }
             Op::Call(n, k) => {
                 let mut a = Vec::with_capacity(k);
                 for _ in 0..k {
@@ -5100,7 +5124,15 @@ impl Vm {
                 return self.pop_frame_or_finish(val, "return");
             }
             Op::Yield => return Ok(Some(self.pop()?)),
-            Op::PushHandler(target, name) => self.handlers.push((target, name, self.stack.len())),
+            Op::PushHandler(target, name) => {
+                if target > self.code.len() {
+                    return Err(format!(
+                        "invalid exception handler target {target} (len {})",
+                        self.code.len()
+                    ));
+                }
+                self.handlers.push((target, name, self.stack.len()))
+            }
             Op::PopHandler => {
                 let _ = self.handlers.pop();
             }
