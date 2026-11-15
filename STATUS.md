@@ -37,12 +37,12 @@ way to misread the project.
 
 ## Verification status
 
-Last full gate run: **2026-11-14**. Every gate passed (**8/8**).
+Last full gate run: **2026-11-15**. Every gate passed (**8/8**).
 
 | Gate | Result |
 |---|---|
 | `cargo fmt --check` | PASS |
-| `cargo test` | PASS — 144 passed, 0 failed |
+| `cargo test` | PASS — 151 passed, 0 failed |
 | `cargo check --no-default-features` | PASS |
 | `cargo clippy --all-targets --all-features -- -D warnings` | PASS |
 | `cargo build --release` | PASS |
@@ -107,8 +107,8 @@ The engine source is modularized under `engine-rs/src/`:
   data watchpoints (`stepBack`, `reverseContinue`, `dataBreakpointInfo`, `setDataBreakpoints`),
   the LSP server, and the AST dependency-driven reactive topological DAG notebook server (`kovrek notebook [dir] [port]`,
   cycle detection, `GET /api/notebook/dag`, `GET /api/notebook/export`).
-- See [docs/ENGINE-SPLIT.md](docs/ENGINE-SPLIT.md) and [WAY_FORWARD.md](WAY_FORWARD.md)
-  for the full architectural map.
+- See [docs/ENGINE-SPLIT.md](docs/ENGINE-SPLIT.md) and [docs/archive/WAY_FORWARD.md](docs/archive/WAY_FORWARD.md)
+  for the architectural map and historical baseline audit.
 
 ### Re-running the gates
 
@@ -203,7 +203,7 @@ Native, without Python:
   split into `engine-rs/src/builtins/` and `lib.rs` is separated from `main.rs`.
 - `compiler-kvr/src/main.kvr` implements the pure-Kovrek self-hosted `.kvbc` compiler
   verified to a 3-stage fixpoint.
-- Sovereign parity extensions (Pillars 1-5): in-process CPython C-API + PEP 3118
+- Additional runtime & FFI capabilities: in-process CPython C-API + PEP 3118
   zero-copy tensor buffers (`py_bridge.rs`), universal Vulkan SPIR-V + Direct3D 11 `f64`/`f32`
   GPU compute (`gpu.rs`), multi-arch x86_64/aarch64 + list slicing + inter-call JIT (`jit.rs`),
   `BigInt`/`BigDecimal`/`Complex`/`FFT`, C3 MRO/`super()`/descriptors/metaclasses, full structural
@@ -229,4 +229,4 @@ Native, without Python:
 | `kovrek.py`, `kovrek_cli.py` | Legacy Convergence runtime and CLI |
 | `kovrek.bat`, `INSTALL.bat` | Native launcher and installer scripts |
 | `CHANGELOG.md` | Consolidated release history |
-| `WAY_FORWARD.md` | Technical audit and 6-phase execution roadmap |
+| `docs/archive/WAY_FORWARD.md` | Historical pre-Kovrek technical audit and execution roadmap |

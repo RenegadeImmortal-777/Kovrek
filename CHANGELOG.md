@@ -20,8 +20,11 @@ release date in the source material; earlier entries are undated.
 
 ## 12.0 Sovereign
 
-Self-hosting, language parity, compiler optimization, tensor broadcasting, and full-stack Sovereign Apex release.
-Release gate verified **2026-11-14** (**144/144** unit tests, **77/77** packages, **8/8** release gates).
+Self-hosting, IR optimization, formal `@verify`/taint/ownership checks, JIT/GPU/Wasm/AOT backends, and compiler/runtime security hardening.
+Release gate verified **2026-11-15** (**151/151** unit tests, **77/77** packages, **8/8** release gates).
+
+- **Compiler, JIT/VM, FFI/DLPack, SSRF, Sandbox & CI Hardening (`jit.rs`, `vm.rs`, `py_bridge.rs`, `builtins/`, `cli.rs`, `.github/`)**:
+  Hardened JIT executable memory permissions (`W^X`), SSRF/redirect/IP validation and path-traversal guards, CPython/DLPack/FFI bounds checks, capability sandbox enforcement, and multi-OS CI failure reporting.
 
 - **Licensing, Onboarding, Benchmarks & Cross-Platform CI (`LICENSE`, `install.sh`, `install.ps1`, `benchmarks/`, `py_bridge.rs`)**:
   Added MIT `LICENSE` and `Cargo.toml` crate metadata, one-line Windows/Linux/macOS installers (`install.ps1`, `install.sh`), architecture hero banner (`docs/assets/kovrek-banner.svg`), archived legacy `STATUS-*.md` / `PYTHON-*.md` records under `docs/archive/`, added reproducible VM/Tensor/Verify/AOT benchmarks (`benchmarks/`), updated Rust `1.100` Clippy compatibility (`as_chunks`) and multi-candidate Unix `libpython` shared library probing, and guarded optional `numpy`/`torch` C-API tests on clean CI runners.

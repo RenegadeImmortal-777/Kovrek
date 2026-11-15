@@ -1,3 +1,6 @@
+> **Historical record.** Pre-Kovrek engineering audit (2026-11-08), superseded by
+> [../../STATUS.md](../../STATUS.md) and [../../CHANGELOG.md](../../CHANGELOG.md). Retained for provenance.
+
 # Veyra — Comprehensive Project Audit & Way Forward
 
 **Audit Date:** 2026-11-08  
