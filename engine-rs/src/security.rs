@@ -12,11 +12,12 @@ use rand::rngs::OsRng;
 
 use crate::value::{constant_time_strings_equal, hmac_sha256_bytes, pbkdf2_hmac_sha256_bytes};
 
-fn zeroize_bytes(buf: &mut [u8]) {
+pub(crate) fn zeroize_bytes(buf: &mut [u8]) {
     for b in buf.iter_mut() {
-        *b = 0;
+        // SAFETY: `b` is a valid, aligned mutable reference to an initialized u8.
+        unsafe { std::ptr::write_volatile(b, 0) };
     }
-    std::hint::black_box(buf);
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
 pub(crate) fn random_bytes(len: usize) -> Result<Vec<u8>, String> {

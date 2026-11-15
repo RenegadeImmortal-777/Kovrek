@@ -39,6 +39,7 @@ mod native_codegen;
 mod parser;
 mod pipeline;
 mod plugin;
+mod pq_crypto;
 mod project;
 mod py_bridge;
 mod registry;
@@ -52,6 +53,7 @@ mod term_ui;
 mod tooling;
 mod universal_arch;
 mod value;
+mod vault_stream;
 mod vm;
 
 #[cfg(test)]
@@ -662,6 +664,7 @@ pub fn run_cli() -> ExitCode {
             let s = fs::read_to_string(p).map_err(|e| e.to_string())?;
             fs::write(p, fmt_source(&s)).map_err(|e| e.to_string())
         }),
+        Some("vault") => run_vault_cli(&a[2..]),
         Some(x) if x.ends_with(".kvr") || x.ends_with(".kvbc") => exec_file_path(Path::new(x)),
         _ => {
             usage();
@@ -674,6 +677,225 @@ pub fn run_cli() -> ExitCode {
             eprintln!("kovrek: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn read_vault_passphrase_flag(
+    flag: &str,
+    val: &str,
+    slot: &mut Option<String>,
+) -> Result<(), String> {
+    if slot.is_some() {
+        return Err("passphrase specified more than once".into());
+    }
+    let secret = match flag {
+        "--passphrase" => val.to_string(),
+        "--passphrase-env" => std::env::var(val)
+            .map_err(|e| format!("failed reading --passphrase-env '{val}': {e}"))?,
+        "--passphrase-file" => fs::read_to_string(val)
+            .map_err(|e| format!("failed reading --passphrase-file '{val}': {e}"))?
+            .trim_end_matches(&['\r', '\n'][..])
+            .to_string(),
+        _ => unreachable!(),
+    };
+    *slot = Some(secret);
+    Ok(())
+}
+
+fn read_vault_key_arg(val: &str, inline_prefix: &str) -> Result<String, String> {
+    if val.starts_with(inline_prefix) {
+        return Ok(val.trim().to_string());
+    }
+    fs::read_to_string(val)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("failed reading key file '{val}': {e}"))
+}
+
+fn next_flag_val<'a>(args: &'a [String], idx: &mut usize, flag: &str) -> Result<&'a str, String> {
+    let v = args
+        .get(*idx + 1)
+        .ok_or_else(|| format!("missing value after {flag}"))?;
+    *idx += 2;
+    Ok(v.as_str())
+}
+
+fn parse_u32_flag(args: &[String], idx: &mut usize, flag: &str) -> Result<u32, String> {
+    let raw = next_flag_val(args, idx, flag)?;
+    raw.parse::<u32>()
+        .map_err(|_| format!("invalid integer '{raw}' for {flag}"))
+}
+
+fn run_vault_cli(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage:\n  kovrek vault keygen <out_prefix>\n  kovrek vault encrypt <src> <dst> [--passphrase <p> | --passphrase-env <VAR> | --passphrase-file <path>] [--pubkey <file>] [--cipher mystique|cascade] [--obscure] [--mem-kib N] [--iters N] [--lanes N] [--ratchet N] [--pad N]\n  kovrek vault decrypt <vault> <dst> [--passphrase <p> | --passphrase-env <VAR> | --passphrase-file <path>] [--seckey <file>]\n  kovrek vault inspect <vault>";
+
+    match args.first().map(String::as_str) {
+        Some("keygen") => {
+            if args.len() != 2 {
+                return Err("usage: kovrek vault keygen <out_prefix>".into());
+            }
+            let prefix = &args[1];
+            let pub_path = PathBuf::from(format!("{prefix}.pub.kvkey"));
+            let sec_path = PathBuf::from(format!("{prefix}.sec.kvkey"));
+            if let Some(parent) = pub_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let (pk, sk) = crate::pq_crypto::pq_hybrid_keygen();
+            fs::write(&pub_path, format!("{pk}\n")).map_err(|e| e.to_string())?;
+            fs::write(&sec_path, format!("{sk}\n")).map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&sec_path, fs::Permissions::from_mode(0o600));
+            }
+            let summary = serde_json::json!({
+                "ok": true,
+                "kem": "ML-KEM-1024+X25519",
+                "public_key_file": pub_path.to_string_lossy(),
+                "secret_key_file": sec_path.to_string_lossy(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        Some("encrypt") => {
+            let mut pos: Vec<String> = Vec::new();
+            let mut opts = crate::vault_stream::VaultSealOptions::default();
+            let mut idx = 1usize;
+            while idx < args.len() {
+                match args[idx].as_str() {
+                    f @ ("--passphrase" | "--passphrase-env" | "--passphrase-file") => {
+                        let v = next_flag_val(args, &mut idx, f)?;
+                        read_vault_passphrase_flag(f, v, &mut opts.passphrase)?;
+                    }
+                    "--pubkey" => {
+                        let v = next_flag_val(args, &mut idx, "--pubkey")?;
+                        opts.recipient_pub = Some(read_vault_key_arg(v, "kvpq1pub:")?);
+                    }
+                    "--cipher" => {
+                        let v = next_flag_val(args, &mut idx, "--cipher")?;
+                        opts.cipher = crate::vault_stream::CipherSuite::from_str(v)?;
+                    }
+                    "--obscure" => {
+                        opts.opaque_obscure = true;
+                        idx += 1;
+                    }
+                    "--mem-kib" => opts.mem_kib = parse_u32_flag(args, &mut idx, "--mem-kib")?,
+                    "--iters" => opts.iterations = parse_u32_flag(args, &mut idx, "--iters")?,
+                    "--lanes" => opts.lanes = parse_u32_flag(args, &mut idx, "--lanes")?,
+                    "--ratchet" => {
+                        opts.ratchet_every = parse_u32_flag(args, &mut idx, "--ratchet")?.max(1)
+                    }
+                    "--pad" => opts.pad_bucket = parse_u32_flag(args, &mut idx, "--pad")?,
+                    flag if flag.starts_with('-') => {
+                        return Err(format!("unknown option '{flag}' for kovrek vault encrypt"));
+                    }
+                    arg => {
+                        pos.push(arg.to_string());
+                        idx += 1;
+                    }
+                }
+            }
+            if pos.len() != 2 {
+                return Err(format!(
+                    "expected <src> <dst> paths for kovrek vault encrypt\n{USAGE}"
+                ));
+            }
+            let res = crate::vault_stream::vault_seal_file(
+                Path::new(&pos[0]),
+                Path::new(&pos[1]),
+                &opts,
+            )?;
+            let summary = serde_json::json!({
+                "ok": true,
+                "method": res.method,
+                "plaintext_bytes": res.plaintext_bytes,
+                "padded_bytes": res.padded_bytes,
+                "chunks_written": res.chunks_written,
+                "key_commitment_prefix": res.key_commitment_prefix,
+                "opaque": res.opaque,
+                "vault_path": pos[1],
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        Some("decrypt") => {
+            let mut pos: Vec<String> = Vec::new();
+            let mut creds = crate::vault_stream::VaultOpenCreds::default();
+            let mut idx = 1usize;
+            while idx < args.len() {
+                match args[idx].as_str() {
+                    f @ ("--passphrase" | "--passphrase-env" | "--passphrase-file") => {
+                        let v = next_flag_val(args, &mut idx, f)?;
+                        read_vault_passphrase_flag(f, v, &mut creds.passphrase)?;
+                    }
+                    "--seckey" => {
+                        let v = next_flag_val(args, &mut idx, "--seckey")?;
+                        creds.secret_key = Some(read_vault_key_arg(v, "kvpq1sec:")?);
+                    }
+                    flag if flag.starts_with('-') => {
+                        return Err(format!("unknown option '{flag}' for kovrek vault decrypt"));
+                    }
+                    arg => {
+                        pos.push(arg.to_string());
+                        idx += 1;
+                    }
+                }
+            }
+            if pos.len() != 2 {
+                return Err(format!(
+                    "expected <vault> <dst> paths for kovrek vault decrypt\n{USAGE}"
+                ));
+            }
+            let res = crate::vault_stream::vault_unseal_file(
+                Path::new(&pos[0]),
+                Path::new(&pos[1]),
+                &creds,
+            )?;
+            let summary = serde_json::json!({
+                "ok": true,
+                "method": res.method,
+                "original_filename": res.original_filename,
+                "recovered_bytes": res.recovered_bytes,
+                "sha3_512": res.sha3_512,
+                "chunks_verified": res.chunks_verified,
+                "output_path": pos[1],
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        Some("inspect") => {
+            if args.len() != 2 {
+                return Err("usage: kovrek vault inspect <vault>".into());
+            }
+            let info = crate::vault_stream::vault_inspect(Path::new(&args[1]))?;
+            let summary = serde_json::json!({
+                "format": info.format,
+                "opaque": info.opaque,
+                "cipher": info.cipher,
+                "unlock_mode": info.unlock_mode,
+                "argon2id_mem_kib": info.argon2id_mem_kib,
+                "argon2id_iterations": info.argon2id_iterations,
+                "ratchet_every": info.ratchet_every,
+                "key_commitment_prefix": info.key_commitment_prefix,
+                "has_plaintext_leak": info.has_plaintext_leak,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        _ => Err(USAGE.into()),
     }
 }
 
@@ -7021,6 +7243,135 @@ assert(pub_ok["ok"] and pub_ok["origin"] == "https://example.com");
         run_source(src).expect("security builtins should succeed");
     }
 
+    #[test]
+    fn sovereign_pq_crypto_and_vault_builtins_and_cli() {
+        let dir = env::temp_dir().join(format!("kovrek_sovereign_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src_file = dir.join("payload.bin");
+        let v_std = dir.join("std.vault");
+        let v_obs = dir.join("obs.vault");
+        let out_std = dir.join("out_std.bin");
+        let out_obs = dir.join("out_obs.bin");
+        fs::write(
+            &src_file,
+            b"\x00\x89PNG\r\n\x1a\nSovereign-Vault-Payload-2026!",
+        )
+        .unwrap();
+
+        let src_esc = src_file.to_string_lossy().replace('\\', "\\\\");
+        let v_std_esc = v_std.to_string_lossy().replace('\\', "\\\\");
+        let v_obs_esc = v_obs.to_string_lossy().replace('\\', "\\\\");
+        let out_std_esc = out_std.to_string_lossy().replace('\\', "\\\\");
+        let out_obs_esc = out_obs.to_string_lossy().replace('\\', "\\\\");
+
+        let code = format!(
+            r##"
+assert(sha3_256("abc") == "3a985da74fe225b2045c172d6bd390bd855f086e3e9d525b46bfe24511431532");
+assert(len(sha3_512("abc")) == 128);
+assert(len(shake128("abc", 24)) == 48);
+assert(len(shake256("abc", 48)) == 96);
+assert(len(blake2b("abc", 32, "key")) == 64);
+assert(len(kmac256("key-material", "payload", "TAG", 32)) == 64);
+let a2 = argon2id("correct-horse", "somesalt12345678", 256, 1, 1, 32);
+assert(len(a2) == 64);
+
+let x_a = x25519_keygen();
+let x_b = x25519_keygen();
+let ss_ab = x25519_shared(x_a["secret_hex"], x_b["public_hex"]);
+let ss_ba = x25519_shared(x_b["secret_hex"], x_a["public_hex"]);
+assert(constant_time_equal(ss_ab, ss_ba));
+
+let mk = ml_kem_1024_keygen();
+let enc = ml_kem_1024_encaps(mk["encaps_key_hex"]);
+let dec = ml_kem_1024_decaps(mk["decaps_key_hex"], enc["ciphertext_hex"]);
+assert(constant_time_equal(enc["shared_secret_hex"], dec));
+
+let pq = pq_hybrid_keygen();
+let s1 = vault_seal_file("{src_esc}", "{v_std_esc}", {{
+    "cipher": "mystique",
+    "obscure": false,
+    "passphrase": "alpha-pass",
+    "recipient_pub": pq["public_key"],
+    "mem_kib": 256,
+    "iterations": 1,
+    "ratchet_every": 2,
+    "pad_bucket": 128
+}});
+assert(not s1["opaque"]);
+let i1 = vault_inspect("{v_std_esc}");
+assert(i1["format"] == "KVRM2-SOVEREIGN" and not i1["has_plaintext_leak"]);
+let u1 = vault_unseal_file("{v_std_esc}", "{out_std_esc}", {{
+    "passphrase": "alpha-pass",
+    "secret_key": pq["secret_key"]
+}});
+assert(u1["original_filename"] == "payload.bin");
+
+let s2 = vault_seal_file("{src_esc}", "{v_obs_esc}", {{
+    "cipher": "cascade",
+    "obscure": true,
+    "passphrase": "beta-pass",
+    "mem_kib": 256,
+    "iterations": 1,
+    "pad_bucket": 128
+}});
+assert(s2["opaque"]);
+let i2 = vault_inspect("{v_obs_esc}");
+assert(i2["format"] == "OBSCURE-OPAQUE" and i2["opaque"] and not i2["has_plaintext_leak"]);
+let u2 = vault_unseal_file("{v_obs_esc}", "{out_obs_esc}", {{"passphrase": "beta-pass"}});
+assert(u2["recovered_bytes"] == s1["plaintext_bytes"]);
+"##
+        );
+        run_source(&code).expect("sovereign crypto & vault builtins should succeed");
+        assert_eq!(fs::read(&src_file).unwrap(), fs::read(&out_std).unwrap());
+        assert_eq!(fs::read(&src_file).unwrap(), fs::read(&out_obs).unwrap());
+
+        // Capability enforcement check
+        let cap_res = crate::runtime::run_with_caps(Vec::new(), || {
+            run_source(&format!("vault_inspect(\"{v_std_esc}\");"))
+        });
+        assert!(cap_res.is_err(), "vault_inspect must require fs.read cap");
+
+        // CLI subcommands check
+        let key_prefix = dir.join("cli_id").to_string_lossy().to_string();
+        let pub_file = format!("{key_prefix}.pub.kvkey");
+        let sec_file = format!("{key_prefix}.sec.kvkey");
+        let cli_vault = dir.join("cli.vault").to_string_lossy().to_string();
+        let cli_out = dir.join("cli_out.bin").to_string_lossy().to_string();
+        run_vault_cli(&["keygen".into(), key_prefix]).expect("cli keygen");
+        run_vault_cli(&[
+            "encrypt".into(),
+            src_file.to_string_lossy().to_string(),
+            cli_vault.clone(),
+            "--passphrase".into(),
+            "cli-pass".into(),
+            "--pubkey".into(),
+            pub_file,
+            "--cipher".into(),
+            "mystique".into(),
+            "--obscure".into(),
+            "--mem-kib".into(),
+            "256".into(),
+            "--iters".into(),
+            "1".into(),
+        ])
+        .expect("cli encrypt");
+        run_vault_cli(&["inspect".into(), cli_vault.clone()]).expect("cli inspect");
+        run_vault_cli(&[
+            "decrypt".into(),
+            cli_vault,
+            cli_out.clone(),
+            "--passphrase".into(),
+            "cli-pass".into(),
+            "--seckey".into(),
+            sec_file,
+        ])
+        .expect("cli decrypt");
+        assert_eq!(fs::read(&src_file).unwrap(), fs::read(&cli_out).unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(feature = "native-services")]
     #[test]
     fn helm_sqlite_wal_atomic_tx_backup_and_verify() {
@@ -7223,6 +7574,13 @@ let diffused = sk.ca_wave_forward([1, 2, 3, 4, 5], 4);
 assert(sk.ca_wave_inverse(diffused, 4)[4] == 5);
 let ac = append_audit_event([], "tester", "INIT", "vault", "ok");
 assert(verify_audit_chain(ac));
+assert(len(hash_sha3_256("kovrek")) == 64);
+assert(len(hash_sha3_512("kovrek")) == 128);
+assert(len(hash_blake2b("kovrek", 32, null)) == 64);
+assert(len(mac_kmac256("k", "msg", "S", 32)) == 64);
+assert(len(derive_argon2id("pass", "12345678", 256, 1, 1, 32)) == 64);
+let skp = sovereign_keygen();
+assert(skp["kem"] == "ML-KEM-1024+X25519");
 "##
         );
         run_source(&crypto_test).expect("kvcrypto upgrade should execute cleanly");

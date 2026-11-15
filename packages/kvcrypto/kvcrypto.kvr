@@ -1,10 +1,13 @@
 // ============================================================================
 // kvcrypto: Kovrek Standard Cryptography Library Package
 // ============================================================================
-// Production-ready native bindings (AES-256-GCM, RFC 8439 ChaCha20-Poly1305,
-// RFC 5869 HKDF-SHA256, PBKDF2-SHA256, TOTP) paired with pure-Kovrek multi-
-// paradigm, asymmetric, zero-knowledge, post-quantum lattice, threshold, and
-// experimental physics file-protection primitives.
+// Production-ready native bindings (MYSTIQUE-1024 / MAESTRO / OBSCURE
+// Sovereign Streaming Vault, FIPS 203 ML-KEM-1024, RFC 7748 X25519, RFC 9106
+// Argon2id, FIPS 202 SHA3/SHAKE, NIST SP 800-185 KMAC256, RFC 7693 BLAKE2b,
+// AES-256-GCM, RFC 8439 ChaCha20-Poly1305, RFC 5869 HKDF-SHA256, PBKDF2-SHA256,
+// TOTP) paired with pure-Kovrek multi-paradigm, asymmetric, zero-knowledge,
+// post-quantum lattice, threshold, and experimental physics file-protection
+// primitives.
 //
 // Compatible with both file inclusion (`use "../packages/kvcrypto/kvcrypto.kvr";`)
 // and registry imports (`use "kvcrypto"; let crypto = import_package("kvcrypto");`).
@@ -2074,6 +2077,60 @@ fn multi_recipient_unseal_with_slot(vault_path: String, out_path: String, slot_n
     env["audit_chain"] = append_audit_event(env["audit_chain"], slot_name, "UNSEAL_OK", out_path, env["plaintext_sha256"]);
     write_file(vault_path, json_stringify(env));
     return env;
+}
+
+// ============================================================================
+// Method 15: MYSTIQUE / MAESTRO / OBSCURE Sovereign Multi-Century Vault
+// ============================================================================
+// - MYSTIQUE-1024 : 4-engine cascade (Dynamic S-Box + ARX -> ChaCha20-Poly1305
+//                   -> AES-256-GCM -> SHAKE256 CTR + KMAC256)
+// - MAESTRO       : Dual-PRF epoch ratcheted KDF (Argon2id + ML-KEM-1024 + X25519)
+// - OBSCURE       : O(1)-RAM zero-plaintext-leak streaming container with bucket
+//                   padding, encrypted SHA3-512 trailer, and zero-banner mode
+// ============================================================================
+
+fn hash_sha3_256(value: Any) -> String { return sha3_256(value); }
+fn hash_sha3_512(value: Any) -> String { return sha3_512(value); }
+fn hash_blake2b(value: Any, bytes: Int, key: Any) -> String { return blake2b(value, bytes, key); }
+fn mac_kmac256(key: Any, data: Any, custom: Any, bytes: Int) -> String { return kmac256(key, data, custom, bytes); }
+fn derive_argon2id(password: Any, salt: Any, mem_kib: Int, iterations: Int, parallelism: Int, bytes: Int) -> String {
+    return argon2id(password, salt, mem_kib, iterations, parallelism, bytes);
+}
+
+fn sovereign_keygen() -> Map {
+    return pq_hybrid_keygen();
+}
+
+fn sovereign_seal_file(src_path: String, dst_path: String, opts: Map) -> Map {
+    return vault_seal_file(src_path, dst_path, opts);
+}
+
+fn sovereign_seal_dual2fa_file(
+    src_path: String,
+    dst_path: String,
+    passphrase: String,
+    recipient_pub: String,
+    obscure: Bool
+) -> Map {
+    return vault_seal_file(src_path, dst_path, {
+        "cipher": "mystique",
+        "obscure": obscure,
+        "passphrase": passphrase,
+        "recipient_pub": recipient_pub,
+        "mem_kib": 65536,
+        "iterations": 3,
+        "lanes": 1,
+        "ratchet_every": 16,
+        "pad_bucket": 4096
+    });
+}
+
+fn sovereign_unseal_file(vault_path: String, out_path: String, creds: Map) -> Map {
+    return vault_unseal_file(vault_path, out_path, creds);
+}
+
+fn sovereign_inspect_vault(vault_path: String) -> Map {
+    return vault_inspect(vault_path);
 }
 
 // ============================================================================

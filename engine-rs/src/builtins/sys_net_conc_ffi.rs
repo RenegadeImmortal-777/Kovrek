@@ -33,6 +33,7 @@ use sha2::{Digest, Sha256};
 
 use crate::bytecode::{ClassDef, FunctionDef, ObjectData, Op};
 use crate::pipeline::{compile_source, load_source};
+use crate::pq_crypto;
 use crate::project::project_root;
 use crate::runtime::{
     CHANNEL_IDS, FUNCTION_IDS, GENERATOR_IDS, OBJECT_IDS, TASK_IDS, channels,
@@ -51,6 +52,7 @@ use crate::value::{
 };
 #[cfg(feature = "native-services")]
 use crate::value::{json_stringify_value, val_to_sql_value};
+use crate::vault_stream;
 use crate::vm::{Vm, collect_generator, generators, resume_generator};
 
 fn parse_aead_args<'a>(
@@ -75,6 +77,78 @@ fn parse_aead_args<'a>(
         _ => return Err(format!("{fn_name} aad must be String")),
     };
     Ok((key, payload, aad))
+}
+
+fn val_to_raw_bytes(v: &Val, fn_name: &str, label: &str) -> Result<Vec<u8>, String> {
+    match v {
+        Val::Str(s) => Ok(s.as_bytes().to_vec()),
+        Val::List(xs) => xs
+            .iter()
+            .map(|b| match b {
+                Val::Num(n) if n.is_finite() && *n >= 0.0 && *n <= 255.0 => Ok(*n as u8),
+                _ => Err(format!(
+                    "{fn_name} {label} byte List entries must be integers in 0..=255"
+                )),
+            })
+            .collect(),
+        _ => Err(format!("{fn_name} {label} must be String or byte List")),
+    }
+}
+
+fn map_opt_str(pairs: &[(Val, Val)], keys: &[&str]) -> Result<Option<String>, String> {
+    for &k in keys {
+        if let Some(v) = map_lookup(pairs, &Val::Str(k.into())) {
+            return match v {
+                Val::Null => Ok(None),
+                Val::Str(s) => Ok(Some(s.clone())),
+                _ => Err(format!("option '{k}' must be String")),
+            };
+        }
+    }
+    Ok(None)
+}
+
+fn map_opt_bool(pairs: &[(Val, Val)], keys: &[&str], default: bool) -> Result<bool, String> {
+    for &k in keys {
+        if let Some(v) = map_lookup(pairs, &Val::Str(k.into())) {
+            return match v {
+                Val::Null => Ok(default),
+                Val::Bool(b) => Ok(*b),
+                _ => Err(format!("option '{k}' must be Bool")),
+            };
+        }
+    }
+    Ok(default)
+}
+
+fn map_opt_u32(
+    pairs: &[(Val, Val)],
+    keys: &[&str],
+    default: u32,
+    min: u32,
+    max: u32,
+) -> Result<u32, String> {
+    for &k in keys {
+        if let Some(v) = map_lookup(pairs, &Val::Str(k.into())) {
+            return match v {
+                Val::Null => Ok(default),
+                Val::Num(n) if n.is_finite() && *n >= f64::from(min) && *n <= f64::from(max) => {
+                    Ok(*n as u32)
+                }
+                Val::Num(_) => Err(format!("option '{k}' must be in {min}..={max}")),
+                _ => Err(format!("option '{k}' must be Number")),
+            };
+        }
+    }
+    Ok(default)
+}
+
+fn checked_usize_arg(v: &Val, name: &str, min: usize, max: usize) -> Result<usize, String> {
+    match v {
+        Val::Num(n) if n.is_finite() && *n >= (min as f64) && *n <= (max as f64) => Ok(*n as usize),
+        Val::Num(_) => Err(format!("{name} must be in {min}..={max}")),
+        _ => Err(format!("{name} must be Number")),
+    }
 }
 
 fn wasm_bytes_from_val(v: &Val) -> Result<Vec<u8>, String> {
@@ -613,6 +687,413 @@ impl Vm {
                     _ => 32usize,
                 };
                 Val::Str(security::hkdf_sha256_hex(ikm, salt, info, bytes)?)
+            }
+            "sha3_256" => {
+                if a.len() != 1 {
+                    return Err("sha3_256 expects 1 String or byte List argument".into());
+                }
+                let data = val_to_raw_bytes(&a[0], "sha3_256", "data")?;
+                Val::Str(security::bytes_to_hex(&pq_crypto::sha3_256(&data)))
+            }
+            "sha3_512" => {
+                if a.len() != 1 {
+                    return Err("sha3_512 expects 1 String or byte List argument".into());
+                }
+                let data = val_to_raw_bytes(&a[0], "sha3_512", "data")?;
+                Val::Str(security::bytes_to_hex(&pq_crypto::sha3_512(&data)))
+            }
+            "shake128" | "shake256" => {
+                if !(1..=2).contains(&a.len()) {
+                    return Err(format!("{n} expects (data[, bytes])"));
+                }
+                let data = val_to_raw_bytes(&a[0], n, "data")?;
+                let default_bytes = if n == "shake128" { 32 } else { 64 };
+                let out_len = match a.get(1) {
+                    Some(v) if !matches!(v, Val::Null) => checked_usize_arg(v, "bytes", 1, 65_536)?,
+                    _ => default_bytes,
+                };
+                let out = if n == "shake128" {
+                    pq_crypto::shake128(&data, out_len)
+                } else {
+                    pq_crypto::shake256(&data, out_len)
+                };
+                Val::Str(security::bytes_to_hex(&out))
+            }
+            "blake2b" => {
+                if !(1..=3).contains(&a.len()) {
+                    return Err("blake2b expects (data[, bytes[, key]])".into());
+                }
+                let data = val_to_raw_bytes(&a[0], "blake2b", "data")?;
+                let out_len = match a.get(1) {
+                    Some(v) if !matches!(v, Val::Null) => checked_usize_arg(v, "bytes", 1, 64)?,
+                    _ => 64usize,
+                };
+                let mut key = match a.get(2) {
+                    Some(v) if !matches!(v, Val::Null) => val_to_raw_bytes(v, "blake2b", "key")?,
+                    _ => Vec::new(),
+                };
+                let res = pq_crypto::blake2b(&data, &key, out_len);
+                security::zeroize_bytes(&mut key);
+                Val::Str(security::bytes_to_hex(&res?))
+            }
+            "kmac256" => {
+                if !(2..=4).contains(&a.len()) {
+                    return Err("kmac256 expects (key, data[, custom[, bytes]])".into());
+                }
+                let mut key = val_to_raw_bytes(&a[0], "kmac256", "key")?;
+                let data = val_to_raw_bytes(&a[1], "kmac256", "data")?;
+                let custom = match a.get(2) {
+                    Some(v) if !matches!(v, Val::Null) => val_to_raw_bytes(v, "kmac256", "custom")?,
+                    _ => Vec::new(),
+                };
+                let out_len = match a.get(3) {
+                    Some(v) if !matches!(v, Val::Null) => checked_usize_arg(v, "bytes", 1, 65_536)?,
+                    _ => 64usize,
+                };
+                let out = pq_crypto::kmac256(&key, &custom, &data, out_len);
+                security::zeroize_bytes(&mut key);
+                Val::Str(security::bytes_to_hex(&out))
+            }
+            "argon2id" => {
+                if !(2..=6).contains(&a.len()) {
+                    return Err(
+                        "argon2id expects (password, salt[, mem_kib[, iterations[, parallelism[, bytes]]]])"
+                            .into(),
+                    );
+                }
+                let mut password = val_to_raw_bytes(&a[0], "argon2id", "password")?;
+                let salt = val_to_raw_bytes(&a[1], "argon2id", "salt")?;
+                let mem_kib = match a.get(2) {
+                    Some(v) if !matches!(v, Val::Null) => {
+                        checked_usize_arg(v, "mem_kib", 8, 4_194_304)? as u32
+                    }
+                    _ => 65_536,
+                };
+                let iterations = match a.get(3) {
+                    Some(v) if !matches!(v, Val::Null) => {
+                        checked_usize_arg(v, "iterations", 1, 10_000)? as u32
+                    }
+                    _ => 3,
+                };
+                let parallelism = match a.get(4) {
+                    Some(v) if !matches!(v, Val::Null) => {
+                        checked_usize_arg(v, "parallelism", 1, 64)? as u32
+                    }
+                    _ => 1,
+                };
+                let out_len = match a.get(5) {
+                    Some(v) if !matches!(v, Val::Null) => checked_usize_arg(v, "bytes", 4, 1024)?,
+                    _ => 32,
+                };
+                let res = pq_crypto::argon2id(
+                    &password,
+                    &salt,
+                    mem_kib,
+                    iterations,
+                    parallelism,
+                    out_len,
+                );
+                security::zeroize_bytes(&mut password);
+                let mut derived = res?;
+                let hex = security::bytes_to_hex(&derived);
+                security::zeroize_bytes(&mut derived);
+                Val::Str(hex)
+            }
+            "x25519_keygen" => {
+                if !a.is_empty() {
+                    return Err("x25519_keygen takes no arguments".into());
+                }
+                let mut sk = [0u8; 32];
+                rand::rngs::OsRng.fill(&mut sk);
+                sk[0] &= 248;
+                sk[31] &= 127;
+                sk[31] |= 64;
+                let pk = pq_crypto::x25519_public(&sk);
+                let sk_hex = security::bytes_to_hex(&sk);
+                security::zeroize_bytes(&mut sk);
+                Val::Map(vec![
+                    (Val::Str("algorithm".into()), Val::Str("X25519".into())),
+                    (Val::Str("secret_hex".into()), Val::Str(sk_hex)),
+                    (
+                        Val::Str("public_hex".into()),
+                        Val::Str(security::bytes_to_hex(&pk)),
+                    ),
+                ])
+            }
+            "x25519_shared" => {
+                if a.len() != 2 {
+                    return Err("x25519_shared expects (secret_hex, public_hex)".into());
+                }
+                let sk_hex = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("x25519_shared secret_hex must be String".into()),
+                };
+                let pk_hex = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("x25519_shared public_hex must be String".into()),
+                };
+                let mut sk_vec = security::hex_to_bytes(sk_hex)?;
+                let pk_vec = security::hex_to_bytes(pk_hex)?;
+                if sk_vec.len() != 32 || pk_vec.len() != 32 {
+                    security::zeroize_bytes(&mut sk_vec);
+                    return Err("x25519_shared expects two 32-byte hex strings".into());
+                }
+                let mut sk_arr = [0u8; 32];
+                let mut pk_arr = [0u8; 32];
+                sk_arr.copy_from_slice(&sk_vec);
+                pk_arr.copy_from_slice(&pk_vec);
+                security::zeroize_bytes(&mut sk_vec);
+                let res = pq_crypto::x25519_shared_checked(&sk_arr, &pk_arr);
+                security::zeroize_bytes(&mut sk_arr);
+                let mut ss = res?;
+                let hex = security::bytes_to_hex(&ss);
+                security::zeroize_bytes(&mut ss);
+                Val::Str(hex)
+            }
+            "ml_kem_1024_keygen" => {
+                if !a.is_empty() {
+                    return Err("ml_kem_1024_keygen takes no arguments".into());
+                }
+                let (ek, mut dk) = pq_crypto::mlkem1024_keygen();
+                let dk_hex = security::bytes_to_hex(&dk);
+                security::zeroize_bytes(&mut dk);
+                Val::Map(vec![
+                    (Val::Str("algorithm".into()), Val::Str("ML-KEM-1024".into())),
+                    (Val::Str("security_bits".into()), Val::Num(256.0)),
+                    (
+                        Val::Str("encaps_key_hex".into()),
+                        Val::Str(security::bytes_to_hex(&ek)),
+                    ),
+                    (Val::Str("decaps_key_hex".into()), Val::Str(dk_hex)),
+                ])
+            }
+            "ml_kem_1024_encaps" => {
+                if a.len() != 1 {
+                    return Err("ml_kem_1024_encaps expects (encaps_key_hex)".into());
+                }
+                let ek_hex = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("ml_kem_1024_encaps encaps_key_hex must be String".into()),
+                };
+                let ek = security::hex_to_bytes(ek_hex)?;
+                let (ct, mut ss) = pq_crypto::mlkem1024_encaps(&ek)?;
+                let ss_hex = security::bytes_to_hex(&ss);
+                security::zeroize_bytes(&mut ss);
+                Val::Map(vec![
+                    (
+                        Val::Str("ciphertext_hex".into()),
+                        Val::Str(security::bytes_to_hex(&ct)),
+                    ),
+                    (Val::Str("shared_secret_hex".into()), Val::Str(ss_hex)),
+                ])
+            }
+            "ml_kem_1024_decaps" => {
+                if a.len() != 2 {
+                    return Err(
+                        "ml_kem_1024_decaps expects (decaps_key_hex, ciphertext_hex)".into(),
+                    );
+                }
+                let dk_hex = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("ml_kem_1024_decaps decaps_key_hex must be String".into()),
+                };
+                let ct_hex = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("ml_kem_1024_decaps ciphertext_hex must be String".into()),
+                };
+                let mut dk = security::hex_to_bytes(dk_hex)?;
+                let ct = security::hex_to_bytes(ct_hex)?;
+                let res = pq_crypto::mlkem1024_decaps(&dk, &ct);
+                security::zeroize_bytes(&mut dk);
+                let mut ss = res?;
+                let ss_hex = security::bytes_to_hex(&ss);
+                security::zeroize_bytes(&mut ss);
+                Val::Str(ss_hex)
+            }
+            "pq_hybrid_keygen" => {
+                if !a.is_empty() {
+                    return Err("pq_hybrid_keygen takes no arguments".into());
+                }
+                let (pk, sk) = pq_crypto::pq_hybrid_keygen();
+                Val::Map(vec![
+                    (
+                        Val::Str("kem".into()),
+                        Val::Str("ML-KEM-1024+X25519".into()),
+                    ),
+                    (Val::Str("public_key".into()), Val::Str(pk)),
+                    (Val::Str("secret_key".into()), Val::Str(sk)),
+                ])
+            }
+            "vault_seal_file" => {
+                crate::runtime::require_cap("fs.read")?;
+                crate::runtime::require_cap("fs.write")?;
+                if a.len() != 3 {
+                    return Err("vault_seal_file expects (src_path, dst_path, opts_map)".into());
+                }
+                let src = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("vault_seal_file src_path must be String".into()),
+                };
+                let dst = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("vault_seal_file dst_path must be String".into()),
+                };
+                let opts_pairs = match &a[2] {
+                    Val::Map(p) => p,
+                    _ => return Err("vault_seal_file opts must be Map".into()),
+                };
+                let cipher = match map_opt_str(opts_pairs, &["cipher"])? {
+                    Some(c) => vault_stream::CipherSuite::from_str(&c)?,
+                    None => vault_stream::CipherSuite::Mystique1024,
+                };
+                let opts = vault_stream::VaultSealOptions {
+                    cipher,
+                    opaque_obscure: map_opt_bool(
+                        opts_pairs,
+                        &["obscure", "opaque_obscure"],
+                        false,
+                    )?,
+                    passphrase: map_opt_str(opts_pairs, &["passphrase"])?,
+                    recipient_pub: map_opt_str(opts_pairs, &["recipient_pub", "pubkey"])?,
+                    mem_kib: map_opt_u32(
+                        opts_pairs,
+                        &["mem_kib", "argon2id_mem_kib"],
+                        65_536,
+                        8,
+                        4_194_304,
+                    )?,
+                    iterations: map_opt_u32(opts_pairs, &["iterations", "iters"], 3, 1, 10_000)?,
+                    lanes: map_opt_u32(opts_pairs, &["lanes", "parallelism"], 1, 1, 64)?,
+                    ratchet_every: map_opt_u32(
+                        opts_pairs,
+                        &["ratchet_every", "ratchet"],
+                        16,
+                        1,
+                        65_536,
+                    )?,
+                    pad_bucket: map_opt_u32(
+                        opts_pairs,
+                        &["pad_bucket", "pad"],
+                        4096,
+                        0,
+                        1_048_576,
+                    )?,
+                };
+                let res = vault_stream::vault_seal_file(Path::new(src), Path::new(dst), &opts)?;
+                Val::Map(vec![
+                    (Val::Str("method".into()), Val::Str(res.method)),
+                    (
+                        Val::Str("plaintext_bytes".into()),
+                        Val::Num(res.plaintext_bytes as f64),
+                    ),
+                    (
+                        Val::Str("padded_bytes".into()),
+                        Val::Num(res.padded_bytes as f64),
+                    ),
+                    (
+                        Val::Str("chunks_written".into()),
+                        Val::Num(res.chunks_written as f64),
+                    ),
+                    (
+                        Val::Str("key_commitment_prefix".into()),
+                        Val::Str(res.key_commitment_prefix),
+                    ),
+                    (Val::Str("opaque".into()), Val::Bool(res.opaque)),
+                ])
+            }
+            "vault_unseal_file" => {
+                crate::runtime::require_cap("fs.read")?;
+                crate::runtime::require_cap("fs.write")?;
+                if a.len() != 3 {
+                    return Err(
+                        "vault_unseal_file expects (vault_path, out_path, creds_map)".into(),
+                    );
+                }
+                let vault = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("vault_unseal_file vault_path must be String".into()),
+                };
+                let out = match &a[1] {
+                    Val::Str(s) => s,
+                    _ => return Err("vault_unseal_file out_path must be String".into()),
+                };
+                let cred_pairs = match &a[2] {
+                    Val::Map(p) => p,
+                    _ => return Err("vault_unseal_file creds must be Map".into()),
+                };
+                let creds = vault_stream::VaultOpenCreds {
+                    passphrase: map_opt_str(cred_pairs, &["passphrase"])?,
+                    secret_key: map_opt_str(cred_pairs, &["secret_key", "seckey"])?,
+                };
+                let res =
+                    vault_stream::vault_unseal_file(Path::new(vault), Path::new(out), &creds)?;
+                Val::Map(vec![
+                    (Val::Str("method".into()), Val::Str(res.method)),
+                    (
+                        Val::Str("original_filename".into()),
+                        Val::Str(res.original_filename),
+                    ),
+                    (
+                        Val::Str("recovered_bytes".into()),
+                        Val::Num(res.recovered_bytes as f64),
+                    ),
+                    (Val::Str("sha3_512".into()), Val::Str(res.sha3_512)),
+                    (
+                        Val::Str("chunks_verified".into()),
+                        Val::Num(res.chunks_verified as f64),
+                    ),
+                ])
+            }
+            "vault_inspect" => {
+                crate::runtime::require_cap("fs.read")?;
+                if a.len() != 1 {
+                    return Err("vault_inspect expects (vault_path)".into());
+                }
+                let vault = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("vault_inspect vault_path must be String".into()),
+                };
+                let info = vault_stream::vault_inspect(Path::new(vault))?;
+                Val::Map(vec![
+                    (Val::Str("format".into()), Val::Str(info.format)),
+                    (Val::Str("opaque".into()), Val::Bool(info.opaque)),
+                    (
+                        Val::Str("cipher".into()),
+                        info.cipher.map(Val::Str).unwrap_or(Val::Null),
+                    ),
+                    (
+                        Val::Str("unlock_mode".into()),
+                        info.unlock_mode.map(Val::Str).unwrap_or(Val::Null),
+                    ),
+                    (
+                        Val::Str("argon2id_mem_kib".into()),
+                        info.argon2id_mem_kib
+                            .map(|n| Val::Num(f64::from(n)))
+                            .unwrap_or(Val::Null),
+                    ),
+                    (
+                        Val::Str("argon2id_iterations".into()),
+                        info.argon2id_iterations
+                            .map(|n| Val::Num(f64::from(n)))
+                            .unwrap_or(Val::Null),
+                    ),
+                    (
+                        Val::Str("ratchet_every".into()),
+                        info.ratchet_every
+                            .map(|n| Val::Num(f64::from(n)))
+                            .unwrap_or(Val::Null),
+                    ),
+                    (
+                        Val::Str("key_commitment_prefix".into()),
+                        info.key_commitment_prefix
+                            .map(Val::Str)
+                            .unwrap_or(Val::Null),
+                    ),
+                    (
+                        Val::Str("has_plaintext_leak".into()),
+                        Val::Bool(info.has_plaintext_leak),
+                    ),
+                ])
             }
             "is_private_ip" => {
                 if a.len() != 1 {

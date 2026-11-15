@@ -2,11 +2,12 @@
 // Kovrek Complete Multi-Paradigm, Post-Quantum & Physics File Vault Showcase
 // ============================================================================
 // Imports the standard `kvcrypto` library (`packages/kvcrypto/kvcrypto.kvr`)
-// and runs an end-to-end file-protection verification suite across all 14
+// and runs an end-to-end file-protection verification suite across all 15
 // cryptographic & physical mechanisms (native RFC 8439 ChaCha20-Poly1305,
 // RFC 5869 HKDF-SHA256, AES-256-GCM, classical ciphers, secp256k1 ECC, RSA,
 // DH, ElGamal+Schnorr ZKP, PQ Matrix-LWE-16, Shamir+TOTP, Quantum BB84,
-// Hamiltonian Symplectic Chaos+Wave CA, and Multi-Recipient PQ Hybrid).
+// Hamiltonian Symplectic Chaos+Wave CA, Multi-Recipient PQ Hybrid, and
+// Sovereign MYSTIQUE-1024 + MAESTRO + OBSCURE Streaming Vault).
 //
 // Check : .\bin\kovrek-native.exe check  examples\file_vault_crypto.kvr
 // Verify: .\bin\kovrek-native.exe verify examples\file_vault_crypto.kvr
@@ -59,7 +60,7 @@ fn run_complete_crypto_suite() -> Void {
         fs_write_bytes(bin_src, binary_payload);
         write_file(text_src, "KOVREK-VAULT-MANIFEST\nclassification=TOP-SECRET\nasset=engine-keys-2026\n");
 
-        // --- [1/14] AES-256-GCM AEAD ---
+        // --- [1/15] AES-256-GCM AEAD ---
         let aead_key = AeadFileKey("k-aead-2026", 1);
         let p01_v = path_join(work_dir, "01_aead.vault");
         let p01_o = path_join(work_dir, "01_aead.bin");
@@ -73,9 +74,9 @@ fn run_complete_crypto_suite() -> Void {
         j01["ciphertext"] = flip_one_hex_char(j01["ciphertext"], len(j01["ciphertext"]) - 2);
         write_file(p01_t, json_stringify(j01));
         expect_error("AEAD tamper", fn() { aead_unprotect_file(p01_t, p01_o, "firmware_blob.bin", aead_key); });
-        print(f"[ 1/14 PASS] AES-256-GCM AEAD            | {n01}B bin  | AAD binding + GHASH tamper check");
+        print(f"[ 1/15 PASS] AES-256-GCM AEAD            | {n01}B bin  | AAD binding + GHASH tamper check");
 
-        // --- [2/14] SHA256-CTR-EtM Stream + RFC 5869 Native HKDF ---
+        // --- [2/15] SHA256-CTR-EtM Stream + RFC 5869 Native HKDF ---
         let st_key = StreamSplitKey("k-ctr-01");
         let p02_v = path_join(work_dir, "02_ctr.vault");
         let p02_o = path_join(work_dir, "02_ctr.bin");
@@ -88,9 +89,9 @@ fn run_complete_crypto_suite() -> Void {
         j02["ciphertext_hex"] = flip_one_hex_char(j02["ciphertext_hex"], 6);
         write_file(p02_t, json_stringify(j02));
         expect_error("CTR EtM bit flip", fn() { stream_etm_unprotect_file(p02_t, p02_o, "firmware_blob.bin", st_key); });
-        print(f"[ 2/14 PASS] SHA256-CTR-EtM Stream       | {n02}B bin  | native RFC5869 HKDF split keys + EtM");
+        print(f"[ 2/15 PASS] SHA256-CTR-EtM Stream       | {n02}B bin  | native RFC5869 HKDF split keys + EtM");
 
-        // --- [3/14] PBKDF2-SHA256 KEK->DEK + Rotation ---
+        // --- [3/15] PBKDF2-SHA256 KEK->DEK + Rotation ---
         let pol03 = PassphraseKekPolicy("kek-pol", 150000);
         let p03_v = path_join(work_dir, "03_kw.vault");
         let p03_o = path_join(work_dir, "03_kw.txt");
@@ -101,9 +102,9 @@ fn run_complete_crypto_suite() -> Void {
         expect_error("KW stale pass", fn() { keywrap_unprotect_file(p03_v, p03_o, "pass-v1-secret"); });
         keywrap_unprotect_file(p03_v, p03_o, "pass-v2-rotated");
         let n03 = assert_files_byte_identical(text_src, p03_o, "03-KEK-DEK");
-        print(f"[ 3/14 PASS] PBKDF2 KEK->DEK Wrap        | {n03}B txt  | epoch passphrase rotation (150k->160k)");
+        print(f"[ 3/15 PASS] PBKDF2 KEK->DEK Wrap        | {n03}B txt  | epoch passphrase rotation (150k->160k)");
 
-        // --- [4/14] RFC 8439 ChaCha20-Poly1305 (Native Engine + Pure-Kovrek ARX) ---
+        // --- [4/15] RFC 8439 ChaCha20-Poly1305 (Native Engine + Pure-Kovrek ARX) ---
         let cc_key = ChaChaPolyKey("chacha-01");
         let p04_v = path_join(work_dir, "04_chacha.vault");
         let p04_o = path_join(work_dir, "04_chacha.bin");
@@ -123,9 +124,9 @@ fn run_complete_crypto_suite() -> Void {
         chacha20_poly1305_unprotect_file_native(p04_nv, p04_no, "chacha-nat-v1", cc_key.key_hex);
         assert_files_byte_identical(bin_src, p04_no, "04-Native-ChaCha20-Poly1305");
         expect_error("Native ChaCha wrong AAD", fn() { chacha20_poly1305_unprotect_file_native(p04_nv, p04_no, "bad-aad", cc_key.key_hex); });
-        print(f"[ 4/14 PASS] RFC8439 ChaCha20-Poly1305   | {n04}B bin  | native Rust + pure-Kovrek GF(2^130-5)");
+        print(f"[ 4/15 PASS] RFC8439 ChaCha20-Poly1305   | {n04}B bin  | native Rust + pure-Kovrek GF(2^130-5)");
 
-        // --- [5/14] 128-bit Feistel CBC + PKCS#7 + EtM ---
+        // --- [5/15] 128-bit Feistel CBC + PKCS#7 + EtM ---
         let cbc_key = CbcBlockVaultKey("cbc-8r-01", 8);
         let p05_v = path_join(work_dir, "05_cbc.vault");
         let p05_o = path_join(work_dir, "05_cbc.bin");
@@ -138,9 +139,9 @@ fn run_complete_crypto_suite() -> Void {
         j05["ciphertext_hex"] = flip_one_hex_char(j05["ciphertext_hex"], len(j05["ciphertext_hex"]) - 4);
         write_file(p05_t, json_stringify(j05));
         expect_error("CBC padding oracle EtM guard", fn() { cbc_pkcs7_unprotect_file(p05_t, p05_o, cbc_key); });
-        print(f"[ 5/14 PASS] Feistel-CBC-PKCS7-EtM       | {n05}B bin  | 16B chaining + padding-oracle EtM blocked");
+        print(f"[ 5/15 PASS] Feistel-CBC-PKCS7-EtM       | {n05}B bin  | 16B chaining + padding-oracle EtM blocked");
 
-        // --- [6/14] BigInt RSA-263 KEM + RSA-264 Signature ---
+        // --- [6/15] BigInt RSA-263 KEM + RSA-264 Signature ---
         let rsa_p = kvc_rsa_params();
         let rsa_enc = RsaPrivateKey("rsa-kem-263", "KEM", rsa_p["enc_p"], rsa_p["enc_q"], rsa_p["public_e"]);
         let rsa_sig = RsaPrivateKey("rsa-sig-264", "SIGN", rsa_p["sign_p"], rsa_p["sign_q"], rsa_p["public_e"]);
@@ -155,9 +156,9 @@ fn run_complete_crypto_suite() -> Void {
         j06["signature_int"] = big_add(j06["signature_int"], "1");
         write_file(p06_t, json_stringify(j06));
         expect_error("RSA signature forge", fn() { rsa_kem_verify_unprotect_file(p06_t, p06_o, rsa_enc, rsa_sig.pub); });
-        print(f"[ 6/14 PASS] BigInt RSA-KEM + RSA-Sig    | {n06}B bin  | {rsa_enc.pub.modulus_bits}b KEM + {rsa_sig.pub.modulus_bits}b Verify-then-Decap");
+        print(f"[ 6/15 PASS] BigInt RSA-KEM + RSA-Sig    | {n06}B bin  | {rsa_enc.pub.modulus_bits}b KEM + {rsa_sig.pub.modulus_bits}b Verify-then-Decap");
 
-        // --- [7/14] secp256k1 Elliptic Curve ECIES + ECDSA ---
+        // --- [7/15] secp256k1 Elliptic Curve ECIES + ECDSA ---
         let ec_recv = EcPrivateKey("ec-recv-256k1");
         let ec_sign = EcPrivateKey("ec-sign-256k1");
         let p07_v = path_join(work_dir, "07_ecies.vault");
@@ -172,9 +173,9 @@ fn run_complete_crypto_suite() -> Void {
         j07["sig_s"] = big_add(j07["sig_s"], "1");
         write_file(p07_t, json_stringify(j07));
         expect_error("ECDSA tampered sig", fn() { ecies_unprotect_file(p07_t, p07_o, ec_recv, ec_sign.pub); });
-        print(f"[ 7/14 PASS] secp256k1 ECIES + ECDSA     | {n07}B bin  | Jacobian ECC + invalid-curve rejected");
+        print(f"[ 7/15 PASS] secp256k1 ECIES + ECDSA     | {n07}B bin  | Jacobian ECC + invalid-curve rejected");
 
-        // --- [8/14] Safe-Prime Ephemeral DH-KEM-256 ---
+        // --- [8/15] Safe-Prime Ephemeral DH-KEM-256 ---
         let dh_params = DhDomainParams("MODP-256-SAFE", kvc_dh_safe_p(), kvc_dh_subgroup_q(), kvc_dh_gen());
         let dh_recv = DhStaticKeyPair("dh-recv", dh_params);
         let p08_v1 = path_join(work_dir, "08_dh1.vault");
@@ -187,9 +188,9 @@ fn run_complete_crypto_suite() -> Void {
         dh_kem_unprotect_file(p08_v1, p08_o, "doc-v1", dh_recv);
         let n08 = assert_files_byte_identical(text_src, p08_o, "08-DH-KEM");
         expect_error("DH order-2 confinement", fn() { dh_params.validate_public_point(big_sub(kvc_dh_safe_p(), "1")); });
-        print(f"[ 8/14 PASS] Safe-Prime DH-KEM-256       | {n08}B txt  | forward secrecy + subgroup confinement");
+        print(f"[ 8/15 PASS] Safe-Prime DH-KEM-256       | {n08}B txt  | forward secrecy + subgroup confinement");
 
-        // --- [9/14] Probabilistic ElGamal + Fiat-Shamir Schnorr ZKP ---
+        // --- [9/15] Probabilistic ElGamal + Fiat-Shamir Schnorr ZKP ---
         let eg_kp = ElGamalZkpKeyPair("elgamal-zkp-256");
         let p09_v = path_join(work_dir, "09_elgamal.vault");
         let p09_o = path_join(work_dir, "09_elgamal.bin");
@@ -201,9 +202,9 @@ fn run_complete_crypto_suite() -> Void {
         elgamal_zkp_unprotect_file(p09_v, p09_o, eg_kp, j09["zkp_t"], j09["zkp_s"]);
         let n09 = assert_files_byte_identical(bin_src, p09_o, "09-ElGamal-ZKP");
         expect_error("Schnorr forged ZKP", fn() { elgamal_zkp_unprotect_file(p09_v, p09_o, eg_kp, j09["zkp_t"], big_add(j09["zkp_s"], "1")); });
-        print(f"[ 9/14 PASS] ElGamal + Schnorr ZKP       | {n09}B bin  | randomized ciphertexts + non-interactive ZKP");
+        print(f"[ 9/15 PASS] ElGamal + Schnorr ZKP       | {n09}B bin  | randomized ciphertexts + non-interactive ZKP");
 
-        // --- [10/14] Post-Quantum Matrix-LWE-16 Lattice KEM ---
+        // --- [10/15] Post-Quantum Matrix-LWE-16 Lattice KEM ---
         let pq_kp = LwePqKeyPair("lwe-pq-16");
         let p10_v = path_join(work_dir, "10_lwe.vault");
         let p10_o = path_join(work_dir, "10_lwe.bin");
@@ -222,9 +223,9 @@ fn run_complete_crypto_suite() -> Void {
         j10["chunks"] = chunks10;
         write_file(p10_t, json_stringify(j10));
         expect_error("LWE FO lattice tamper", fn() { lwe_pq_unprotect_file(p10_t, p10_o, pq_kp); });
-        print(f"[10/14 PASS] Post-Quantum Matrix-LWE-16  | {n10}B bin  | zero-error lattice margin + FO rejection");
+        print(f"[10/15 PASS] Post-Quantum Matrix-LWE-16  | {n10}B bin  | zero-error lattice margin + FO rejection");
 
-        // --- [11/14] Shamir (3-of-5) GF(P257) + RFC 6238 TOTP 2FA ---
+        // --- [11/15] Shamir (3-of-5) GF(P257) + RFC 6238 TOTP 2FA ---
         let sss_vault = ShamirTotpVault("sss-totp-26", 3, 5, ["alice", "bob", "carol", "dave", "erin"]);
         let p11_v = path_join(work_dir, "11_sss.vault");
         let p11_o = path_join(work_dir, "11_sss.bin");
@@ -237,9 +238,9 @@ fn run_complete_crypto_suite() -> Void {
         let n11 = assert_files_byte_identical(bin_src, p11_o, "11-Shamir");
         expect_error("Shamir < k quorum", fn() { sss_vault.unseal_with_quorum_and_totp(p11_v, p11_o, [shares[0], shares[1]], otp, ts); });
         expect_error("Invalid TOTP", fn() { sss_vault.unseal_with_quorum_and_totp(p11_v, p11_o, [shares[0], shares[2], shares[4]], "000000", ts); });
-        print(f"[11/14 PASS] Shamir 3/5 + TOTP + @verify | {n11}B bin  | GF(P257) Lagrange + <k & bad 2FA rejected");
+        print(f"[11/15 PASS] Shamir 3/5 + TOTP + @verify | {n11}B bin  | GF(P257) Lagrange + <k & bad 2FA rejected");
 
-        // --- [12/14] Quantum Optical BB84 Polarization + QBER Abort ---
+        // --- [12/15] Quantum Optical BB84 Polarization + QBER Abort ---
         let qchan = QuantumBb84Channel("bb84-fiber-01", 1100);
         let p12_v = path_join(work_dir, "12_bb84.vault");
         let p12_o = path_join(work_dir, "12_bb84.bin");
@@ -247,9 +248,9 @@ fn run_complete_crypto_suite() -> Void {
         quantum_bb84_protect_and_unprotect(bin_src, p12_v, p12_o, qchan);
         let n12 = assert_files_byte_identical(bin_src, p12_o, "12-Quantum-BB84");
         expect_error("Quantum BB84 Eve 90% intercept abort", fn() { qchan.establish_sifted_key(512, 90); });
-        print(f"[12/14 PASS] Quantum BB84 Polarization   | {n12}B bin  | Born cos^2 collapse + Eve QBER>11% aborted");
+        print(f"[12/15 PASS] Quantum BB84 Polarization   | {n12}B bin  | Born cos^2 collapse + Eve QBER>11% aborted");
 
-        // --- [13/14] Hamiltonian Symplectic Chaos + Wave CA + Entropy ---
+        // --- [13/15] Hamiltonian Symplectic Chaos + Wave CA + Entropy ---
         let symp_key = SymplecticChaosKey("symp-ca-01", 32);
         let p13_v = path_join(work_dir, "13_symp.vault");
         let p13_o = path_join(work_dir, "13_symp.bin");
@@ -261,9 +262,9 @@ fn run_complete_crypto_suite() -> Void {
         let ks_pert = symp_key.generate_phase_bytes(32, (symp_key.q0 + 1) % 4294967291, symp_key.p0, 777);
         assert(not constant_time_equal(bytes_to_hex(ks_orig), bytes_to_hex(ks_pert)), "Butterfly divergence required");
         let h_ent = floor(s_env["entropy_bits_per_byte"] * 100.0) / 100.0;
-        print(f"[13/14 PASS] Symplectic det=1 + Wave CA  | {n13}B bin  | H={h_ent} b/B + dQ=1 butterfly");
+        print(f"[13/15 PASS] Symplectic det=1 + Wave CA  | {n13}B bin  | H={h_ent} b/B + dQ=1 butterfly");
 
-        // --- [14/14] Multi-Recipient Post-Quantum Hybrid + Audit Chain ---
+        // --- [14/15] Multi-Recipient Post-Quantum Hybrid + Audit Chain ---
         let p14_v = path_join(work_dir, "14_multi.vault");
         let p14_o = path_join(work_dir, "14_multi.bin");
         created_files = concat(created_files, [p14_v, p14_o]);
@@ -273,8 +274,66 @@ fn run_complete_crypto_suite() -> Void {
         let final_env = multi_recipient_unseal_with_slot(p14_v, p14_o, "lwe", pq_kp);
         assert_files_byte_identical(bin_src, p14_o, "14-Multi-LWE");
         assert(verify_audit_chain(final_env["audit_chain"]) and len(final_env["audit_chain"]) == 3, "Audit chain length/hash ok");
-        print(f"[14/14 PASS] Multi-Slot PQ Hybrid+Chain  | {n14}B bin  | Passphrase+RSA+secp256k1+LWE & 3-entry chain");
-        print("ALL 14 ENCRYPTION PARADIGMS, KEY STRUCTURES, & SECURITY MECHANISMS PASSED.");
+        print(f"[14/15 PASS] Multi-Slot PQ Hybrid+Chain  | {n14}B bin  | Passphrase+RSA+secp256k1+LWE & 3-entry chain");
+
+        // --- [15/15] Sovereign MYSTIQUE-1024 + MAESTRO + OBSCURE Streaming Vault ---
+        let sov_kp = sovereign_keygen();
+        let sov_kp_wrong = sovereign_keygen();
+        let p15_v = path_join(work_dir, "15_sovereign.vault");
+        let p15_o = path_join(work_dir, "15_sovereign.bin");
+        let p15_obs_v = path_join(work_dir, "15_obscure.vault");
+        let p15_obs_o = path_join(work_dir, "15_obscure.bin");
+        let p15_obs_t = path_join(work_dir, "15_obscure_t.vault");
+        let p15_obs_fail = path_join(work_dir, "15_obscure_fail.bin");
+        created_files = concat(created_files, [p15_v, p15_o, p15_obs_v, p15_obs_o, p15_obs_t, p15_obs_fail]);
+
+        let res15_a = sovereign_seal_file(bin_src, p15_v, {
+            "cipher": "mystique",
+            "obscure": false,
+            "passphrase": "sovereign-quantum-pass",
+            "recipient_pub": sov_kp["public_key"],
+            "mem_kib": 1024,
+            "iterations": 1,
+            "ratchet_every": 2,
+            "pad_bucket": 256
+        });
+        assert(not res15_a["opaque"] and res15_a["padded_bytes"] >= res15_a["plaintext_bytes"], "KVRM2 padding check");
+        let ins15_a = sovereign_inspect_vault(p15_v);
+        assert(ins15_a["format"] == "KVRM2-SOVEREIGN" and not ins15_a["has_plaintext_leak"], "Zero plaintext leak required");
+        let open15_a = sovereign_unseal_file(p15_v, p15_o, {
+            "passphrase": "sovereign-quantum-pass",
+            "secret_key": sov_kp["secret_key"]
+        });
+        let n15 = assert_files_byte_identical(bin_src, p15_o, "15-Sovereign-KVRM2");
+        assert(open15_a["original_filename"] == "firmware_blob.bin", "Encrypted prologue filename check");
+        assert(constant_time_equal(open15_a["sha3_512"], hash_sha3_512(binary_payload)), "SHA3-512 trailer check");
+        expect_error("Dual-2FA wrong passphrase", fn() { sovereign_unseal_file(p15_v, p15_obs_fail, {"passphrase": "wrong", "secret_key": sov_kp["secret_key"]}); });
+        expect_error("Dual-2FA wrong PQ secret", fn() { sovereign_unseal_file(p15_v, p15_obs_fail, {"passphrase": "sovereign-quantum-pass", "secret_key": sov_kp_wrong["secret_key"]}); });
+        expect_error("Dual-2FA missing 2nd factor", fn() { sovereign_unseal_file(p15_v, p15_obs_fail, {"passphrase": "sovereign-quantum-pass"}); });
+
+        let res15_b = sovereign_seal_file(bin_src, p15_obs_v, {
+            "cipher": "mystique",
+            "obscure": true,
+            "passphrase": "obscure-blind-pass",
+            "mem_kib": 1024,
+            "iterations": 1,
+            "ratchet_every": 2,
+            "pad_bucket": 256
+        });
+        assert(res15_b["opaque"], "OBSCURE opaque wire flag required");
+        let ins15_b = sovereign_inspect_vault(p15_obs_v);
+        assert(ins15_b["format"] == "OBSCURE-OPAQUE" and ins15_b["opaque"] and not ins15_b["has_plaintext_leak"], "OBSCURE metadata blindness");
+        let open15_b = sovereign_unseal_file(p15_obs_v, p15_obs_o, {"passphrase": "obscure-blind-pass"});
+        assert_files_byte_identical(bin_src, p15_obs_o, "15-OBSCURE");
+        assert(constant_time_equal(open15_b["sha3_512"], hash_sha3_512(binary_payload)), "OBSCURE SHA3-512 trailer check");
+
+        let raw_obs = fs_read_bytes(p15_obs_v);
+        raw_obs[len(raw_obs) - 5] = (raw_obs[len(raw_obs) - 5] + 1) % 256;
+        fs_write_bytes(p15_obs_t, raw_obs);
+        expect_error("OBSCURE tamper rejected", fn() { sovereign_unseal_file(p15_obs_t, p15_obs_fail, {"passphrase": "obscure-blind-pass"}); });
+        assert(not path_exists(p15_obs_fail), "Tampered unseal must remove partial output");
+        print(f"[15/15 PASS] MYSTIQUE+MAESTRO+OBSCURE  | {n15}B bin  | 1024b 4-engine + ML-KEM-1024/X25519 + zero-leak");
+        print("ALL 15 ENCRYPTION PARADIGMS, KEY STRUCTURES, & SECURITY MECHANISMS PASSED.");
     } catch suite_err {
         throw suite_err;
     } finally {
