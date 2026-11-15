@@ -1,0 +1,295 @@
+// ============================================================================
+// Kovrek Complete Multi-Paradigm, Post-Quantum & Physics File Vault Showcase
+// ============================================================================
+// Imports the standard `kvcrypto` library (`packages/kvcrypto/kvcrypto.kvr`)
+// and runs an end-to-end file-protection verification suite across all 14
+// cryptographic & physical mechanisms (native RFC 8439 ChaCha20-Poly1305,
+// RFC 5869 HKDF-SHA256, AES-256-GCM, classical ciphers, secp256k1 ECC, RSA,
+// DH, ElGamal+Schnorr ZKP, PQ Matrix-LWE-16, Shamir+TOTP, Quantum BB84,
+// Hamiltonian Symplectic Chaos+Wave CA, and Multi-Recipient PQ Hybrid).
+//
+// Check : .\bin\kovrek-native.exe check  examples\file_vault_crypto.kvr
+// Verify: .\bin\kovrek-native.exe verify examples\file_vault_crypto.kvr
+// Run   : .\bin\kovrek-native.exe run    examples\file_vault_crypto.kvr
+// ============================================================================
+
+use "../packages/kvcrypto/kvcrypto.kvr";
+
+fn assert_files_byte_identical(path_a: String, path_b: String, label: String) -> Int {
+    let a = fs_read_bytes(path_a);
+    let b = fs_read_bytes(path_b);
+    assert(len(a) == len(b), label + ": file length mismatch");
+    let i = 0;
+    let n = len(a);
+    while i < n {
+        assert(a[i] == b[i], label + ": byte mismatch at offset " + str(i));
+        i = i + 1;
+    }
+    return n;
+}
+
+fn resolve_vault_work_dir() -> String {
+    let base = env_get("TMPDIR");
+    if base == null or base == "" {
+        base = env_get("TEMP");
+    }
+    if base == null or base == "" {
+        base = env_get("TMP");
+    }
+    if base == null or base == "" {
+        base = ".";
+    }
+    return path_join(base, "kovrek_vault_" + random_bytes_hex(6));
+}
+
+fn run_complete_crypto_suite() -> Void {
+    let work_dir = resolve_vault_work_dir();
+    fs_mkdir(work_dir);
+
+    let bin_src = path_join(work_dir, "firmware_blob.bin");
+    let text_src = path_join(work_dir, "treasury_manifest.txt");
+    let binary_payload = [
+        0, 137, 80, 78, 71, 13, 10, 26, 10, 255, 254, 128, 127, 65, 90, 1,
+        2, 3, 240, 200, 160, 99, 0, 42, 75, 86, 82, 255, 0, 170, 85, 195,
+        33, 64, 129, 250, 18, 222, 173, 190, 239
+    ];
+    let created_files = [bin_src, text_src];
+
+    try {
+        fs_write_bytes(bin_src, binary_payload);
+        write_file(text_src, "KOVREK-VAULT-MANIFEST\nclassification=TOP-SECRET\nasset=engine-keys-2026\n");
+
+        // --- [1/14] AES-256-GCM AEAD ---
+        let aead_key = AeadFileKey("k-aead-2026", 1);
+        let p01_v = path_join(work_dir, "01_aead.vault");
+        let p01_o = path_join(work_dir, "01_aead.bin");
+        let p01_t = path_join(work_dir, "01_aead_t.vault");
+        created_files = concat(created_files, [p01_v, p01_o, p01_t]);
+        aead_protect_file(bin_src, p01_v, "firmware_blob.bin", aead_key);
+        aead_unprotect_file(p01_v, p01_o, "firmware_blob.bin", aead_key);
+        let n01 = assert_files_byte_identical(bin_src, p01_o, "01-AEAD");
+        expect_error("AEAD filename swap", fn() { aead_unprotect_file(p01_v, p01_o, "wrong.bin", aead_key); });
+        let j01 = json_parse(read_file(p01_v));
+        j01["ciphertext"] = flip_one_hex_char(j01["ciphertext"], len(j01["ciphertext"]) - 2);
+        write_file(p01_t, json_stringify(j01));
+        expect_error("AEAD tamper", fn() { aead_unprotect_file(p01_t, p01_o, "firmware_blob.bin", aead_key); });
+        print(f"[ 1/14 PASS] AES-256-GCM AEAD            | {n01}B bin  | AAD binding + GHASH tamper check");
+
+        // --- [2/14] SHA256-CTR-EtM Stream + RFC 5869 Native HKDF ---
+        let st_key = StreamSplitKey("k-ctr-01");
+        let p02_v = path_join(work_dir, "02_ctr.vault");
+        let p02_o = path_join(work_dir, "02_ctr.bin");
+        let p02_t = path_join(work_dir, "02_ctr_t.vault");
+        created_files = concat(created_files, [p02_v, p02_o, p02_t]);
+        stream_etm_protect_file(bin_src, p02_v, "firmware_blob.bin", st_key);
+        stream_etm_unprotect_file(p02_v, p02_o, "firmware_blob.bin", st_key);
+        let n02 = assert_files_byte_identical(bin_src, p02_o, "02-CTR-EtM");
+        let j02 = json_parse(read_file(p02_v));
+        j02["ciphertext_hex"] = flip_one_hex_char(j02["ciphertext_hex"], 6);
+        write_file(p02_t, json_stringify(j02));
+        expect_error("CTR EtM bit flip", fn() { stream_etm_unprotect_file(p02_t, p02_o, "firmware_blob.bin", st_key); });
+        print(f"[ 2/14 PASS] SHA256-CTR-EtM Stream       | {n02}B bin  | native RFC5869 HKDF split keys + EtM");
+
+        // --- [3/14] PBKDF2-SHA256 KEK->DEK + Rotation ---
+        let pol03 = PassphraseKekPolicy("kek-pol", 150000);
+        let p03_v = path_join(work_dir, "03_kw.vault");
+        let p03_o = path_join(work_dir, "03_kw.txt");
+        created_files = concat(created_files, [p03_v, p03_o]);
+        let kw1 = keywrap_protect_file(text_src, p03_v, "pass-v1-secret", pol03);
+        let kw2 = keywrap_rotate_passphrase(p03_v, "pass-v1-secret", "pass-v2-rotated", 160000);
+        assert(constant_time_equal(kw1["payload_ct"], kw2["payload_ct"]) and kw2["rotation_epoch"] == 2, "DEK rotation invariant");
+        expect_error("KW stale pass", fn() { keywrap_unprotect_file(p03_v, p03_o, "pass-v1-secret"); });
+        keywrap_unprotect_file(p03_v, p03_o, "pass-v2-rotated");
+        let n03 = assert_files_byte_identical(text_src, p03_o, "03-KEK-DEK");
+        print(f"[ 3/14 PASS] PBKDF2 KEK->DEK Wrap        | {n03}B txt  | epoch passphrase rotation (150k->160k)");
+
+        // --- [4/14] RFC 8439 ChaCha20-Poly1305 (Native Engine + Pure-Kovrek ARX) ---
+        let cc_key = ChaChaPolyKey("chacha-01");
+        let p04_v = path_join(work_dir, "04_chacha.vault");
+        let p04_o = path_join(work_dir, "04_chacha.bin");
+        let p04_t = path_join(work_dir, "04_chacha_t.vault");
+        let p04_nv = path_join(work_dir, "04_chacha_nat.vault");
+        let p04_no = path_join(work_dir, "04_chacha_nat.bin");
+        created_files = concat(created_files, [p04_v, p04_o, p04_t, p04_nv, p04_no]);
+        chacha_poly_protect_file(bin_src, p04_v, "chacha-aad-v1", cc_key);
+        chacha_poly_unprotect_file(p04_v, p04_o, "chacha-aad-v1", cc_key);
+        let n04 = assert_files_byte_identical(bin_src, p04_o, "04-ChaCha20-Poly1305");
+        expect_error("ChaCha wrong AAD", fn() { chacha_poly_unprotect_file(p04_v, p04_o, "evil-aad", cc_key); });
+        let j04 = json_parse(read_file(p04_v));
+        j04["ciphertext_hex"] = flip_one_hex_char(j04["ciphertext_hex"], 4);
+        write_file(p04_t, json_stringify(j04));
+        expect_error("Poly1305 tag fail", fn() { chacha_poly_unprotect_file(p04_t, p04_o, "chacha-aad-v1", cc_key); });
+        chacha20_poly1305_protect_file_native(bin_src, p04_nv, "chacha-nat-v1", cc_key.key_hex);
+        chacha20_poly1305_unprotect_file_native(p04_nv, p04_no, "chacha-nat-v1", cc_key.key_hex);
+        assert_files_byte_identical(bin_src, p04_no, "04-Native-ChaCha20-Poly1305");
+        expect_error("Native ChaCha wrong AAD", fn() { chacha20_poly1305_unprotect_file_native(p04_nv, p04_no, "bad-aad", cc_key.key_hex); });
+        print(f"[ 4/14 PASS] RFC8439 ChaCha20-Poly1305   | {n04}B bin  | native Rust + pure-Kovrek GF(2^130-5)");
+
+        // --- [5/14] 128-bit Feistel CBC + PKCS#7 + EtM ---
+        let cbc_key = CbcBlockVaultKey("cbc-8r-01", 8);
+        let p05_v = path_join(work_dir, "05_cbc.vault");
+        let p05_o = path_join(work_dir, "05_cbc.bin");
+        let p05_t = path_join(work_dir, "05_cbc_t.vault");
+        created_files = concat(created_files, [p05_v, p05_o, p05_t]);
+        cbc_pkcs7_protect_file(bin_src, p05_v, cbc_key);
+        cbc_pkcs7_unprotect_file(p05_v, p05_o, cbc_key);
+        let n05 = assert_files_byte_identical(bin_src, p05_o, "05-CBC-PKCS7");
+        let j05 = json_parse(read_file(p05_v));
+        j05["ciphertext_hex"] = flip_one_hex_char(j05["ciphertext_hex"], len(j05["ciphertext_hex"]) - 4);
+        write_file(p05_t, json_stringify(j05));
+        expect_error("CBC padding oracle EtM guard", fn() { cbc_pkcs7_unprotect_file(p05_t, p05_o, cbc_key); });
+        print(f"[ 5/14 PASS] Feistel-CBC-PKCS7-EtM       | {n05}B bin  | 16B chaining + padding-oracle EtM blocked");
+
+        // --- [6/14] BigInt RSA-263 KEM + RSA-264 Signature ---
+        let rsa_p = kvc_rsa_params();
+        let rsa_enc = RsaPrivateKey("rsa-kem-263", "KEM", rsa_p["enc_p"], rsa_p["enc_q"], rsa_p["public_e"]);
+        let rsa_sig = RsaPrivateKey("rsa-sig-264", "SIGN", rsa_p["sign_p"], rsa_p["sign_q"], rsa_p["public_e"]);
+        let p06_v = path_join(work_dir, "06_rsa.vault");
+        let p06_o = path_join(work_dir, "06_rsa.bin");
+        let p06_t = path_join(work_dir, "06_rsa_t.vault");
+        created_files = concat(created_files, [p06_v, p06_o, p06_t]);
+        rsa_kem_sign_protect_file(bin_src, p06_v, rsa_enc.pub, rsa_sig);
+        rsa_kem_verify_unprotect_file(p06_v, p06_o, rsa_enc, rsa_sig.pub);
+        let n06 = assert_files_byte_identical(bin_src, p06_o, "06-RSA-KEM-SIG");
+        let j06 = json_parse(read_file(p06_v));
+        j06["signature_int"] = big_add(j06["signature_int"], "1");
+        write_file(p06_t, json_stringify(j06));
+        expect_error("RSA signature forge", fn() { rsa_kem_verify_unprotect_file(p06_t, p06_o, rsa_enc, rsa_sig.pub); });
+        print(f"[ 6/14 PASS] BigInt RSA-KEM + RSA-Sig    | {n06}B bin  | {rsa_enc.pub.modulus_bits}b KEM + {rsa_sig.pub.modulus_bits}b Verify-then-Decap");
+
+        // --- [7/14] secp256k1 Elliptic Curve ECIES + ECDSA ---
+        let ec_recv = EcPrivateKey("ec-recv-256k1");
+        let ec_sign = EcPrivateKey("ec-sign-256k1");
+        let p07_v = path_join(work_dir, "07_ecies.vault");
+        let p07_o = path_join(work_dir, "07_ecies.bin");
+        let p07_t = path_join(work_dir, "07_ecies_t.vault");
+        created_files = concat(created_files, [p07_v, p07_o, p07_t]);
+        ecies_protect_file(bin_src, p07_v, ec_recv.pub, ec_sign);
+        ecies_unprotect_file(p07_v, p07_o, ec_recv, ec_sign.pub);
+        let n07 = assert_files_byte_identical(bin_src, p07_o, "07-secp256k1");
+        expect_error("ECDSA invalid-curve point", fn() { ec_mul_affine("7", ["123", "456"]); });
+        let j07 = json_parse(read_file(p07_v));
+        j07["sig_s"] = big_add(j07["sig_s"], "1");
+        write_file(p07_t, json_stringify(j07));
+        expect_error("ECDSA tampered sig", fn() { ecies_unprotect_file(p07_t, p07_o, ec_recv, ec_sign.pub); });
+        print(f"[ 7/14 PASS] secp256k1 ECIES + ECDSA     | {n07}B bin  | Jacobian ECC + invalid-curve rejected");
+
+        // --- [8/14] Safe-Prime Ephemeral DH-KEM-256 ---
+        let dh_params = DhDomainParams("MODP-256-SAFE", kvc_dh_safe_p(), kvc_dh_subgroup_q(), kvc_dh_gen());
+        let dh_recv = DhStaticKeyPair("dh-recv", dh_params);
+        let p08_v1 = path_join(work_dir, "08_dh1.vault");
+        let p08_v2 = path_join(work_dir, "08_dh2.vault");
+        let p08_o = path_join(work_dir, "08_dh.txt");
+        created_files = concat(created_files, [p08_v1, p08_v2, p08_o]);
+        let dh1 = dh_kem_protect_file(text_src, p08_v1, "doc-v1", dh_recv);
+        let dh2 = dh_kem_protect_file(text_src, p08_v2, "doc-v1", dh_recv);
+        assert(dh1["ephem_pub"] != dh2["ephem_pub"], "DH forward secrecy requires distinct ephemeral shares");
+        dh_kem_unprotect_file(p08_v1, p08_o, "doc-v1", dh_recv);
+        let n08 = assert_files_byte_identical(text_src, p08_o, "08-DH-KEM");
+        expect_error("DH order-2 confinement", fn() { dh_params.validate_public_point(big_sub(kvc_dh_safe_p(), "1")); });
+        print(f"[ 8/14 PASS] Safe-Prime DH-KEM-256       | {n08}B txt  | forward secrecy + subgroup confinement");
+
+        // --- [9/14] Probabilistic ElGamal + Fiat-Shamir Schnorr ZKP ---
+        let eg_kp = ElGamalZkpKeyPair("elgamal-zkp-256");
+        let p09_v = path_join(work_dir, "09_elgamal.vault");
+        let p09_o = path_join(work_dir, "09_elgamal.bin");
+        created_files = concat(created_files, [p09_v, p09_o]);
+        let eg_c_a = eg_kp.encrypt_probabilistic_int("987654321");
+        let eg_c_b = eg_kp.encrypt_probabilistic_int("987654321");
+        assert(eg_c_a["c1"] != eg_c_b["c1"] and eg_c_a["c2"] != eg_c_b["c2"], "ElGamal must be probabilistic");
+        let j09 = elgamal_zkp_protect_file(bin_src, p09_v, eg_kp);
+        elgamal_zkp_unprotect_file(p09_v, p09_o, eg_kp, j09["zkp_t"], j09["zkp_s"]);
+        let n09 = assert_files_byte_identical(bin_src, p09_o, "09-ElGamal-ZKP");
+        expect_error("Schnorr forged ZKP", fn() { elgamal_zkp_unprotect_file(p09_v, p09_o, eg_kp, j09["zkp_t"], big_add(j09["zkp_s"], "1")); });
+        print(f"[ 9/14 PASS] ElGamal + Schnorr ZKP       | {n09}B bin  | randomized ciphertexts + non-interactive ZKP");
+
+        // --- [10/14] Post-Quantum Matrix-LWE-16 Lattice KEM ---
+        let pq_kp = LwePqKeyPair("lwe-pq-16");
+        let p10_v = path_join(work_dir, "10_lwe.vault");
+        let p10_o = path_join(work_dir, "10_lwe.bin");
+        let p10_t = path_join(work_dir, "10_lwe_t.vault");
+        created_files = concat(created_files, [p10_v, p10_o, p10_t]);
+        lwe_pq_protect_file(bin_src, p10_v, pq_kp);
+        lwe_pq_unprotect_file(p10_v, p10_o, pq_kp);
+        let n10 = assert_files_byte_identical(bin_src, p10_o, "10-PQ-LWE");
+        let j10 = json_parse(read_file(p10_v));
+        let chunks10 = j10["chunks"];
+        let chunk0 = chunks10[0];
+        let u0 = chunk0["u"];
+        u0[0] = (u0[0] + 20000) % kvc_lwe_q();
+        chunk0["u"] = u0;
+        chunks10[0] = chunk0;
+        j10["chunks"] = chunks10;
+        write_file(p10_t, json_stringify(j10));
+        expect_error("LWE FO lattice tamper", fn() { lwe_pq_unprotect_file(p10_t, p10_o, pq_kp); });
+        print(f"[10/14 PASS] Post-Quantum Matrix-LWE-16  | {n10}B bin  | zero-error lattice margin + FO rejection");
+
+        // --- [11/14] Shamir (3-of-5) GF(P257) + RFC 6238 TOTP 2FA ---
+        let sss_vault = ShamirTotpVault("sss-totp-26", 3, 5, ["alice", "bob", "carol", "dave", "erin"]);
+        let p11_v = path_join(work_dir, "11_sss.vault");
+        let p11_o = path_join(work_dir, "11_sss.bin");
+        created_files = concat(created_files, [p11_v, p11_o]);
+        let s_bundle = sss_vault.seal_with_shares(bin_src, p11_v);
+        let shares = s_bundle["shares"];
+        let ts = 1794748500;
+        let otp = totp_code(sss_vault.totp_seed, ts);
+        sss_vault.unseal_with_quorum_and_totp(p11_v, p11_o, [shares[0], shares[2], shares[4]], otp, ts);
+        let n11 = assert_files_byte_identical(bin_src, p11_o, "11-Shamir");
+        expect_error("Shamir < k quorum", fn() { sss_vault.unseal_with_quorum_and_totp(p11_v, p11_o, [shares[0], shares[1]], otp, ts); });
+        expect_error("Invalid TOTP", fn() { sss_vault.unseal_with_quorum_and_totp(p11_v, p11_o, [shares[0], shares[2], shares[4]], "000000", ts); });
+        print(f"[11/14 PASS] Shamir 3/5 + TOTP + @verify | {n11}B bin  | GF(P257) Lagrange + <k & bad 2FA rejected");
+
+        // --- [12/14] Quantum Optical BB84 Polarization + QBER Abort ---
+        let qchan = QuantumBb84Channel("bb84-fiber-01", 1100);
+        let p12_v = path_join(work_dir, "12_bb84.vault");
+        let p12_o = path_join(work_dir, "12_bb84.bin");
+        created_files = concat(created_files, [p12_v, p12_o]);
+        quantum_bb84_protect_and_unprotect(bin_src, p12_v, p12_o, qchan);
+        let n12 = assert_files_byte_identical(bin_src, p12_o, "12-Quantum-BB84");
+        expect_error("Quantum BB84 Eve 90% intercept abort", fn() { qchan.establish_sifted_key(512, 90); });
+        print(f"[12/14 PASS] Quantum BB84 Polarization   | {n12}B bin  | Born cos^2 collapse + Eve QBER>11% aborted");
+
+        // --- [13/14] Hamiltonian Symplectic Chaos + Wave CA + Entropy ---
+        let symp_key = SymplecticChaosKey("symp-ca-01", 32);
+        let p13_v = path_join(work_dir, "13_symp.vault");
+        let p13_o = path_join(work_dir, "13_symp.bin");
+        created_files = concat(created_files, [p13_v, p13_o]);
+        let s_env = symplectic_protect_file(bin_src, p13_v, symp_key);
+        symplectic_unprotect_file(p13_v, p13_o, symp_key);
+        let n13 = assert_files_byte_identical(bin_src, p13_o, "13-Symplectic-CA");
+        let ks_orig = symp_key.generate_phase_bytes(32, symp_key.q0, symp_key.p0, 777);
+        let ks_pert = symp_key.generate_phase_bytes(32, (symp_key.q0 + 1) % 4294967291, symp_key.p0, 777);
+        assert(not constant_time_equal(bytes_to_hex(ks_orig), bytes_to_hex(ks_pert)), "Butterfly divergence required");
+        let h_ent = floor(s_env["entropy_bits_per_byte"] * 100.0) / 100.0;
+        print(f"[13/14 PASS] Symplectic det=1 + Wave CA  | {n13}B bin  | H={h_ent} b/B + dQ=1 butterfly");
+
+        // --- [14/14] Multi-Recipient Post-Quantum Hybrid + Audit Chain ---
+        let p14_v = path_join(work_dir, "14_multi.vault");
+        let p14_o = path_join(work_dir, "14_multi.bin");
+        created_files = concat(created_files, [p14_v, p14_o]);
+        multi_recipient_protect_file(bin_src, p14_v, "multi-vault-master", rsa_enc.pub, ec_recv.pub, pq_kp);
+        multi_recipient_unseal_with_slot(p14_v, p14_o, "ecies", ec_recv);
+        let n14 = assert_files_byte_identical(bin_src, p14_o, "14-Multi-ECIES");
+        let final_env = multi_recipient_unseal_with_slot(p14_v, p14_o, "lwe", pq_kp);
+        assert_files_byte_identical(bin_src, p14_o, "14-Multi-LWE");
+        assert(verify_audit_chain(final_env["audit_chain"]) and len(final_env["audit_chain"]) == 3, "Audit chain length/hash ok");
+        print(f"[14/14 PASS] Multi-Slot PQ Hybrid+Chain  | {n14}B bin  | Passphrase+RSA+secp256k1+LWE & 3-entry chain");
+        print("ALL 14 ENCRYPTION PARADIGMS, KEY STRUCTURES, & SECURITY MECHANISMS PASSED.");
+    } catch suite_err {
+        throw suite_err;
+    } finally {
+        let i = 0;
+        while i < len(created_files) {
+            let p = created_files[i];
+            if path_exists(p) {
+                fs_remove(p);
+            }
+            i = i + 1;
+        }
+        if path_exists(work_dir) {
+            fs_remove(work_dir);
+        }
+    }
+}
+
+run_complete_crypto_suite();

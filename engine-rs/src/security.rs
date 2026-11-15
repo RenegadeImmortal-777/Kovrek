@@ -1,5 +1,6 @@
 //! Security primitives: CSPRNG tokens, HTML escaping, Base32/TOTP (RFC 6238),
-//! pure-Rust AES-256-GCM authenticated encryption, and SSRF URL/IP validation.
+//! HKDF-SHA256 (RFC 5869), pure-Rust AES-256-GCM, ChaCha20-Poly1305 (RFC 8439),
+//! and SSRF URL/IP validation.
 #![allow(clippy::needless_range_loop)]
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -9,7 +10,7 @@ use base64::Engine;
 use rand::RngCore;
 use rand::rngs::OsRng;
 
-use crate::value::{constant_time_strings_equal, pbkdf2_hmac_sha256_bytes};
+use crate::value::{constant_time_strings_equal, hmac_sha256_bytes, pbkdf2_hmac_sha256_bytes};
 
 fn zeroize_bytes(buf: &mut [u8]) {
     for b in buf.iter_mut() {
@@ -471,9 +472,9 @@ fn gctr(rk: &[[u8; 16]; 15], icb: [u8; 16], data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn derive_aes256_key_salted(secret: &str, salt: &[u8; 16]) -> [u8; 32] {
-    let mut domain_salt = Vec::with_capacity(PBKDF2_AES_DOMAIN.len() + salt.len());
-    domain_salt.extend_from_slice(PBKDF2_AES_DOMAIN);
+fn derive_salted_key_with_domain(domain: &[u8], secret: &str, salt: &[u8; 16]) -> [u8; 32] {
+    let mut domain_salt = Vec::with_capacity(domain.len() + salt.len());
+    domain_salt.extend_from_slice(domain);
     domain_salt.extend_from_slice(salt);
     let mut derived =
         pbkdf2_hmac_sha256_bytes(secret.as_bytes(), &domain_salt, PBKDF2_AES_ITERATIONS, 32);
@@ -481,6 +482,75 @@ fn derive_aes256_key_salted(secret: &str, salt: &[u8; 16]) -> [u8; 32] {
     key.copy_from_slice(&derived);
     zeroize_bytes(&mut derived);
     key
+}
+
+fn seal_salted_aead_token<F>(
+    version: &str,
+    domain: &[u8],
+    secret: &str,
+    plaintext: &str,
+    seal_fn: F,
+) -> Result<String, String>
+where
+    F: FnOnce(&[u8; 32], &[u8; 12], &[u8]) -> (Vec<u8>, [u8; 16]),
+{
+    if secret.is_empty() {
+        return Err("encryption key must not be empty".into());
+    }
+    let mut salt = [0u8; 16];
+    let mut iv = [0u8; 12];
+    OsRng.fill_bytes(&mut salt);
+    OsRng.fill_bytes(&mut iv);
+    let mut key = derive_salted_key_with_domain(domain, secret, &salt);
+    let (ct, tag) = seal_fn(&key, &iv, plaintext.as_bytes());
+    zeroize_bytes(&mut key);
+    Ok(format!(
+        "{version}:{}:{}:{}:{}",
+        bytes_to_hex(&salt),
+        bytes_to_hex(&iv),
+        bytes_to_hex(&tag),
+        bytes_to_hex(&ct)
+    ))
+}
+
+fn open_salted_aead_token<F>(
+    expected_version: &str,
+    cipher_label: &str,
+    domain: &[u8],
+    secret: &str,
+    token: &str,
+    open_fn: F,
+) -> Result<String, String>
+where
+    F: FnOnce(&[u8; 32], &[u8; 12], &[u8], &[u8; 16]) -> Result<Vec<u8>, String>,
+{
+    if secret.is_empty() {
+        return Err("decryption key must not be empty".into());
+    }
+    let parts: Vec<&str> = token.trim().split(':').collect();
+    if parts.len() != 5 || parts[0] != expected_version {
+        return Err(format!(
+            "invalid encrypted payload format (expected {expected_version}:salt:iv:tag:ciphertext)"
+        ));
+    }
+    let salt_vec = hex_to_bytes(parts[1])?;
+    let iv_vec = hex_to_bytes(parts[2])?;
+    let tag_vec = hex_to_bytes(parts[3])?;
+    let ct = hex_to_bytes(parts[4])?;
+    let salt: [u8; 16] = salt_vec
+        .try_into()
+        .map_err(|_| format!("invalid {cipher_label} salt length (expected 16 bytes)"))?;
+    let iv: [u8; 12] = iv_vec
+        .try_into()
+        .map_err(|_| format!("invalid {cipher_label} IV length (expected 12 bytes)"))?;
+    let tag: [u8; 16] = tag_vec
+        .try_into()
+        .map_err(|_| format!("invalid {cipher_label} tag length (expected 16 bytes)"))?;
+    let mut key = derive_salted_key_with_domain(domain, secret, &salt);
+    let pt_res = open_fn(&key, &iv, &ct, &tag);
+    zeroize_bytes(&mut key);
+    let pt = pt_res?;
+    String::from_utf8(pt).map_err(|e| format!("decrypted payload is not valid UTF-8: {e}"))
 }
 
 pub(crate) fn aes_gcm_seal_raw(
@@ -549,23 +619,9 @@ pub(crate) fn aes_gcm_encrypt_token(
     plaintext: &str,
     aad: &[u8],
 ) -> Result<String, String> {
-    if secret.is_empty() {
-        return Err("encryption key must not be empty".into());
-    }
-    let mut salt = [0u8; 16];
-    let mut iv = [0u8; 12];
-    OsRng.fill_bytes(&mut salt);
-    OsRng.fill_bytes(&mut iv);
-    let mut key = derive_aes256_key_salted(secret, &salt);
-    let (ct, tag) = aes_gcm_seal_raw(&key, &iv, aad, plaintext.as_bytes());
-    zeroize_bytes(&mut key);
-    Ok(format!(
-        "v2:{}:{}:{}:{}",
-        bytes_to_hex(&salt),
-        bytes_to_hex(&iv),
-        bytes_to_hex(&tag),
-        bytes_to_hex(&ct)
-    ))
+    seal_salted_aead_token("v2", PBKDF2_AES_DOMAIN, secret, plaintext, |key, iv, pt| {
+        aes_gcm_seal_raw(key, iv, aad, pt)
+    })
 }
 
 pub(crate) fn aes_gcm_decrypt_token(
@@ -573,31 +629,346 @@ pub(crate) fn aes_gcm_decrypt_token(
     token: &str,
     aad: &[u8],
 ) -> Result<String, String> {
-    if secret.is_empty() {
-        return Err("decryption key must not be empty".into());
+    open_salted_aead_token(
+        "v2",
+        "AES-GCM",
+        PBKDF2_AES_DOMAIN,
+        secret,
+        token,
+        |key, iv, ct, tag| aes_gcm_open_raw(key, iv, aad, ct, tag),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// HKDF-SHA256 (RFC 5869) & Pure-Rust ChaCha20-Poly1305 (RFC 8439)
+// ---------------------------------------------------------------------------
+
+const PBKDF2_CHACHA_DOMAIN: &[u8] = b"kovrek-chacha20-poly1305-v1\0";
+
+pub(crate) fn hkdf_sha256_bytes(
+    ikm: &[u8],
+    salt: &[u8],
+    info: &[u8],
+    out_len: usize,
+) -> Result<Vec<u8>, String> {
+    if out_len == 0 || out_len > 255 * 32 {
+        return Err("hkdf_sha256 length must be between 1 and 8160 bytes".into());
     }
-    let parts: Vec<&str> = token.trim().split(':').collect();
-    if parts.len() != 5 || parts[0] != "v2" {
-        return Err("invalid encrypted payload format (expected v2:salt:iv:tag:ciphertext)".into());
+    let effective_salt = if salt.is_empty() {
+        vec![0u8; 32]
+    } else {
+        salt.to_vec()
+    };
+    let mut prk = hmac_sha256_bytes(&effective_salt, ikm);
+    let blocks = out_len.div_ceil(32);
+    let mut okm = Vec::with_capacity(blocks * 32);
+    let mut prev: Vec<u8> = Vec::new();
+    for counter in 1..=blocks {
+        let mut msg = Vec::with_capacity(prev.len() + info.len() + 1);
+        msg.extend_from_slice(&prev);
+        msg.extend_from_slice(info);
+        msg.push(counter as u8);
+        let next = hmac_sha256_bytes(&prk, &msg);
+        zeroize_bytes(&mut msg);
+        okm.extend_from_slice(&next);
+        zeroize_bytes(&mut prev);
+        prev = next;
     }
-    let salt_vec = hex_to_bytes(parts[1])?;
-    let iv_vec = hex_to_bytes(parts[2])?;
-    let tag_vec = hex_to_bytes(parts[3])?;
-    let ct = hex_to_bytes(parts[4])?;
-    let salt: [u8; 16] = salt_vec
-        .try_into()
-        .map_err(|_| "invalid AES-GCM salt length (expected 16 bytes)".to_string())?;
-    let iv: [u8; 12] = iv_vec
-        .try_into()
-        .map_err(|_| "invalid AES-GCM IV length (expected 12 bytes)".to_string())?;
-    let tag: [u8; 16] = tag_vec
-        .try_into()
-        .map_err(|_| "invalid AES-GCM tag length (expected 16 bytes)".to_string())?;
-    let mut key = derive_aes256_key_salted(secret, &salt);
-    let pt_res = aes_gcm_open_raw(&key, &iv, aad, &ct, &tag);
-    zeroize_bytes(&mut key);
-    let pt = pt_res?;
-    String::from_utf8(pt).map_err(|e| format!("decrypted payload is not valid UTF-8: {e}"))
+    zeroize_bytes(&mut prev);
+    zeroize_bytes(&mut prk);
+    okm.truncate(out_len);
+    Ok(okm)
+}
+
+pub(crate) fn hkdf_sha256_hex(
+    ikm: &str,
+    salt: &str,
+    info: &str,
+    out_len: usize,
+) -> Result<String, String> {
+    let mut okm = hkdf_sha256_bytes(ikm.as_bytes(), salt.as_bytes(), info.as_bytes(), out_len)?;
+    let hex = bytes_to_hex(&okm);
+    zeroize_bytes(&mut okm);
+    Ok(hex)
+}
+
+#[inline(always)]
+fn chacha_quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] ^= state[a];
+    state[d] = state[d].rotate_left(16);
+
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] ^= state[c];
+    state[b] = state[b].rotate_left(12);
+
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] ^= state[a];
+    state[d] = state[d].rotate_left(8);
+
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] ^= state[c];
+    state[b] = state[b].rotate_left(7);
+}
+
+fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
+    let mut initial = [0u32; 16];
+    initial[0] = 0x6170_7865;
+    initial[1] = 0x3320_646e;
+    initial[2] = 0x7962_2d32;
+    initial[3] = 0x6b20_6574;
+    for i in 0..8 {
+        initial[4 + i] =
+            u32::from_le_bytes([key[i * 4], key[i * 4 + 1], key[i * 4 + 2], key[i * 4 + 3]]);
+    }
+    initial[12] = counter;
+    for i in 0..3 {
+        initial[13 + i] = u32::from_le_bytes([
+            nonce[i * 4],
+            nonce[i * 4 + 1],
+            nonce[i * 4 + 2],
+            nonce[i * 4 + 3],
+        ]);
+    }
+
+    let mut working = initial;
+    for _ in 0..10 {
+        chacha_quarter_round(&mut working, 0, 4, 8, 12);
+        chacha_quarter_round(&mut working, 1, 5, 9, 13);
+        chacha_quarter_round(&mut working, 2, 6, 10, 14);
+        chacha_quarter_round(&mut working, 3, 7, 11, 15);
+        chacha_quarter_round(&mut working, 0, 5, 10, 15);
+        chacha_quarter_round(&mut working, 1, 6, 11, 12);
+        chacha_quarter_round(&mut working, 2, 7, 8, 13);
+        chacha_quarter_round(&mut working, 3, 4, 9, 14);
+    }
+
+    let mut out = [0u8; 64];
+    for i in 0..16 {
+        let word = working[i].wrapping_add(initial[i]).to_le_bytes();
+        out[i * 4..i * 4 + 4].copy_from_slice(&word);
+    }
+    out
+}
+
+fn chacha20_xor(key: &[u8; 32], counter: u32, nonce: &[u8; 12], input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    for (idx, chunk) in input.chunks(64).enumerate() {
+        let mut ks = chacha20_block(key, counter.wrapping_add(idx as u32), nonce);
+        for (i, &byte) in chunk.iter().enumerate() {
+            out.push(byte ^ ks[i]);
+        }
+        zeroize_bytes(&mut ks);
+    }
+    out
+}
+
+fn poly1305_key_gen(key: &[u8; 32], nonce: &[u8; 12]) -> [u8; 32] {
+    let mut block = chacha20_block(key, 0, nonce);
+    let mut otk = [0u8; 32];
+    otk.copy_from_slice(&block[..32]);
+    zeroize_bytes(&mut block);
+    otk
+}
+
+fn poly1305_extract_limbs(b: &[u8; 17]) -> [u64; 5] {
+    [
+        u64::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])) & 0x3ff_ffff,
+        (u64::from(u32::from_le_bytes([b[3], b[4], b[5], b[6]])) >> 2) & 0x3ff_ffff,
+        (u64::from(u32::from_le_bytes([b[6], b[7], b[8], b[9]])) >> 4) & 0x3ff_ffff,
+        (u64::from(u32::from_le_bytes([b[9], b[10], b[11], b[12]])) >> 6) & 0x3ff_ffff,
+        (u64::from(u32::from_le_bytes([b[12], b[13], b[14], b[15]])) >> 8)
+            | (u64::from(b[16]) << 24),
+    ]
+}
+
+fn poly1305_mac(key: &[u8; 32], msg: &[u8]) -> [u8; 16] {
+    let mut r_bytes = [0u8; 17];
+    r_bytes[..16].copy_from_slice(&key[..16]);
+    r_bytes[3] &= 15;
+    r_bytes[7] &= 15;
+    r_bytes[11] &= 15;
+    r_bytes[15] &= 15;
+    r_bytes[4] &= 252;
+    r_bytes[8] &= 252;
+    r_bytes[12] &= 252;
+
+    let [r0, r1, r2, r3, r4] = poly1305_extract_limbs(&r_bytes);
+    zeroize_bytes(&mut r_bytes);
+
+    let s1 = r1 * 5;
+    let s2 = r2 * 5;
+    let s3 = r3 * 5;
+    let s4 = r4 * 5;
+
+    let (mut h0, mut h1, mut h2, mut h3, mut h4) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for chunk in msg.chunks(16) {
+        let mut block = [0u8; 17];
+        block[..chunk.len()].copy_from_slice(chunk);
+        block[chunk.len()] = 1;
+        let [m0, m1, m2, m3, m4] = poly1305_extract_limbs(&block);
+        h0 += m0;
+        h1 += m1;
+        h2 += m2;
+        h3 += m3;
+        h4 += m4;
+
+        let d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
+        let mut d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
+        let mut d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
+        let mut d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
+        let mut d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+
+        let mut c = d0 >> 26;
+        h0 = d0 & 0x3ff_ffff;
+        d1 += c;
+        c = d1 >> 26;
+        h1 = d1 & 0x3ff_ffff;
+        d2 += c;
+        c = d2 >> 26;
+        h2 = d2 & 0x3ff_ffff;
+        d3 += c;
+        c = d3 >> 26;
+        h3 = d3 & 0x3ff_ffff;
+        d4 += c;
+        c = d4 >> 26;
+        h4 = d4 & 0x3ff_ffff;
+        h0 += c * 5;
+        c = h0 >> 26;
+        h0 &= 0x3ff_ffff;
+        h1 += c;
+    }
+
+    let mut c = h1 >> 26;
+    h1 &= 0x3ff_ffff;
+    h2 += c;
+    c = h2 >> 26;
+    h2 &= 0x3ff_ffff;
+    h3 += c;
+    c = h3 >> 26;
+    h3 &= 0x3ff_ffff;
+    h4 += c;
+    c = h4 >> 26;
+    h4 &= 0x3ff_ffff;
+    h0 += c * 5;
+    c = h0 >> 26;
+    h0 &= 0x3ff_ffff;
+    h1 += c;
+
+    // Constant-time conditional reduction modulo 2^130 - 5.
+    let mut g0 = h0 + 5;
+    c = g0 >> 26;
+    g0 &= 0x3ff_ffff;
+    let mut g1 = h1 + c;
+    c = g1 >> 26;
+    g1 &= 0x3ff_ffff;
+    let mut g2 = h2 + c;
+    c = g2 >> 26;
+    g2 &= 0x3ff_ffff;
+    let mut g3 = h3 + c;
+    c = g3 >> 26;
+    g3 &= 0x3ff_ffff;
+    let g4_sum = h4 + c;
+    let mask = 0u64.wrapping_sub(g4_sum >> 26);
+    let g4 = g4_sum & 0x3ff_ffff;
+
+    h0 = (h0 & !mask) | (g0 & mask);
+    h1 = (h1 & !mask) | (g1 & mask);
+    h2 = (h2 & !mask) | (g2 & mask);
+    h3 = (h3 & !mask) | (g3 & mask);
+    h4 = (h4 & !mask) | (g4 & mask);
+
+    let mut w0 = (h0 | (h1 << 26)) & 0xffff_ffff;
+    let mut w1 = ((h1 >> 6) | (h2 << 20)) & 0xffff_ffff;
+    let mut w2 = ((h2 >> 12) | (h3 << 14)) & 0xffff_ffff;
+    let mut w3 = ((h3 >> 18) | (h4 << 8)) & 0xffff_ffff;
+
+    w0 += u64::from(u32::from_le_bytes([key[16], key[17], key[18], key[19]]));
+    w1 += u64::from(u32::from_le_bytes([key[20], key[21], key[22], key[23]])) + (w0 >> 32);
+    w0 &= 0xffff_ffff;
+    w2 += u64::from(u32::from_le_bytes([key[24], key[25], key[26], key[27]])) + (w1 >> 32);
+    w1 &= 0xffff_ffff;
+    w3 += u64::from(u32::from_le_bytes([key[28], key[29], key[30], key[31]])) + (w2 >> 32);
+    w2 &= 0xffff_ffff;
+    w3 &= 0xffff_ffff;
+
+    let mut tag = [0u8; 16];
+    tag[0..4].copy_from_slice(&(w0 as u32).to_le_bytes());
+    tag[4..8].copy_from_slice(&(w1 as u32).to_le_bytes());
+    tag[8..12].copy_from_slice(&(w2 as u32).to_le_bytes());
+    tag[12..16].copy_from_slice(&(w3 as u32).to_le_bytes());
+    tag
+}
+
+fn poly1305_aead_tag(otk: &[u8; 32], aad: &[u8], ciphertext: &[u8]) -> [u8; 16] {
+    let aad_pad = (16 - (aad.len() % 16)) % 16;
+    let ct_pad = (16 - (ciphertext.len() % 16)) % 16;
+    let mut mac_data = Vec::with_capacity(aad.len() + aad_pad + ciphertext.len() + ct_pad + 16);
+    mac_data.extend_from_slice(aad);
+    mac_data.resize(mac_data.len() + aad_pad, 0);
+    mac_data.extend_from_slice(ciphertext);
+    mac_data.resize(mac_data.len() + ct_pad, 0);
+    mac_data.extend_from_slice(&(aad.len() as u64).to_le_bytes());
+    mac_data.extend_from_slice(&(ciphertext.len() as u64).to_le_bytes());
+    poly1305_mac(otk, &mac_data)
+}
+
+pub(crate) fn chacha20_poly1305_seal_raw(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> (Vec<u8>, [u8; 16]) {
+    let mut otk = poly1305_key_gen(key, nonce);
+    let ct = chacha20_xor(key, 1, nonce, plaintext);
+    let tag = poly1305_aead_tag(&otk, aad, &ct);
+    zeroize_bytes(&mut otk);
+    (ct, tag)
+}
+
+pub(crate) fn chacha20_poly1305_open_raw(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8; 16],
+) -> Result<Vec<u8>, String> {
+    let mut otk = poly1305_key_gen(key, nonce);
+    let expected_tag = poly1305_aead_tag(&otk, aad, ciphertext);
+    zeroize_bytes(&mut otk);
+    if !constant_time_bytes_equal(&expected_tag, tag) {
+        return Err("decryption failed: authentication tag mismatch".into());
+    }
+    Ok(chacha20_xor(key, 1, nonce, ciphertext))
+}
+
+pub(crate) fn chacha20_poly1305_encrypt_token(
+    secret: &str,
+    plaintext: &str,
+    aad: &[u8],
+) -> Result<String, String> {
+    seal_salted_aead_token(
+        "cc20p1305",
+        PBKDF2_CHACHA_DOMAIN,
+        secret,
+        plaintext,
+        |key, nonce, pt| chacha20_poly1305_seal_raw(key, nonce, aad, pt),
+    )
+}
+
+pub(crate) fn chacha20_poly1305_decrypt_token(
+    secret: &str,
+    token: &str,
+    aad: &[u8],
+) -> Result<String, String> {
+    open_salted_aead_token(
+        "cc20p1305",
+        "ChaCha20-Poly1305",
+        PBKDF2_CHACHA_DOMAIN,
+        secret,
+        token,
+        |key, nonce, ct, tag| chacha20_poly1305_open_raw(key, nonce, aad, ct, tag),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,7 +1456,8 @@ mod tests {
         );
         assert!(aes_gcm_decrypt_token("wrong-key", &tok, b"ctx").is_err());
         assert!(aes_gcm_decrypt_token("super-secret-master-key", &tok, b"wrong-ctx").is_err());
-        let tampered = format!("{}0", &tok[..tok.len() - 1]);
+        let last_flip = if tok.ends_with('0') { '1' } else { '0' };
+        let tampered = format!("{}{last_flip}", &tok[..tok.len() - 1]);
         assert!(aes_gcm_decrypt_token("super-secret-master-key", &tampered, b"ctx").is_err());
         // Legacy unsalted 3-part tokens must be rejected
         assert!(aes_gcm_decrypt_token(
@@ -1162,5 +1534,76 @@ mod tests {
         assert!(validate_public_url("http://example.com/hook", false).is_err());
         let ok = validate_public_url("https://example.com/webhooks/helm", false).unwrap();
         assert_eq!(ok.origin, "https://example.com");
+    }
+
+    #[test]
+    fn hkdf_sha256_rfc5869_vectors() {
+        // RFC 5869 Appendix A.1 (basic test case)
+        let ikm1 = hex_to_bytes("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
+        let salt1 = hex_to_bytes("000102030405060708090a0b0c").unwrap();
+        let info1 = hex_to_bytes("f0f1f2f3f4f5f6f7f8f9").unwrap();
+        let okm1 = hkdf_sha256_bytes(&ikm1, &salt1, &info1, 42).unwrap();
+        assert_eq!(
+            bytes_to_hex(&okm1),
+            "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+        );
+
+        // RFC 5869 Appendix A.3 (empty salt and empty info)
+        let ikm3 = hex_to_bytes("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap();
+        let okm3 = hkdf_sha256_bytes(&ikm3, &[], &[], 42).unwrap();
+        assert_eq!(
+            bytes_to_hex(&okm3),
+            "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8"
+        );
+
+        assert!(hkdf_sha256_bytes(&ikm3, &[], &[], 0).is_err());
+        assert!(hkdf_sha256_bytes(&ikm3, &[], &[], 8161).is_err());
+    }
+
+    #[test]
+    fn chacha20_poly1305_rfc8439_vectors_and_token_tamper_checks() {
+        // RFC 8439 Section 2.8.2 AEAD official test vector
+        let key: [u8; 32] =
+            hex_to_bytes("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let nonce: [u8; 12] = hex_to_bytes("070000004041424344454647")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let aad = hex_to_bytes("50515253c0c1c2c3c4c5c6c7").unwrap();
+        let pt = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+
+        let (ct, tag) = chacha20_poly1305_seal_raw(&key, &nonce, &aad, pt);
+        assert_eq!(
+            bytes_to_hex(&ct),
+            "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6\
+3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36\
+92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc\
+3ff4def08e4b7a9de576d26586cec64b6116"
+        );
+        assert_eq!(bytes_to_hex(&tag), "1ae10b594f09e26a7e902ecbd0600691");
+        let opened = chacha20_poly1305_open_raw(&key, &nonce, &aad, &ct, &tag).unwrap();
+        assert_eq!(opened, pt);
+
+        // Salted PBKDF2 cc20p1305 token roundtrip & tamper/AAD/cross-cipher checks
+        let tok =
+            chacha20_poly1305_encrypt_token("vault-master", "secret-doc-payload", b"hdr").unwrap();
+        let tok2 =
+            chacha20_poly1305_encrypt_token("vault-master", "secret-doc-payload", b"hdr").unwrap();
+        assert!(tok.starts_with("cc20p1305:"));
+        assert_ne!(tok, tok2);
+        assert_eq!(
+            chacha20_poly1305_decrypt_token("vault-master", &tok, b"hdr").unwrap(),
+            "secret-doc-payload"
+        );
+        assert!(chacha20_poly1305_decrypt_token("wrong-master", &tok, b"hdr").is_err());
+        assert!(chacha20_poly1305_decrypt_token("vault-master", &tok, b"bad-hdr").is_err());
+        let last_flip = if tok.ends_with('0') { '1' } else { '0' };
+        let tampered = format!("{}{last_flip}", &tok[..tok.len() - 1]);
+        assert!(chacha20_poly1305_decrypt_token("vault-master", &tampered, b"hdr").is_err());
+        // Cross-cipher token downgrade/confusion must fail cleanly
+        assert!(aes_gcm_decrypt_token("vault-master", &tok, b"hdr").is_err());
     }
 }

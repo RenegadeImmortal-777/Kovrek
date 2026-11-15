@@ -1041,7 +1041,19 @@ mod tests {
     }
     #[test]
     fn security_primitives() {
-        let src = "let mac=hmac_sha256(\"key\",\"message\"); assert(len(mac)==64); let derived=pbkdf2_sha256(\"password\",\"salt\",100,32); assert(len(derived)==64); assert(constant_time_equal(mac,mac)); assert(not constant_time_equal(mac,derived));";
+        let src = r#"
+let mac=hmac_sha256("key","message");
+assert(len(mac)==64);
+let derived=pbkdf2_sha256("password","salt",100,32);
+assert(len(derived)==64);
+assert(constant_time_equal(mac,mac));
+assert(not constant_time_equal(mac,derived));
+let okm=hkdf_sha256("input-key-material","salt-value","kovrek:ctx",42);
+assert(len(okm)==84);
+let okm_default=hkdf_sha256("input-key-material","salt-value");
+assert(len(okm_default)==64);
+assert(not constant_time_equal(hmac_sha256(okm,"enc"),hmac_sha256(okm,"mac")));
+"#;
         assert!(run_source(src).is_ok());
     }
     #[cfg(feature = "native-services")]
@@ -4574,6 +4586,35 @@ assert(checked(7) == 14);
     }
 
     #[test]
+    fn statically_decorated_top_level_fns_register_in_vm_funcs() {
+        let src = r#"
+fn call_later_decorated(x: Int) -> Int {
+    let tok = mk_lease("v1");
+    linear_consume(tok);
+    return add_checked(x);
+}
+
+@linear
+fn mk_lease(id: String) -> String {
+    return "lease:" + id;
+}
+
+@verify
+fn add_checked(n: Int) -> Int {
+    requires(n >= 0, "n >= 0");
+    let res = n + 10;
+    ensures(res >= 10, "res >= 10");
+    return res;
+}
+
+let fref = add_checked;
+assert(call_later_decorated(5) == 15);
+assert(fref(7) == 17);
+"#;
+        assert_eq!(run_source(src), Ok(()));
+    }
+
+    #[test]
     fn capability_sandbox_and_reproducible_pkg_bundle() {
         let dir = env::temp_dir().join("kovrek_cap_repro_test");
         let _ = fs::remove_dir_all(&dir);
@@ -6950,6 +6991,18 @@ let bad_aad = false;
 try { aes_gcm_decrypt("master-key-123", sealed, "other"); } catch err { bad_aad = true; }
 assert(bad_aad);
 
+let cc_sealed = chacha20_poly1305_encrypt("master-key-123", "chacha-payload", "cc-aad");
+assert(chacha20_poly1305_decrypt("master-key-123", cc_sealed, "cc-aad") == "chacha-payload");
+let cc_bad_key = false;
+try { chacha20_poly1305_decrypt("wrong-key", cc_sealed, "cc-aad"); } catch err { cc_bad_key = true; }
+assert(cc_bad_key);
+let cc_bad_aad = false;
+try { chacha20_poly1305_decrypt("master-key-123", cc_sealed, "wrong-aad"); } catch err { cc_bad_aad = true; }
+assert(cc_bad_aad);
+let cross_cipher_err = false;
+try { aes_gcm_decrypt("master-key-123", cc_sealed, "cc-aad"); } catch err { cross_cipher_err = true; }
+assert(cross_cipher_err);
+
 assert(is_private_ip("127.0.0.1"));
 assert(is_private_ip("169.254.169.254"));
 assert(is_private_ip("10.0.0.8"));
@@ -7093,6 +7146,7 @@ assert(d["ok"]);
         let sec_src = fs::read_to_string(pkgs_root.join("kvsecurity/kvsecurity.kvr")).unwrap();
         let auth_src = fs::read_to_string(pkgs_root.join("kvauth/kvauth.kvr")).unwrap();
         let web_src = fs::read_to_string(pkgs_root.join("kvweb/kvweb.kvr")).unwrap();
+        let crypto_src = fs::read_to_string(pkgs_root.join("kvcrypto/kvcrypto.kvr")).unwrap();
 
         let test_src = format!(
             r##"
@@ -7146,6 +7200,32 @@ assert(client_ip({{"headers": {{"X-Forwarded-For": "203.0.113.5"}}}}, ["10.0.0.2
 "##
         );
         run_source(&web_test).expect("kvweb upgrade should execute cleanly");
+
+        let crypto_test = format!(
+            r##"
+{crypto_src}
+assert(len(sha256_text("kovrek")) == 64);
+let okm = kdf_hkdf_sha256("ikm-seed", "salt-val", "ctx", 32);
+assert(len(okm) == 64);
+let cc = chacha20_poly1305_seal(okm, "vault-secret", "aad-1");
+assert(chacha20_poly1305_open(okm, cc, "aad-1") == "vault-secret");
+let ec = EcPrivateKey("ec-unit");
+let sig = ec.sign_ecdsa(sha256("msg"));
+assert(ec.pub.verify_ecdsa(sha256("msg"), sig["r"], sig["s"]));
+let lwe = LwePqKeyPair("lwe-unit");
+let kem = lwe.encapsulate_128bit_seed();
+assert(constant_time_equal(kem["dek"], lwe.decapsulate_128bit_seed(kem["chunks"], kem["fo_commit"])));
+let ch = QuantumBb84Channel("bb84-unit", 1100);
+let sifted = ch.establish_sifted_key(256, 0);
+assert(sifted["qber"] <= 0.11);
+let sk = SymplecticChaosKey("symp-unit", 16);
+let diffused = sk.ca_wave_forward([1, 2, 3, 4, 5], 4);
+assert(sk.ca_wave_inverse(diffused, 4)[4] == 5);
+let ac = append_audit_event([], "tester", "INIT", "vault", "ok");
+assert(verify_audit_chain(ac));
+"##
+        );
+        run_source(&crypto_test).expect("kvcrypto upgrade should execute cleanly");
     }
 
     #[cfg(feature = "native-services")]

@@ -53,6 +53,30 @@ use crate::value::{
 use crate::value::{json_stringify_value, val_to_sql_value};
 use crate::vm::{Vm, collect_generator, generators, resume_generator};
 
+fn parse_aead_args<'a>(
+    fn_name: &str,
+    payload_label: &str,
+    a: &'a [Val],
+) -> Result<(&'a str, &'a str, &'a [u8]), String> {
+    if a.len() != 2 && a.len() != 3 {
+        return Err(format!("{fn_name} expects (key, {payload_label}[, aad])"));
+    }
+    let key = match &a[0] {
+        Val::Str(s) => s.as_str(),
+        _ => return Err(format!("{fn_name} key must be String")),
+    };
+    let payload = match &a[1] {
+        Val::Str(s) => s.as_str(),
+        _ => return Err(format!("{fn_name} {payload_label} must be String")),
+    };
+    let aad = match a.get(2) {
+        Some(Val::Str(s)) => s.as_bytes(),
+        Some(Val::Null) | None => b"",
+        _ => return Err(format!("{fn_name} aad must be String")),
+    };
+    Ok((key, payload, aad))
+}
+
 fn wasm_bytes_from_val(v: &Val) -> Result<Vec<u8>, String> {
     match v {
         Val::Str(path) => {
@@ -545,42 +569,50 @@ impl Vm {
                 Val::Bool(ok)
             }
             "aes_gcm_encrypt" => {
-                if a.len() != 2 && a.len() != 3 {
-                    return Err("aes_gcm_encrypt expects (key, plaintext[, aad])".into());
-                }
-                let key = match &a[0] {
-                    Val::Str(s) => s,
-                    _ => return Err("aes_gcm_encrypt key must be String".into()),
-                };
-                let plaintext = match &a[1] {
-                    Val::Str(s) => s,
-                    _ => return Err("aes_gcm_encrypt plaintext must be String".into()),
-                };
-                let aad = match a.get(2) {
-                    Some(Val::Str(s)) => s.as_bytes(),
-                    Some(Val::Null) | None => b"",
-                    _ => return Err("aes_gcm_encrypt aad must be String".into()),
-                };
+                let (key, plaintext, aad) = parse_aead_args("aes_gcm_encrypt", "plaintext", &a)?;
                 Val::Str(security::aes_gcm_encrypt_token(key, plaintext, aad)?)
             }
             "aes_gcm_decrypt" => {
-                if a.len() != 2 && a.len() != 3 {
-                    return Err("aes_gcm_decrypt expects (key, ciphertext[, aad])".into());
-                }
-                let key = match &a[0] {
-                    Val::Str(s) => s,
-                    _ => return Err("aes_gcm_decrypt key must be String".into()),
-                };
-                let token = match &a[1] {
-                    Val::Str(s) => s,
-                    _ => return Err("aes_gcm_decrypt ciphertext must be String".into()),
-                };
-                let aad = match a.get(2) {
-                    Some(Val::Str(s)) => s.as_bytes(),
-                    Some(Val::Null) | None => b"",
-                    _ => return Err("aes_gcm_decrypt aad must be String".into()),
-                };
+                let (key, token, aad) = parse_aead_args("aes_gcm_decrypt", "ciphertext", &a)?;
                 Val::Str(security::aes_gcm_decrypt_token(key, token, aad)?)
+            }
+            "chacha20_poly1305_encrypt" => {
+                let (key, plaintext, aad) =
+                    parse_aead_args("chacha20_poly1305_encrypt", "plaintext", &a)?;
+                Val::Str(security::chacha20_poly1305_encrypt_token(
+                    key, plaintext, aad,
+                )?)
+            }
+            "chacha20_poly1305_decrypt" => {
+                let (key, token, aad) =
+                    parse_aead_args("chacha20_poly1305_decrypt", "ciphertext", &a)?;
+                Val::Str(security::chacha20_poly1305_decrypt_token(key, token, aad)?)
+            }
+            "hkdf_sha256" => {
+                if !(2..=4).contains(&a.len()) {
+                    return Err("hkdf_sha256 expects (ikm, salt[, info[, bytes]])".into());
+                }
+                let ikm = match &a[0] {
+                    Val::Str(s) => s,
+                    _ => return Err("hkdf_sha256 ikm must be String".into()),
+                };
+                let salt = match &a[1] {
+                    Val::Str(s) => s,
+                    Val::Null => "",
+                    _ => return Err("hkdf_sha256 salt must be String or Null".into()),
+                };
+                let info = match a.get(2) {
+                    Some(Val::Str(s)) => s.as_str(),
+                    Some(Val::Null) | None => "",
+                    _ => return Err("hkdf_sha256 info must be String".into()),
+                };
+                let bytes = match a.get(3) {
+                    Some(v) if !matches!(v, Val::Null) => {
+                        checked_finite_range(v, "bytes", 1.0, 8160.0)? as usize
+                    }
+                    _ => 32usize,
+                };
+                Val::Str(security::hkdf_sha256_hex(ikm, salt, info, bytes)?)
             }
             "is_private_ip" => {
                 if a.len() != 1 {

@@ -1,1 +1,2096 @@
+// ============================================================================
+// kvcrypto: Kovrek Standard Cryptography Library Package
+// ============================================================================
+// Production-ready native bindings (AES-256-GCM, RFC 8439 ChaCha20-Poly1305,
+// RFC 5869 HKDF-SHA256, PBKDF2-SHA256, TOTP) paired with pure-Kovrek multi-
+// paradigm, asymmetric, zero-knowledge, post-quantum lattice, threshold, and
+// experimental physics file-protection primitives.
+//
+// Compatible with both file inclusion (`use "../packages/kvcrypto/kvcrypto.kvr";`)
+// and registry imports (`use "kvcrypto"; let crypto = import_package("kvcrypto");`).
+// ============================================================================
+
+// Backwards-compatible v0.1.0 hash helper.
 fn sha256_text(value: Any) -> String { return sha256(value); }
+
+// Native constant-time KDF and AEAD ergonomic wrappers.
+fn kdf_hkdf_sha256(ikm: String, salt: String, info: String, bytes: Int) -> String {
+    return hkdf_sha256(ikm, salt, info, bytes);
+}
+
+fn chacha20_poly1305_seal(key: String, plaintext: String, aad: String) -> String {
+    return chacha20_poly1305_encrypt(key, plaintext, aad);
+}
+
+fn chacha20_poly1305_open(key: String, ciphertext: String, aad: String) -> String {
+    return chacha20_poly1305_decrypt(key, ciphertext, aad);
+}
+
+// Domain-parameter getters (pure functions so `import_package("kvcrypto")` needs no global vars).
+fn kvc_pi() -> Float { return 3.141592653589793; }
+fn kvc_poly1305_p() -> String { return "1361129467683753853853498429727072845819"; }
+fn kvc_two_128() -> String { return "340282366920938463463374607431768211456"; }
+fn kvc_ec_p() -> String { return "115792089237316195423570985008687907853269984665640564039457584007908834671663"; }
+fn kvc_ec_n() -> String { return "115792089237316195423570985008687907852837564279074904382605163141518161494337"; }
+fn kvc_ec_gx() -> String { return "55066263022277343669578718895168534326250603453777594175500187360389116729240"; }
+fn kvc_ec_gy() -> String { return "32670510020758816978083085130507043184471273380659243275938904335757337482424"; }
+fn kvc_dh_safe_p() -> String { return "84508262694762188407502741780663027242268165184418559816932914558372238036439"; }
+fn kvc_dh_subgroup_q() -> String { return "42254131347381094203751370890331513621134082592209279908466457279186119018219"; }
+fn kvc_dh_gen() -> String { return "4"; }
+fn kvc_shamir_prime() -> String { return "216002797989028950377031785661019681371453390128832240401920025198725638979711"; }
+fn kvc_lwe_q() -> Int { return 65521; }
+fn kvc_symp_torus_m() -> Int { return 4294967291; }
+
+fn kvc_rsa_params() -> Map {
+    return {
+        "enc_p": "3243916439361711084366647157360175856309",
+        "enc_q": "4142311876164454965398303542089883544389",
+        "sign_p": "3794428445894728396907639422239536726531",
+        "sign_q": "4643841957825407235050064161156070227479",
+        "public_e": "65537"
+    };
+}
+
+// ----------------------------------------------------------------------------
+// 0. Static Contract Verification, @secret Taint Isolation, & @linear Leases
+// ----------------------------------------------------------------------------
+
+@verify
+fn verify_cryptographic_policy(pbkdf2_rounds: Int, quorum_k: Int, total_n: Int, nonce_bytes: Int) -> Int {
+    requires(pbkdf2_rounds >= 100000, "pbkdf2_rounds >= 100000");
+    requires(pbkdf2_rounds <= 500000, "pbkdf2_rounds <= 500000");
+    requires(quorum_k >= 2, "quorum_k >= 2");
+    requires(quorum_k <= 8, "quorum_k <= 8");
+    requires(total_n >= quorum_k, "total_n >= quorum_k");
+    requires(total_n <= 16, "total_n <= 16");
+    requires(nonce_bytes >= 16, "nonce_bytes >= 16");
+    requires(nonce_bytes <= 64, "nonce_bytes <= 64");
+
+    let score = pbkdf2_rounds + quorum_k * 1000 + total_n * 10 + nonce_bytes;
+    ensures(score >= 100000, "security policy margin >= 100000");
+    return score;
+}
+
+@verify
+fn verify_physics_security_params(max_qber_bps: Int, symp_burn_kicks: Int, lwe_dim: Int) -> Int {
+    // QBER ceiling <= 1100 bps (11% Shor-Preskill BB84 bound), burn kicks >= 16, LWE n >= 16.
+    requires(max_qber_bps >= 100, "max_qber_bps >= 100");
+    requires(max_qber_bps <= 1100, "max_qber_bps <= 1100");
+    requires(symp_burn_kicks >= 16, "symp_burn_kicks >= 16");
+    requires(symp_burn_kicks <= 128, "symp_burn_kicks <= 128");
+    requires(lwe_dim >= 16, "lwe_dim >= 16");
+    requires(lwe_dim <= 64, "lwe_dim <= 64");
+
+    let composite = symp_burn_kicks * 100 + lwe_dim * 10 + (1200 - max_qber_bps);
+    ensures(composite >= 1860, "physics & PQ safety composite >= 1860");
+    return composite;
+}
+
+@secret
+fn load_hsm_root_entropy() -> String {
+    return "hsm-root:" + random_bytes_hex(32);
+}
+
+@linear
+fn acquire_decrypt_lease(vault_id: String, method: String) -> String {
+    return vault_id + "|" + method + "|" + random_token(16);
+}
+
+// ----------------------------------------------------------------------------
+// 1. Exact Byte, 32-Bit ARX, BigInt Modular, & Test Harness Utilities
+// ----------------------------------------------------------------------------
+
+fn byte_xor(a: Int, b: Int) -> Int {
+    // Exact constant-iteration 8-bit XOR (zero module-global lookups for import_package portability).
+    let acc = 0;
+    let bit = 1;
+    let i = 0;
+    while i < 8 {
+        if (a % 2) != (b % 2) {
+            acc = acc + bit;
+        }
+        a = floor(a / 2);
+        b = floor(b / 2);
+        bit = bit * 2;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn xor_byte_lists(a: List, b: List) -> List {
+    assert(len(a) == len(b), "xor_byte_lists length mismatch");
+    let out = [];
+    let i = 0;
+    let n = len(a);
+    while i < n {
+        out = append(out, byte_xor(a[i], b[i]));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn u32_add(a: Int, b: Int) -> Int {
+    return (a + b) % 4294967296;
+}
+
+fn u32_xor(a: Int, b: Int) -> Int {
+    let a0 = a % 256;
+    let a1 = floor(a / 256) % 256;
+    let a2 = floor(a / 65536) % 256;
+    let a3 = floor(a / 16777216) % 256;
+    let b0 = b % 256;
+    let b1 = floor(b / 256) % 256;
+    let b2 = floor(b / 65536) % 256;
+    let b3 = floor(b / 16777216) % 256;
+    return byte_xor(a0, b0)
+        + byte_xor(a1, b1) * 256
+        + byte_xor(a2, b2) * 65536
+        + byte_xor(a3, b3) * 16777216;
+}
+
+fn pow2_int(k: Int) -> Int {
+    let acc = 1;
+    let i = 0;
+    while i < k {
+        acc = acc * 2;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn u32_rotl(x: Int, bits: Int) -> Int {
+    // Splits high/low bits cleanly so intermediates never exceed 2^32 < 2^53.
+    let shift_dn = pow2_int(32 - bits);
+    let shift_up = pow2_int(bits);
+    if shift_dn != 0 {
+        let top = floor(x / shift_dn);
+        let bot = x % shift_dn;
+        return bot * shift_up + top;
+    }
+    return x;
+}
+
+fn le_bytes_to_u32(bs: List, offset: Int) -> Int {
+    return bs[offset]
+        + bs[offset + 1] * 256
+        + bs[offset + 2] * 65536
+        + bs[offset + 3] * 16777216;
+}
+
+fn u32_to_le_bytes(w: Int) -> List {
+    return [
+        w % 256,
+        floor(w / 256) % 256,
+        floor(w / 65536) % 256,
+        floor(w / 16777216) % 256
+    ];
+}
+
+fn bytes_to_hex(bytes: List) -> String {
+    let hex_digits = "0123456789abcdef";
+    let parts = [];
+    let i = 0;
+    let n = len(bytes);
+    while i < n {
+        let b = bytes[i];
+        let hi = floor(b / 16);
+        let lo = b % 16;
+        parts = append(parts, slice(hex_digits, hi, hi + 1) + slice(hex_digits, lo, lo + 1));
+        i = i + 1;
+    }
+    return join(parts, "");
+}
+
+fn hex_to_bytes(hex_str: String) -> List {
+    let hex_digits = "0123456789abcdef";
+    let s = lower(hex_str);
+    let n = len(s);
+    assert(n % 2 == 0, "hex_to_bytes requires even-length hex string");
+    let out = [];
+    let i = 0;
+    while i < n {
+        let hi = index_of(hex_digits, slice(s, i, i + 1));
+        let lo = index_of(hex_digits, slice(s, i + 1, i + 2));
+        assert(hi != null and lo != null, "hex_to_bytes encountered non-hex character");
+        out = append(out, hi * 16 + lo);
+        i = i + 2;
+    }
+    return out;
+}
+
+fn dec_str_to_int(s: String) -> Int {
+    let dec_digits = "0123456789";
+    let acc = 0;
+    let i = 0;
+    let n = len(s);
+    while i < n {
+        let d = index_of(dec_digits, slice(s, i, i + 1));
+        assert(d != null, "dec_str_to_int expects unsigned decimal digits");
+        acc = acc * 10 + d;
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn le_bytes_to_bigint(bs: List, append_high_one: Bool) -> String {
+    let acc = "0";
+    if append_high_one {
+        acc = "1";
+    }
+    let i = len(bs) - 1;
+    while i >= 0 {
+        acc = big_add(big_mul(acc, "256"), str(bs[i]));
+        i = i - 1;
+    }
+    return acc;
+}
+
+fn bigint_to_le_bytes(val: String, byte_len: Int) -> List {
+    let cur = val;
+    let out = [];
+    let i = 0;
+    while i < byte_len {
+        let qr = big_divmod(cur, "256");
+        cur = qr[0];
+        out = append(out, dec_str_to_int(qr[1]));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn read_file_bytes_hex(path: String) -> Map {
+    let raw = fs_read_bytes(path);
+    let hex_data = bytes_to_hex(raw);
+    return {
+        "bytes": raw,
+        "hex": hex_data,
+        "len": len(raw),
+        "sha256": sha256(hex_data)
+    };
+}
+
+fn write_hex_to_file(path: String, hex_data: String) -> Int {
+    return fs_write_bytes(path, hex_to_bytes(hex_data));
+}
+
+fn big_mod_pos(x: String, m: String) -> String {
+    let r = big_rem(x, m);
+    if big_cmp(r, "0") < 0 {
+        r = big_add(r, m);
+    }
+    return r;
+}
+
+fn big_modinv(a: String, m: String) -> String {
+    let a0 = big_mod_pos(a, m);
+    let t = "0";
+    let newt = "1";
+    let r = m;
+    let newr = a0;
+    while big_cmp(newr, "0") != 0 {
+        let qr = big_divmod(r, newr);
+        let q = qr[0];
+        let rem = qr[1];
+        let next_t = big_sub(t, big_mul(q, newt));
+        t = newt;
+        newt = next_t;
+        r = newr;
+        newr = rem;
+    }
+    assert(r == "1", "big_modinv requires gcd(a, m) == 1");
+    return big_mod_pos(t, m);
+}
+
+fn big_to_fixed_hex(val: String, hex_len: Int) -> String {
+    let cur = val;
+    let rev_chars = [];
+    let i = 0;
+    while i < hex_len {
+        let qr = big_divmod(cur, "16");
+        cur = qr[0];
+        let ni = dec_str_to_int(qr[1]);
+        rev_chars = append(rev_chars, slice("0123456789abcdef", ni, ni + 1));
+        i = i + 1;
+    }
+    assert(cur == "0", "BigInt exceeds target fixed hex width");
+    let parts = [];
+    let j = len(rev_chars) - 1;
+    while j >= 0 {
+        parts = append(parts, rev_chars[j]);
+        j = j - 1;
+    }
+    return join(parts, "");
+}
+
+fn flip_one_hex_char(s: String, index: Int) -> String {
+    let ch = slice(s, index, index + 1);
+    let repl = "0";
+    if ch == "0" {
+        repl = "1";
+    }
+    return slice(s, 0, index) + repl + slice(s, index + 1, len(s));
+}
+
+fn expect_error(label: String, thunk) -> String {
+    let rejected = false;
+    let reason = "";
+    try {
+        thunk();
+    } catch err {
+        rejected = true;
+        reason = str(err);
+    }
+    assert(rejected, "Security check failed: expected rejection for " + label);
+    return reason;
+}
+
+// ----------------------------------------------------------------------------
+// Method 1: Symmetric AEAD (AES-256-GCM + AAD Header Binding)
+// ----------------------------------------------------------------------------
+
+class AeadFileKey {
+    fn init(self, key_id: String, policy_version: Int) -> Void {
+        self.key_id = key_id;
+        self.algorithm = "AES-256-GCM";
+        self.master_key_hex = random_bytes_hex(32);
+        self.key_fingerprint = slice(sha256("AEAD-FP|" + self.master_key_hex), 0, 16);
+        self.policy_version = policy_version;
+    }
+
+    fn build_aad(self, logical_name: String, byte_len: Int, plain_sha256: String) -> String {
+        return "AEAD-v" + str(self.policy_version) + "|" + self.key_id + "|" + logical_name + "|" + str(byte_len) + "|" + plain_sha256;
+    }
+}
+
+fn aead_protect_file(src_path: String, vault_path: String, logical_name: String, key: AeadFileKey) -> Map {
+    let info = read_file_bytes_hex(src_path);
+    let aad = key.build_aad(logical_name, info["len"], info["sha256"]);
+    let env = {
+        "method": "AES-256-GCM",
+        "key_id": key.key_id,
+        "key_fingerprint": key.key_fingerprint,
+        "logical_name": logical_name,
+        "plaintext_len": info["len"],
+        "plaintext_sha256": info["sha256"],
+        "aad": aad,
+        "ciphertext": aes_gcm_encrypt(key.master_key_hex, info["hex"], aad)
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn aead_unprotect_file(vault_path: String, out_path: String, expected_logical_name: String, key: AeadFileKey) -> Int {
+    let env = json_parse(read_file(vault_path));
+    assert(env["key_id"] == key.key_id, "AEAD key_id mismatch");
+    let expected_aad = key.build_aad(expected_logical_name, env["plaintext_len"], env["plaintext_sha256"]);
+    assert(constant_time_equal(env["aad"], expected_aad), "AEAD AAD context binding mismatch");
+
+    let lease = acquire_decrypt_lease(env["key_id"], "AES-256-GCM");
+    linear_consume(lease);
+
+    let recovered_hex = aes_gcm_decrypt(key.master_key_hex, env["ciphertext"], expected_aad);
+    assert(constant_time_equal(sha256(recovered_hex), env["plaintext_sha256"]), "AEAD digest mismatch");
+    return write_hex_to_file(out_path, recovered_hex);
+}
+
+// ----------------------------------------------------------------------------
+// Method 2: Symmetric Stream + Split Keys (SHA256-CTR-EtM + RFC 5869 HKDF)
+// ----------------------------------------------------------------------------
+
+class StreamSplitKey {
+    fn init(self, key_id: String) -> Void {
+        let seed = random_bytes_hex(32);
+        let salt = random_bytes_hex(16);
+        self.key_id = key_id;
+        self.enc_key_hex = hkdf_sha256(seed, salt, "domain:ctr:enc:" + key_id, 32);
+        self.mac_key_hex = hkdf_sha256(seed, salt, "domain:ctr:mac:" + key_id, 32);
+        assert(not constant_time_equal(self.enc_key_hex, self.mac_key_hex), "Split keys must be distinct");
+    }
+
+    fn keystream_xor_bytes(self, input_bytes: List, nonce_hex: String) -> List {
+        let total = len(input_bytes);
+        let out = [];
+        let block_idx = 0;
+        let pos = 0;
+        while pos < total {
+            let ks_block = hex_to_bytes(sha256("CTR-KS|" + self.enc_key_hex + "|" + nonce_hex + "|" + str(block_idx)));
+            let k = 0;
+            while k < 32 and pos < total {
+                out = append(out, byte_xor(input_bytes[pos], ks_block[k]));
+                pos = pos + 1;
+                k = k + 1;
+            }
+            block_idx = block_idx + 1;
+        }
+        return out;
+    }
+
+    fn compute_etm_tag(self, logical_name: String, nonce_hex: String, ct_hex: String) -> String {
+        return hmac_sha256(self.mac_key_hex, "ETM-v1|" + self.key_id + "|" + logical_name + "|" + nonce_hex + "|" + ct_hex);
+    }
+}
+
+fn stream_etm_protect_file(src_path: String, vault_path: String, logical_name: String, key: StreamSplitKey) -> Map {
+    let raw = fs_read_bytes(src_path);
+    let nonce_hex = random_bytes_hex(16);
+    let ct_hex = bytes_to_hex(key.keystream_xor_bytes(raw, nonce_hex));
+    let env = {
+        "method": "SHA256-CTR-EtM",
+        "key_id": key.key_id,
+        "nonce_hex": nonce_hex,
+        "plaintext_len": len(raw),
+        "ciphertext_hex": ct_hex,
+        "mac_tag": key.compute_etm_tag(logical_name, nonce_hex, ct_hex)
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn stream_etm_unprotect_file(vault_path: String, out_path: String, expected_logical_name: String, key: StreamSplitKey) -> Int {
+    let env = json_parse(read_file(vault_path));
+    assert(env["key_id"] == key.key_id, "Stream key_id mismatch");
+    let expected_tag = key.compute_etm_tag(expected_logical_name, env["nonce_hex"], env["ciphertext_hex"]);
+    assert(constant_time_equal(expected_tag, env["mac_tag"]), "EtM HMAC failed before decrypt");
+
+    let lease = acquire_decrypt_lease(env["key_id"], "SHA256-CTR-EtM");
+    linear_consume(lease);
+
+    return fs_write_bytes(out_path, key.keystream_xor_bytes(hex_to_bytes(env["ciphertext_hex"]), env["nonce_hex"]));
+}
+
+// ----------------------------------------------------------------------------
+// Method 3: PBKDF2-SHA256 KEK -> DEK Key Wrapping + Epoch Passphrase Rotation
+// ----------------------------------------------------------------------------
+
+class PassphraseKekPolicy {
+    fn init(self, policy_id: String, iterations: Int) -> Void {
+        assert(iterations >= 100000, "KEK PBKDF2 rounds below security floor");
+        self.policy_id = policy_id;
+        self.iterations = iterations;
+        self.salt_hex = random_bytes_hex(16);
+    }
+}
+
+fn keywrap_protect_file(src_path: String, vault_path: String, passphrase: String, pol: PassphraseKekPolicy) -> Map {
+    let info = read_file_bytes_hex(src_path);
+    let dek_hex = random_bytes_hex(32);
+    let kek_hex = pbkdf2_sha256(passphrase, pol.salt_hex, pol.iterations, 32);
+    let wrap_aad = "KW-WRAP|v1|" + pol.policy_id + "|epoch-1";
+    let payload_aad = "KW-DATA|v1|" + pol.policy_id + "|" + info["sha256"];
+    let env = {
+        "method": "PBKDF2-KEK-WRAP-AES-GCM",
+        "policy_id": pol.policy_id,
+        "rotation_epoch": 1,
+        "kdf_iterations": pol.iterations,
+        "kek_salt_hex": pol.salt_hex,
+        "wrap_aad": wrap_aad,
+        "wrapped_dek": aes_gcm_encrypt(kek_hex, dek_hex, wrap_aad),
+        "payload_aad": payload_aad,
+        "payload_ct": aes_gcm_encrypt(dek_hex, info["hex"], payload_aad),
+        "plaintext_sha256": info["sha256"]
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn keywrap_rotate_passphrase(vault_path: String, old_pass: String, new_pass: String, new_iters: Int) -> Map {
+    let env = json_parse(read_file(vault_path));
+    let old_kek = pbkdf2_sha256(old_pass, env["kek_salt_hex"], env["kdf_iterations"], 32);
+    let dek_hex = aes_gcm_decrypt(old_kek, env["wrapped_dek"], env["wrap_aad"]);
+
+    let next_epoch = env["rotation_epoch"] + 1;
+    let new_salt = random_bytes_hex(16);
+    let new_kek = pbkdf2_sha256(new_pass, new_salt, new_iters, 32);
+    let next_wrap_aad = "KW-WRAP|v1|" + env["policy_id"] + "|epoch-" + str(next_epoch);
+    let rotated = {
+        "method": env["method"],
+        "policy_id": env["policy_id"],
+        "rotation_epoch": next_epoch,
+        "kdf_iterations": new_iters,
+        "kek_salt_hex": new_salt,
+        "wrap_aad": next_wrap_aad,
+        "wrapped_dek": aes_gcm_encrypt(new_kek, dek_hex, next_wrap_aad),
+        "payload_aad": env["payload_aad"],
+        "payload_ct": env["payload_ct"],
+        "plaintext_sha256": env["plaintext_sha256"]
+    };
+    write_file(vault_path, json_stringify(rotated));
+    return rotated;
+}
+
+fn keywrap_unprotect_file(vault_path: String, out_path: String, passphrase: String) -> Int {
+    let env = json_parse(read_file(vault_path));
+    let kek = pbkdf2_sha256(passphrase, env["kek_salt_hex"], env["kdf_iterations"], 32);
+    let dek_hex = aes_gcm_decrypt(kek, env["wrapped_dek"], env["wrap_aad"]);
+
+    let lease = acquire_decrypt_lease(env["policy_id"], "PBKDF2-KEK-WRAP");
+    linear_consume(lease);
+
+    let plain_hex = aes_gcm_decrypt(dek_hex, env["payload_ct"], env["payload_aad"]);
+    assert(constant_time_equal(sha256(plain_hex), env["plaintext_sha256"]), "KEK-Wrap digest mismatch");
+    return write_hex_to_file(out_path, plain_hex);
+}
+
+// ----------------------------------------------------------------------------
+// Method 4: RFC 8439 ChaCha20 ARX Stream Cipher + Poly1305 GF(2^130 - 5) MAC
+// ----------------------------------------------------------------------------
+
+fn chacha_quarter_round(st: List, a: Int, b: Int, c: Int, d: Int) -> List {
+    let va = u32_add(st[a], st[b]);
+    let vd = u32_rotl(u32_xor(st[d], va), 16);
+    let vc = u32_add(st[c], vd);
+    let vb = u32_rotl(u32_xor(st[b], vc), 12);
+    va = u32_add(va, vb);
+    vd = u32_rotl(u32_xor(vd, va), 8);
+    vc = u32_add(vc, vd);
+    vb = u32_rotl(u32_xor(vb, vc), 7);
+    st[a] = va;
+    st[b] = vb;
+    st[c] = vc;
+    st[d] = vd;
+    return st;
+}
+
+fn chacha20_block_bytes(key_bytes: List, counter: Int, nonce_bytes: List) -> List {
+    assert(len(key_bytes) == 32 and len(nonce_bytes) == 12, "ChaCha20 expects 32B key + 12B nonce");
+    let init_st = [
+        1634760805, 857760878, 2036477234, 1797285236,
+        le_bytes_to_u32(key_bytes, 0), le_bytes_to_u32(key_bytes, 4),
+        le_bytes_to_u32(key_bytes, 8), le_bytes_to_u32(key_bytes, 12),
+        le_bytes_to_u32(key_bytes, 16), le_bytes_to_u32(key_bytes, 20),
+        le_bytes_to_u32(key_bytes, 24), le_bytes_to_u32(key_bytes, 28),
+        counter,
+        le_bytes_to_u32(nonce_bytes, 0), le_bytes_to_u32(nonce_bytes, 4), le_bytes_to_u32(nonce_bytes, 8)
+    ];
+    let x = [];
+    let idx = 0;
+    while idx < 16 {
+        x = append(x, init_st[idx]);
+        idx = idx + 1;
+    }
+    let dbl = 0;
+    while dbl < 10 {
+        x = chacha_quarter_round(x, 0, 4, 8, 12);
+        x = chacha_quarter_round(x, 1, 5, 9, 13);
+        x = chacha_quarter_round(x, 2, 6, 10, 14);
+        x = chacha_quarter_round(x, 3, 7, 11, 15);
+        x = chacha_quarter_round(x, 0, 5, 10, 15);
+        x = chacha_quarter_round(x, 1, 6, 11, 12);
+        x = chacha_quarter_round(x, 2, 7, 8, 13);
+        x = chacha_quarter_round(x, 3, 4, 9, 14);
+        dbl = dbl + 1;
+    }
+    let out = [];
+    let i = 0;
+    while i < 16 {
+        let word = u32_add(x[i], init_st[i]);
+        let wb = u32_to_le_bytes(word);
+        out = append(out, wb[0]);
+        out = append(out, wb[1]);
+        out = append(out, wb[2]);
+        out = append(out, wb[3]);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn poly1305_mac_bytes(otk32: List, aad_bytes: List, ct_bytes: List) -> String {
+    // RFC 8439 Poly1305 over GF(2^130 - 5) with clamped one-time r and additive s.
+    let r = [
+        otk32[0], otk32[1], otk32[2], otk32[3] % 16,
+        otk32[4] - (otk32[4] % 4), otk32[5], otk32[6], otk32[7] % 16,
+        otk32[8] - (otk32[8] % 4), otk32[9], otk32[10], otk32[11] % 16,
+        otk32[12] - (otk32[12] % 4), otk32[13], otk32[14], otk32[15] % 16
+    ];
+    let s = slice(otk32, 16, 32);
+    let r_big = le_bytes_to_bigint(r, false);
+    let s_big = le_bytes_to_bigint(s, false);
+
+    // Construct padded RFC 8439 authenticated byte stream.
+    let mac_data = [];
+    let i = 0;
+    while i < len(aad_bytes) {
+        mac_data = append(mac_data, aad_bytes[i]);
+        i = i + 1;
+    }
+    while len(mac_data) % 16 != 0 {
+        mac_data = append(mac_data, 0);
+    }
+    i = 0;
+    while i < len(ct_bytes) {
+        mac_data = append(mac_data, ct_bytes[i]);
+        i = i + 1;
+    }
+    while len(mac_data) % 16 != 0 {
+        mac_data = append(mac_data, 0);
+    }
+    let aad_len_bytes = bigint_to_le_bytes(str(len(aad_bytes)), 8);
+    let ct_len_bytes = bigint_to_le_bytes(str(len(ct_bytes)), 8);
+    i = 0;
+    while i < 8 {
+        mac_data = append(mac_data, aad_len_bytes[i]);
+        i = i + 1;
+    }
+    i = 0;
+    while i < 8 {
+        mac_data = append(mac_data, ct_len_bytes[i]);
+        i = i + 1;
+    }
+
+    let acc = "0";
+    let pos = 0;
+    while pos < len(mac_data) {
+        let end = pos + 16;
+        if end > len(mac_data) {
+            end = len(mac_data);
+        }
+        let blk_big = le_bytes_to_bigint(slice(mac_data, pos, end), true);
+        acc = big_rem(big_mul(big_add(acc, blk_big), r_big), kvc_poly1305_p());
+        pos = end;
+    }
+    let tag_big = big_rem(big_add(acc, s_big), kvc_two_128());
+    return bytes_to_hex(bigint_to_le_bytes(tag_big, 16));
+}
+
+class ChaChaPolyKey {
+    fn init(self, key_id: String) -> Void {
+        // Self-verify RFC 8439 section 2.1.1 quarter-round test vector at key init.
+        let tv = chacha_quarter_round([286331153, 16909060, 2609737539, 19088743], 0, 1, 2, 3);
+        assert(tv[0] == 3928658676 and tv[1] == 3407673550 and tv[2] == 1166100270 and tv[3] == 1484899515, "RFC 8439 quarter-round self-test failed");
+
+        self.key_id = key_id;
+        self.key_hex = random_bytes_hex(32);
+    }
+
+    fn xor_stream(self, input_bytes: List, nonce_bytes: List) -> List {
+        let key_bytes = hex_to_bytes(self.key_hex);
+        let out = [];
+        let ctr = 1;
+        let pos = 0;
+        let n = len(input_bytes);
+        while pos < n {
+            let block = chacha20_block_bytes(key_bytes, ctr, nonce_bytes);
+            let k = 0;
+            while k < 64 and pos < n {
+                out = append(out, byte_xor(input_bytes[pos], block[k]));
+                pos = pos + 1;
+                k = k + 1;
+            }
+            ctr = ctr + 1;
+        }
+        return out;
+    }
+}
+
+fn chacha_poly_protect_file(src_path: String, vault_path: String, aad_text: String, key: ChaChaPolyKey) -> Map {
+    let raw = fs_read_bytes(src_path);
+    let nonce_hex = random_bytes_hex(12);
+    let nonce_bytes = hex_to_bytes(nonce_hex);
+    let key_bytes = hex_to_bytes(key.key_hex);
+    let otk = slice(chacha20_block_bytes(key_bytes, 0, nonce_bytes), 0, 32);
+    let ct_bytes = key.xor_stream(raw, nonce_bytes);
+    let tag_hex = poly1305_mac_bytes(otk, hex_to_bytes(bytes_to_hex_str(aad_text)), ct_bytes);
+
+    let env = {
+        "method": "RFC8439-CHACHA20-POLY1305",
+        "key_id": key.key_id,
+        "nonce_hex": nonce_hex,
+        "aad_hex": bytes_to_hex_str(aad_text),
+        "ciphertext_hex": bytes_to_hex(ct_bytes),
+        "poly1305_tag": tag_hex
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn bytes_to_hex_str(ascii_str: String) -> String {
+    let hex_digits = "0123456789abcdef";
+    let out = [];
+    let i = 0;
+    let n = len(ascii_str);
+    while i < n {
+        let code = ord(slice(ascii_str, i, i + 1));
+        assert(code >= 0 and code <= 255, "bytes_to_hex_str expects single-byte text");
+        let hi = floor(code / 16);
+        let lo = code % 16;
+        out = append(out, slice(hex_digits, hi, hi + 1) + slice(hex_digits, lo, lo + 1));
+        i = i + 1;
+    }
+    return join(out, "");
+}
+
+fn chacha_poly_unprotect_file(vault_path: String, out_path: String, expected_aad: String, key: ChaChaPolyKey) -> Int {
+    let env = json_parse(read_file(vault_path));
+    assert(env["key_id"] == key.key_id, "ChaCha20 key_id mismatch");
+    let nonce_bytes = hex_to_bytes(env["nonce_hex"]);
+    let ct_bytes = hex_to_bytes(env["ciphertext_hex"]);
+    let key_bytes = hex_to_bytes(key.key_hex);
+    let otk = slice(chacha20_block_bytes(key_bytes, 0, nonce_bytes), 0, 32);
+
+    let expected_tag = poly1305_mac_bytes(otk, hex_to_bytes(bytes_to_hex_str(expected_aad)), ct_bytes);
+    assert(constant_time_equal(expected_tag, env["poly1305_tag"]), "Poly1305 MAC failed before stream decrypt");
+
+    let lease = acquire_decrypt_lease(key.key_id, "CHACHA20-POLY1305");
+    linear_consume(lease);
+
+    return fs_write_bytes(out_path, key.xor_stream(ct_bytes, nonce_bytes));
+}
+
+fn chacha20_poly1305_protect_file_native(src_path: String, vault_path: String, aad_text: String, key_hex: String) -> Map {
+    let info = read_file_bytes_hex(src_path);
+    let sealed = chacha20_poly1305_encrypt(key_hex, info["hex"], aad_text);
+    let env = {
+        "method": "NATIVE-RFC8439-CHACHA20-POLY1305",
+        "plaintext_len": info["len"],
+        "plaintext_sha256": info["sha256"],
+        "aad": aad_text,
+        "ciphertext": sealed
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn chacha20_poly1305_unprotect_file_native(vault_path: String, out_path: String, expected_aad: String, key_hex: String) -> Int {
+    let env = json_parse(read_file(vault_path));
+    assert(constant_time_equal(env["aad"], expected_aad), "ChaCha20-Poly1305 AAD mismatch");
+    let lease = acquire_decrypt_lease("native-chacha", "RFC8439-CHACHA20-POLY1305");
+    linear_consume(lease);
+    let recovered_hex = chacha20_poly1305_decrypt(key_hex, env["ciphertext"], expected_aad);
+    assert(constant_time_equal(sha256(recovered_hex), env["plaintext_sha256"]), "ChaCha20-Poly1305 digest mismatch");
+    return write_hex_to_file(out_path, recovered_hex);
+}
+
+// ----------------------------------------------------------------------------
+// Method 5: 128-bit Keyed Feistel Block Cipher in CBC + PKCS#7 + EtM
+// ----------------------------------------------------------------------------
+
+class CbcBlockVaultKey {
+    fn init(self, key_id: String, rounds: Int) -> Void {
+        let master = random_bytes_hex(32);
+        self.key_id = key_id;
+        self.rounds = rounds;
+        self.block_seed = hmac_sha256(master, "cbc-feistel:enc:" + key_id);
+        self.mac_key = hmac_sha256(master, "cbc-feistel:mac:" + key_id);
+        self.round_keys = [];
+        let r = 0;
+        while r < rounds {
+            self.round_keys = append(self.round_keys, sha256(self.block_seed + "|R" + str(r)));
+            r = r + 1;
+        }
+    }
+
+    fn feistel_f(self, half8: List, round_key: String) -> List {
+        let digest_hex = sha256(round_key + "|" + bytes_to_hex(half8));
+        return slice(hex_to_bytes(digest_hex), 0, 8);
+    }
+
+    fn encrypt_block16(self, blk: List) -> List {
+        let left = slice(blk, 0, 8);
+        let right = slice(blk, 8, 16);
+        let r = 0;
+        while r < self.rounds {
+            let f_out = self.feistel_f(right, self.round_keys[r]);
+            let next_right = xor_byte_lists(left, f_out);
+            left = right;
+            right = next_right;
+            r = r + 1;
+        }
+        return concat(left, right);
+    }
+
+    fn decrypt_block16(self, blk: List) -> List {
+        let left = slice(blk, 0, 8);
+        let right = slice(blk, 8, 16);
+        let r = self.rounds - 1;
+        while r >= 0 {
+            let prev_right = left;
+            let f_out = self.feistel_f(prev_right, self.round_keys[r]);
+            let prev_left = xor_byte_lists(right, f_out);
+            left = prev_left;
+            right = prev_right;
+            r = r - 1;
+        }
+        return concat(left, right);
+    }
+}
+
+fn pkcs7_pad16(raw: List) -> List {
+    let pad_len = 16 - (len(raw) % 16);
+    let out = concat([], raw);
+    let i = 0;
+    while i < pad_len {
+        out = append(out, pad_len);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn pkcs7_unpad16(padded: List) -> List {
+    assert(len(padded) > 0 and len(padded) % 16 == 0, "Invalid CBC padded length");
+    let pad_len = padded[len(padded) - 1];
+    assert(pad_len >= 1 and pad_len <= 16, "Invalid PKCS#7 pad length");
+    let start = len(padded) - pad_len;
+    let i = start;
+    while i < len(padded) {
+        assert(padded[i] == pad_len, "Invalid PKCS#7 padding byte");
+        i = i + 1;
+    }
+    return slice(padded, 0, start);
+}
+
+fn cbc_pkcs7_protect_file(src_path: String, vault_path: String, key: CbcBlockVaultKey) -> Map {
+    let padded = pkcs7_pad16(fs_read_bytes(src_path));
+    let iv_hex = random_bytes_hex(16);
+    let prev = hex_to_bytes(iv_hex);
+    let ct = [];
+    let pos = 0;
+    while pos < len(padded) {
+        let xored = xor_byte_lists(slice(padded, pos, pos + 16), prev);
+        let cblk = key.encrypt_block16(xored);
+        ct = concat(ct, cblk);
+        prev = cblk;
+        pos = pos + 16;
+    }
+    let ct_hex = bytes_to_hex(ct);
+    let mac_tag = hmac_sha256(key.mac_key, "CBC-ETM|" + key.key_id + "|" + iv_hex + "|" + ct_hex);
+    let env = {
+        "method": "FEISTEL-8R-CBC-PKCS7-EtM",
+        "key_id": key.key_id,
+        "iv_hex": iv_hex,
+        "ciphertext_hex": ct_hex,
+        "mac_tag": mac_tag
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn cbc_pkcs7_unprotect_file(vault_path: String, out_path: String, key: CbcBlockVaultKey) -> Int {
+    let env = json_parse(read_file(vault_path));
+    assert(env["key_id"] == key.key_id, "CBC key_id mismatch");
+    let expected_mac = hmac_sha256(key.mac_key, "CBC-ETM|" + key.key_id + "|" + env["iv_hex"] + "|" + env["ciphertext_hex"]);
+    // Strict padding-oracle defense: authenticate IV||CT in constant time BEFORE CBC decrypt/unpad.
+    assert(constant_time_equal(expected_mac, env["mac_tag"]), "CBC EtM MAC failed (padding oracle blocked)");
+
+    let lease = acquire_decrypt_lease(key.key_id, "CBC-PKCS7-EtM");
+    linear_consume(lease);
+
+    let ct = hex_to_bytes(env["ciphertext_hex"]);
+    let prev = hex_to_bytes(env["iv_hex"]);
+    let padded = [];
+    let pos = 0;
+    while pos < len(ct) {
+        let cblk = slice(ct, pos, pos + 16);
+        let pblk = xor_byte_lists(key.decrypt_block16(cblk), prev);
+        padded = concat(padded, pblk);
+        prev = cblk;
+        pos = pos + 16;
+    }
+    return fs_write_bytes(out_path, pkcs7_unpad16(padded));
+}
+
+// ----------------------------------------------------------------------------
+// Method 6: Asymmetric RSA-KEM-263 + RSA Digital Signatures-264
+// ----------------------------------------------------------------------------
+
+class RsaPublicKey {
+    fn init(self, key_id: String, role: String, n: String, e: String) -> Void {
+        self.key_id = key_id;
+        self.role = role;
+        self.modulus_bits = big_bits(n);
+        self.n = n;
+        self.e = e;
+    }
+
+    fn encrypt_int(self, m: String) -> String {
+        assert(big_cmp(m, "1") > 0 and big_cmp(m, self.n) < 0, "RSA plaintext out of modulus bounds");
+        return big_powmod(m, self.e, self.n);
+    }
+
+    fn verify_signature_int(self, sig: String, expected_hash_int: String) -> Bool {
+        return constant_time_equal(big_powmod(sig, self.e, self.n), expected_hash_int);
+    }
+}
+
+class RsaPrivateKey {
+    fn init(self, key_id: String, role: String, p: String, q: String, e: String) -> Void {
+        assert(p != q, "RSA primes must be distinct");
+        let n = big_mul(p, q);
+        let phi = big_mul(big_sub(p, "1"), big_sub(q, "1"));
+        assert(big_gcd(e, phi) == "1", "RSA public exponent not coprime to phi(n)");
+        self.key_id = key_id;
+        self.role = role;
+        self.d = big_modinv(e, phi);
+        self.pub = RsaPublicKey(key_id, role, n, e);
+    }
+
+    fn decrypt_int(self, c: String) -> String {
+        return big_powmod(c, self.d, self.pub.n);
+    }
+
+    fn sign_hash_int(self, h_int: String) -> String {
+        assert(big_cmp(h_int, "1") > 0 and big_cmp(h_int, self.pub.n) < 0, "RSA digest out of modulus bounds");
+        return big_powmod(h_int, self.d, self.pub.n);
+    }
+}
+
+fn rsa_kem_encapsulate(recipient_pub: RsaPublicKey) -> Map {
+    let s_int = bigint("0x" + random_bytes_hex(30));
+    let c_kem = recipient_pub.encrypt_int(s_int);
+    return {
+        "c_kem": c_kem,
+        "dek": sha256("RSA-KEM-v1|" + recipient_pub.key_id + "|" + s_int + "|" + c_kem)
+    };
+}
+
+fn rsa_kem_decapsulate(recipient_priv: RsaPrivateKey, c_kem: String) -> String {
+    let s_int = recipient_priv.decrypt_int(c_kem);
+    return sha256("RSA-KEM-v1|" + recipient_priv.key_id + "|" + s_int + "|" + c_kem);
+}
+
+fn rsa_kem_sign_protect_file(src_path: String, vault_path: String, recipient_pub: RsaPublicKey, sign_priv: RsaPrivateKey) -> Map {
+    let info = read_file_bytes_hex(src_path);
+    let kem = rsa_kem_encapsulate(recipient_pub);
+    let aad = "RSA-HYBRID-v1|" + recipient_pub.key_id + "|" + sign_priv.key_id + "|" + kem["c_kem"];
+    let file_ct = aes_gcm_encrypt(kem["dek"], info["hex"], aad);
+    let sig_digest = sha256("RSA-SIG-v1|" + aad + "|" + file_ct + "|" + info["sha256"]);
+
+    let env = {
+        "method": "RSA-KEM-263 + RSA-SIG-264 + AES-256-GCM",
+        "kem_key_id": recipient_pub.key_id,
+        "sign_key_id": sign_priv.key_id,
+        "kem_ciphertext_int": kem["c_kem"],
+        "aad": aad,
+        "file_ct": file_ct,
+        "plaintext_sha256": info["sha256"],
+        "signature_int": sign_priv.sign_hash_int(bigint("0x" + sig_digest))
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn rsa_kem_verify_unprotect_file(vault_path: String, out_path: String, recv_priv: RsaPrivateKey, sign_pub: RsaPublicKey) -> Int {
+    let env = json_parse(read_file(vault_path));
+    assert(env["kem_key_id"] == recv_priv.key_id and env["sign_key_id"] == sign_pub.key_id, "RSA key_id mismatch");
+    let expected_sig_hex = sha256("RSA-SIG-v1|" + env["aad"] + "|" + env["file_ct"] + "|" + env["plaintext_sha256"]);
+    assert(sign_pub.verify_signature_int(env["signature_int"], bigint("0x" + expected_sig_hex)), "RSA signature verification failed");
+
+    let lease = acquire_decrypt_lease(recv_priv.key_id, "RSA-KEM-SIG");
+    linear_consume(lease);
+
+    let dek = rsa_kem_decapsulate(recv_priv, env["kem_ciphertext_int"]);
+    let plain_hex = aes_gcm_decrypt(dek, env["file_ct"], env["aad"]);
+    assert(constant_time_equal(sha256(plain_hex), env["plaintext_sha256"]), "RSA plaintext hash mismatch");
+    return write_hex_to_file(out_path, plain_hex);
+}
+
+// ----------------------------------------------------------------------------
+// Method 7: secp256k1 Jacobian Elliptic Curve Hybrid (ECIES + ECDSA)
+// ----------------------------------------------------------------------------
+
+fn ec_is_on_curve(x: String, y: String) -> Bool {
+    if big_cmp(x, "0") < 0 or big_cmp(x, kvc_ec_p()) >= 0 or big_cmp(y, "0") < 0 or big_cmp(y, kvc_ec_p()) >= 0 {
+        return false;
+    }
+    let lhs = big_mod_pos(big_mul(y, y), kvc_ec_p());
+    let rhs = big_mod_pos(big_add(big_mul(big_mod_pos(big_mul(x, x), kvc_ec_p()), x), "7"), kvc_ec_p());
+    return lhs == rhs;
+}
+
+fn ec_jac_double(pt: List) -> List {
+    if pt[2] == "0" or pt[1] == "0" {
+        return ["0", "1", "0"];
+    }
+    let x1 = pt[0];
+    let y1 = pt[1];
+    let z1 = pt[2];
+    let xx = big_mod_pos(big_mul(x1, x1), kvc_ec_p());
+    let yy = big_mod_pos(big_mul(y1, y1), kvc_ec_p());
+    let yyyy = big_mod_pos(big_mul(yy, yy), kvc_ec_p());
+    let s = big_mod_pos(big_mul("4", big_mul(x1, yy)), kvc_ec_p());
+    let m = big_mod_pos(big_mul("3", xx), kvc_ec_p());
+    let x3 = big_mod_pos(big_sub(big_mul(m, m), big_mul("2", s)), kvc_ec_p());
+    let y3 = big_mod_pos(big_sub(big_mul(m, big_sub(s, x3)), big_mul("8", yyyy)), kvc_ec_p());
+    let z3 = big_mod_pos(big_mul("2", big_mul(y1, z1)), kvc_ec_p());
+    return [x3, y3, z3];
+}
+
+fn ec_jac_add(p1: List, p2: List) -> List {
+    if p1[2] == "0" {
+        return p2;
+    }
+    if p2[2] == "0" {
+        return p1;
+    }
+    let z1z1 = big_mod_pos(big_mul(p1[2], p1[2]), kvc_ec_p());
+    let z2z2 = big_mod_pos(big_mul(p2[2], p2[2]), kvc_ec_p());
+    let u1 = big_mod_pos(big_mul(p1[0], z2z2), kvc_ec_p());
+    let u2 = big_mod_pos(big_mul(p2[0], z1z1), kvc_ec_p());
+    let s1 = big_mod_pos(big_mul(p1[1], big_mul(p2[2], z2z2)), kvc_ec_p());
+    let s2 = big_mod_pos(big_mul(p2[1], big_mul(p1[2], z1z1)), kvc_ec_p());
+    if u1 == u2 {
+        if s1 == s2 {
+            return ec_jac_double(p1);
+        }
+        return ["0", "1", "0"];
+    }
+    let h = big_mod_pos(big_sub(u2, u1), kvc_ec_p());
+    let hh = big_mod_pos(big_mul(h, h), kvc_ec_p());
+    let hhh = big_mod_pos(big_mul(h, hh), kvc_ec_p());
+    let v = big_mod_pos(big_mul(u1, hh), kvc_ec_p());
+    let r = big_mod_pos(big_sub(s2, s1), kvc_ec_p());
+    let x3 = big_mod_pos(big_sub(big_sub(big_mul(r, r), hhh), big_mul("2", v)), kvc_ec_p());
+    let y3 = big_mod_pos(big_sub(big_mul(r, big_sub(v, x3)), big_mul(s1, hhh)), kvc_ec_p());
+    let z3 = big_mod_pos(big_mul(h, big_mul(p1[2], p2[2])), kvc_ec_p());
+    return [x3, y3, z3];
+}
+
+fn ec_jac_to_affine(pt: List) -> List {
+    assert(pt[2] != "0", "Cannot convert infinity EC point to affine");
+    let z_inv = big_modinv(pt[2], kvc_ec_p());
+    let z2 = big_mod_pos(big_mul(z_inv, z_inv), kvc_ec_p());
+    let z3 = big_mod_pos(big_mul(z2, z_inv), kvc_ec_p());
+    return [big_mod_pos(big_mul(pt[0], z2), kvc_ec_p()), big_mod_pos(big_mul(pt[1], z3), kvc_ec_p())];
+}
+
+fn ec_mul_affine(k: String, affine_pt: List) -> List {
+    assert(ec_is_on_curve(affine_pt[0], affine_pt[1]), "Invalid-curve point blocked before EC scalar mult");
+    let cur = big_mod_pos(k, kvc_ec_n());
+    let acc = ["0", "1", "0"];
+    let addend = [affine_pt[0], affine_pt[1], "1"];
+    while big_cmp(cur, "0") > 0 {
+        let qr = big_divmod(cur, "2");
+        if qr[1] == "1" {
+            acc = ec_jac_add(acc, addend);
+        }
+        cur = qr[0];
+        if big_cmp(cur, "0") > 0 {
+            addend = ec_jac_double(addend);
+        }
+    }
+    return ec_jac_to_affine(acc);
+}
+
+class EcPublicKey {
+    fn init(self, key_id: String, qx: String, qy: String) -> Void {
+        assert(ec_is_on_curve(qx, qy), "Invalid secp256k1 public key point rejected");
+        self.key_id = key_id;
+        self.qx = qx;
+        self.qy = qy;
+    }
+
+    fn verify_ecdsa(self, z_hex: String, sig_r: String, sig_s: String) -> Bool {
+        if big_cmp(sig_r, "1") < 0 or big_cmp(sig_r, kvc_ec_n()) >= 0 or big_cmp(sig_s, "1") < 0 or big_cmp(sig_s, kvc_ec_n()) >= 0 {
+            return false;
+        }
+        let z = big_mod_pos(bigint("0x" + z_hex), kvc_ec_n());
+        let s_inv = big_modinv(sig_s, kvc_ec_n());
+        let u1 = big_mod_pos(big_mul(z, s_inv), kvc_ec_n());
+        let u2 = big_mod_pos(big_mul(sig_r, s_inv), kvc_ec_n());
+        let p1 = ec_mul_affine(u1, [kvc_ec_gx(), kvc_ec_gy()]);
+        let p2 = ec_mul_affine(u2, [self.qx, self.qy]);
+        let sum = ec_jac_add([p1[0], p1[1], "1"], [p2[0], p2[1], "1"]);
+        if sum[2] == "0" {
+            return false;
+        }
+        let aff = ec_jac_to_affine(sum);
+        return constant_time_equal(big_mod_pos(aff[0], kvc_ec_n()), sig_r);
+    }
+}
+
+class EcPrivateKey {
+    fn init(self, key_id: String) -> Void {
+        self.key_id = key_id;
+        self.d = big_add(big_mod_pos(bigint("0x" + random_bytes_hex(30)), big_sub(kvc_ec_n(), "2")), "1");
+        let q = ec_mul_affine(self.d, [kvc_ec_gx(), kvc_ec_gy()]);
+        self.pub = EcPublicKey(key_id, q[0], q[1]);
+    }
+
+    fn sign_ecdsa(self, z_hex: String) -> Map {
+        let z = big_mod_pos(bigint("0x" + z_hex), kvc_ec_n());
+        let k = big_add(big_mod_pos(bigint("0x" + random_bytes_hex(30)), big_sub(kvc_ec_n(), "2")), "1");
+        let r_pt = ec_mul_affine(k, [kvc_ec_gx(), kvc_ec_gy()]);
+        let r = big_mod_pos(r_pt[0], kvc_ec_n());
+        let s = big_mod_pos(big_mul(big_modinv(k, kvc_ec_n()), big_add(z, big_mul(r, self.d))), kvc_ec_n());
+        assert(r != "0" and s != "0", "Degenerate ECDSA signature");
+        return {"r": r, "s": s};
+    }
+}
+
+fn ecies_encapsulate(recv_pub: EcPublicKey) -> Map {
+    let ephem_k = big_add(big_mod_pos(bigint("0x" + random_bytes_hex(30)), big_sub(kvc_ec_n(), "2")), "1");
+    let ephem_r = ec_mul_affine(ephem_k, [kvc_ec_gx(), kvc_ec_gy()]);
+    let shared_s = ec_mul_affine(ephem_k, [recv_pub.qx, recv_pub.qy]);
+    let dek = hmac_sha256(shared_s[0], "ECIES-secp256k1|" + ephem_r[0] + "|" + ephem_r[1] + "|" + recv_pub.qx);
+    return {
+        "rx": ephem_r[0],
+        "ry": ephem_r[1],
+        "dek": dek
+    };
+}
+
+fn ecies_decapsulate(recv_priv: EcPrivateKey, rx: String, ry: String) -> String {
+    assert(ec_is_on_curve(rx, ry), "Invalid-curve ECIES ephemeral point rejected");
+    let shared_s = ec_mul_affine(recv_priv.d, [rx, ry]);
+    return hmac_sha256(shared_s[0], "ECIES-secp256k1|" + rx + "|" + ry + "|" + recv_priv.pub.qx);
+}
+
+fn ecies_protect_file(src_path: String, vault_path: String, recv_pub: EcPublicKey, sign_priv: EcPrivateKey) -> Map {
+    let info = read_file_bytes_hex(src_path);
+    let kem = ecies_encapsulate(recv_pub);
+    let aad = "ECIES-256k1|" + recv_pub.key_id + "|" + sign_priv.key_id + "|" + kem["rx"];
+    let file_ct = aes_gcm_encrypt(kem["dek"], info["hex"], aad);
+    let z_hex = sha256("ECDSA-SIG|" + aad + "|" + file_ct + "|" + info["sha256"]);
+    let sig = sign_priv.sign_ecdsa(z_hex);
+    let env = {
+        "method": "SECP256K1-ECIES + ECDSA + AES-256-GCM",
+        "recv_key_id": recv_pub.key_id,
+        "sign_key_id": sign_priv.key_id,
+        "ephem_rx": kem["rx"],
+        "ephem_ry": kem["ry"],
+        "aad": aad,
+        "file_ct": file_ct,
+        "plaintext_sha256": info["sha256"],
+        "sig_r": sig["r"],
+        "sig_s": sig["s"]
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn ecies_unprotect_file(vault_path: String, out_path: String, recv_priv: EcPrivateKey, sign_pub: EcPublicKey) -> Int {
+    let env = json_parse(read_file(vault_path));
+    assert(env["recv_key_id"] == recv_priv.key_id and env["sign_key_id"] == sign_pub.key_id, "ECC key_id mismatch");
+    let z_hex = sha256("ECDSA-SIG|" + env["aad"] + "|" + env["file_ct"] + "|" + env["plaintext_sha256"]);
+    assert(sign_pub.verify_ecdsa(z_hex, env["sig_r"], env["sig_s"]), "ECDSA signature failed before ECIES decap");
+
+    let lease = acquire_decrypt_lease(recv_priv.key_id, "ECIES-SECP256K1");
+    linear_consume(lease);
+
+    let dek = ecies_decapsulate(recv_priv, env["ephem_rx"], env["ephem_ry"]);
+    let plain_hex = aes_gcm_decrypt(dek, env["file_ct"], env["aad"]);
+    assert(constant_time_equal(sha256(plain_hex), env["plaintext_sha256"]), "ECIES plaintext hash mismatch");
+    return write_hex_to_file(out_path, plain_hex);
+}
+
+// ----------------------------------------------------------------------------
+// Method 8: Safe-Prime Ephemeral-Static Diffie-Hellman (DH-KEM-256)
+// ----------------------------------------------------------------------------
+
+class DhDomainParams {
+    fn init(self, group_name: String, p: String, q: String, g: String) -> Void {
+        assert(big_powmod(g, q, p) == "1" and big_powmod(g, "2", p) != "1", "Invalid DH generator order");
+        self.group_name = group_name;
+        self.p = p;
+        self.q = q;
+        self.g = g;
+    }
+
+    fn validate_public_point(self, pt: String) -> Void {
+        let p_m1 = big_sub(self.p, "1");
+        assert(big_cmp(pt, "1") > 0 and big_cmp(pt, p_m1) < 0, "DH point out of safe range");
+        assert(big_powmod(pt, self.q, self.p) == "1", "DH small-subgroup confinement failed");
+    }
+}
+
+class DhStaticKeyPair {
+    fn init(self, key_id: String, params: DhDomainParams) -> Void {
+        self.key_id = key_id;
+        self.params = params;
+        self.priv_x = big_add(big_mod_pos(bigint("0x" + random_bytes_hex(30)), big_sub(params.q, "2")), "2");
+        self.pub_y = big_powmod(params.g, self.priv_x, params.p);
+        params.validate_public_point(self.pub_y);
+    }
+}
+
+fn dh_kem_protect_file(src_path: String, vault_path: String, file_id: String, recv_kp: DhStaticKeyPair) -> Map {
+    recv_kp.params.validate_public_point(recv_kp.pub_y);
+    let info = read_file_bytes_hex(src_path);
+    let ephem_a = big_add(big_mod_pos(bigint("0x" + random_bytes_hex(30)), big_sub(recv_kp.params.q, "2")), "2");
+    let ephem_pub = big_powmod(recv_kp.params.g, ephem_a, recv_kp.params.p);
+    let z = big_powmod(recv_kp.pub_y, ephem_a, recv_kp.params.p);
+    let session_key = hmac_sha256(z, "DH-KEM-v1|" + recv_kp.key_id + "|" + ephem_pub + "|" + recv_kp.pub_y + "|" + file_id);
+    let aad = "DH-KEM|" + file_id + "|" + ephem_pub + "|" + recv_kp.key_id;
+    let env = {
+        "method": "DH-SAFEPRIME-256-KEM",
+        "file_id": file_id,
+        "recv_key_id": recv_kp.key_id,
+        "ephem_pub": ephem_pub,
+        "aad": aad,
+        "file_ct": aes_gcm_encrypt(session_key, info["hex"], aad),
+        "plaintext_sha256": info["sha256"]
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn dh_kem_unprotect_file(vault_path: String, out_path: String, expected_file_id: String, recv_kp: DhStaticKeyPair) -> Int {
+    let env = json_parse(read_file(vault_path));
+    assert(env["recv_key_id"] == recv_kp.key_id and env["file_id"] == expected_file_id, "DH identity/file_id mismatch");
+    recv_kp.params.validate_public_point(env["ephem_pub"]);
+    let z = big_powmod(env["ephem_pub"], recv_kp.priv_x, recv_kp.params.p);
+    let session_key = hmac_sha256(z, "DH-KEM-v1|" + recv_kp.key_id + "|" + env["ephem_pub"] + "|" + recv_kp.pub_y + "|" + expected_file_id);
+
+    let lease = acquire_decrypt_lease(recv_kp.key_id, "DH-KEM-256");
+    linear_consume(lease);
+
+    let plain_hex = aes_gcm_decrypt(session_key, env["file_ct"], env["aad"]);
+    assert(constant_time_equal(sha256(plain_hex), env["plaintext_sha256"]), "DH plaintext digest mismatch");
+    return write_hex_to_file(out_path, plain_hex);
+}
+
+// ----------------------------------------------------------------------------
+// Method 9: Probabilistic ElGamal Encryption + Fiat-Shamir Schnorr ZKP
+// ----------------------------------------------------------------------------
+
+class ElGamalZkpKeyPair {
+    fn init(self, key_id: String) -> Void {
+        self.key_id = key_id;
+        self.p = kvc_dh_safe_p();
+        self.q = kvc_dh_subgroup_q();
+        self.g = kvc_dh_gen();
+        self.x = big_add(big_mod_pos(bigint("0x" + random_bytes_hex(30)), big_sub(self.q, "2")), "2");
+        self.y = big_powmod(self.g, self.x, self.p);
+    }
+
+    fn encrypt_probabilistic_int(self, m_int: String) -> Map {
+        // Fresh ephemeral blinding k ensures two encryptions of identical m_int are unlinkable.
+        let k = big_add(big_mod_pos(bigint("0x" + random_bytes_hex(30)), big_sub(self.q, "2")), "2");
+        let c1 = big_powmod(self.g, k, self.p);
+        let shared = big_powmod(self.y, k, self.p);
+        let c2 = big_mod_pos(big_mul(m_int, shared), self.p);
+        return {"c1": c1, "c2": c2};
+    }
+
+    fn decrypt_int(self, c1: String, c2: String) -> String {
+        let shared = big_powmod(c1, self.x, self.p);
+        return big_mod_pos(big_mul(c2, big_modinv(shared, self.p)), self.p);
+    }
+
+    fn prove_schnorr_zkp(self, context_aad: String) -> Map {
+        // Non-interactive zero-knowledge proof of knowledge of private exponent x.
+        let v = big_add(big_mod_pos(bigint("0x" + random_bytes_hex(30)), big_sub(self.q, "2")), "2");
+        let t_commit = big_powmod(self.g, v, self.p);
+        let c_chal = big_mod_pos(bigint("0x" + sha256("SCHNORR-ZKP|" + self.key_id + "|" + self.y + "|" + t_commit + "|" + context_aad)), self.q);
+        let s_resp = big_mod_pos(big_sub(v, big_mul(c_chal, self.x)), self.q);
+        return {"t": t_commit, "s": s_resp};
+    }
+
+    fn verify_schnorr_zkp(self, context_aad: String, zkp: Map) -> Bool {
+        let c_chal = big_mod_pos(bigint("0x" + sha256("SCHNORR-ZKP|" + self.key_id + "|" + self.y + "|" + zkp["t"] + "|" + context_aad)), self.q);
+        let lhs = big_mod_pos(big_mul(big_powmod(self.g, zkp["s"], self.p), big_powmod(self.y, c_chal, self.p)), self.p);
+        return constant_time_equal(lhs, zkp["t"]);
+    }
+}
+
+fn elgamal_zkp_protect_file(src_path: String, vault_path: String, kp: ElGamalZkpKeyPair) -> Map {
+    let info = read_file_bytes_hex(src_path);
+    let m_int = bigint("0x" + random_bytes_hex(30));
+    let ct_pair = kp.encrypt_probabilistic_int(m_int);
+    let dek = sha256("ELGAMAL-DEK|" + m_int + "|" + kp.key_id);
+    let aad = "ELGAMAL-ZKP-v1|" + kp.key_id + "|" + ct_pair["c1"] + "|" + ct_pair["c2"];
+    let zkp = kp.prove_schnorr_zkp(aad);
+    let env = {
+        "method": "ELGAMAL-PROBABILISTIC + SCHNORR-ZKP + AES-256-GCM",
+        "key_id": kp.key_id,
+        "c1": ct_pair["c1"],
+        "c2": ct_pair["c2"],
+        "aad": aad,
+        "zkp_t": zkp["t"],
+        "zkp_s": zkp["s"],
+        "file_ct": aes_gcm_encrypt(dek, info["hex"], aad),
+        "plaintext_sha256": info["sha256"]
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn elgamal_zkp_unprotect_file(vault_path: String, out_path: String, kp: ElGamalZkpKeyPair, zkp_t: String, zkp_s: String) -> Int {
+    let env = json_parse(read_file(vault_path));
+    assert(kp.verify_schnorr_zkp(env["aad"], {"t": zkp_t, "s": zkp_s}), "Schnorr Zero-Knowledge Proof rejected");
+
+    let lease = acquire_decrypt_lease(kp.key_id, "ELGAMAL-ZKP");
+    linear_consume(lease);
+
+    let m_int = kp.decrypt_int(env["c1"], env["c2"]);
+    let dek = sha256("ELGAMAL-DEK|" + m_int + "|" + kp.key_id);
+    let plain_hex = aes_gcm_decrypt(dek, env["file_ct"], env["aad"]);
+    assert(constant_time_equal(sha256(plain_hex), env["plaintext_sha256"]), "ElGamal hash mismatch");
+    return write_hex_to_file(out_path, plain_hex);
+}
+
+// ----------------------------------------------------------------------------
+// Method 10: Post-Quantum Matrix-LWE-16 Lattice KEM (Zero-Error + FO Hybrid)
+// ----------------------------------------------------------------------------
+
+fn csprng_small_noise(count: Int, bound: Int) -> List {
+    // Draws centered small coefficients in [-bound, +bound] via rejection-free mod.
+    let span = 2 * bound + 1;
+    let raw = hex_to_bytes(random_bytes_hex(count));
+    let out = [];
+    if span != 0 {
+        let i = 0;
+        while i < count {
+            out = append(out, (raw[i] % span) - bound);
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+class LwePqKeyPair {
+    fn init(self, key_id: String) -> Void {
+        let pq_score = verify_physics_security_params(1100, 32, 16);
+        assert(pq_score >= 1860, "PQ & physics policy check failed");
+        self.key_id = key_id;
+        self.n = 16;
+        self.m = 24;
+        self.q = kvc_lwe_q();
+        self.half_q = floor(kvc_lwe_q() / 2);
+
+        // Public lattice A (m x n) over Z_q.
+        self.mat_a = [];
+        let row = 0;
+        while row < self.m {
+            let rbytes = hex_to_bytes(random_bytes_hex(self.n * 2));
+            let rlist = [];
+            let col = 0;
+            while col < self.n {
+                rlist = append(rlist, (rbytes[col * 2] * 256 + rbytes[col * 2 + 1]) % self.q);
+                col = col + 1;
+            }
+            self.mat_a = append(self.mat_a, rlist);
+            row = row + 1;
+        }
+
+        // Private short secret matrix S (n x n) in [-2, 2] and short error E (m x n) in [-2, 2].
+        self.mat_s = [];
+        let c = 0;
+        while c < self.n {
+            self.mat_s = append(self.mat_s, csprng_small_noise(self.n, 2));
+            c = c + 1;
+        }
+
+        // Public matrix B_cols[col][row] = ((A[row] . S[col]) + E[row]) mod q.
+        self.mat_b_cols = [];
+        c = 0;
+        while c < self.n {
+            let err_col = csprng_small_noise(self.m, 2);
+            let scol = self.mat_s[c];
+            let bcol = [];
+            row = 0;
+            while row < self.m {
+                let arow = self.mat_a[row];
+                let dot = 0;
+                let j = 0;
+                while j < self.n {
+                    dot = dot + arow[j] * scol[j];
+                    j = j + 1;
+                }
+                let val = (dot + err_col[row]) % self.q;
+                if val < 0 {
+                    val = val + self.q;
+                }
+                bcol = append(bcol, val);
+                row = row + 1;
+            }
+            self.mat_b_cols = append(self.mat_b_cols, bcol);
+            c = c + 1;
+        }
+    }
+
+    fn encapsulate_128bit_seed(self) -> Map {
+        // Encapsulate 16 CSPRNG bytes (128 bits = 8 chunks x 16 bits/chunk) via Matrix LWE.
+        let seed_bytes = hex_to_bytes(random_bytes_hex(16));
+        let seed_hex = bytes_to_hex(seed_bytes);
+        let cipher_chunks = [];
+        let chk = 0;
+        while chk < 8 {
+            // Each 2-byte chunk encodes 16 bits across the 16 columns of B.
+            let b0 = seed_bytes[chk * 2];
+            let b1 = seed_bytes[chk * 2 + 1];
+            let bits16 = [];
+            let bi = 0;
+            let tmp = b0;
+            while bi < 8 {
+                bits16 = append(bits16, tmp % 2);
+                tmp = floor(tmp / 2);
+                bi = bi + 1;
+            }
+            bi = 0;
+            tmp = b1;
+            while bi < 8 {
+                bits16 = append(bits16, tmp % 2);
+                tmp = floor(tmp / 2);
+                bi = bi + 1;
+            }
+
+            // Ephemeral binary r in {0, 1}^m guarantees worst-case noise <= 114 << q/4 = 16380.
+            let r_raw = hex_to_bytes(random_bytes_hex(self.m));
+            let r_vec = [];
+            let row = 0;
+            while row < self.m {
+                r_vec = append(r_vec, r_raw[row] % 2);
+                row = row + 1;
+            }
+            let e1 = csprng_small_noise(self.n, 2);
+            let e2 = csprng_small_noise(self.n, 2);
+
+            let u_vec = [];
+            let col = 0;
+            while col < self.n {
+                let acc = e1[col];
+                row = 0;
+                while row < self.m {
+                    acc = acc + self.mat_a[row][col] * r_vec[row];
+                    row = row + 1;
+                }
+                let u_mod = acc % self.q;
+                if u_mod < 0 {
+                    u_mod = u_mod + self.q;
+                }
+                u_vec = append(u_vec, u_mod);
+                col = col + 1;
+            }
+
+            let v_vec = [];
+            col = 0;
+            while col < self.n {
+                let bcol = self.mat_b_cols[col];
+                let vacc = e2[col] + bits16[col] * self.half_q;
+                row = 0;
+                while row < self.m {
+                    vacc = vacc + bcol[row] * r_vec[row];
+                    row = row + 1;
+                }
+                let v_mod = vacc % self.q;
+                if v_mod < 0 {
+                    v_mod = v_mod + self.q;
+                }
+                v_vec = append(v_vec, v_mod);
+                col = col + 1;
+            }
+            cipher_chunks = append(cipher_chunks, {"u": u_vec, "v": v_vec});
+            chk = chk + 1;
+        }
+        let fo_commit = sha256("LWE-FO-v1|" + self.key_id + "|" + seed_hex);
+        return {
+            "seed_hex": seed_hex,
+            "dek": sha256("LWE-DEK-v1|" + self.key_id + "|" + seed_hex),
+            "fo_commit": fo_commit,
+            "chunks": cipher_chunks
+        };
+    }
+
+    fn decapsulate_128bit_seed(self, chunks: List, fo_commit: String) -> String {
+        let out_bytes = [];
+        let chk = 0;
+        while chk < 8 {
+            let uv = chunks[chk];
+            let u_vec = uv["u"];
+            let v_vec = uv["v"];
+            let lo_byte = 0;
+            let hi_byte = 0;
+            let col = 0;
+            while col < self.n {
+                let scol = self.mat_s[col];
+                let dot = 0;
+                let j = 0;
+                while j < self.n {
+                    dot = dot + u_vec[j] * scol[j];
+                    j = j + 1;
+                }
+                let diff = (v_vec[col] - dot) % self.q;
+                if diff < 0 {
+                    diff = diff + self.q;
+                }
+                // Decode bit by minimum modular distance to 0 vs floor(q/2).
+                let dist0 = diff;
+                if self.q - diff < dist0 {
+                    dist0 = self.q - diff;
+                }
+                let dist1 = diff - self.half_q;
+                if dist1 < 0 {
+                    dist1 = 0 - dist1;
+                }
+                if self.q - dist1 < dist1 {
+                    dist1 = self.q - dist1;
+                }
+                let bit = 0;
+                if dist1 < dist0 {
+                    bit = 1;
+                }
+                if col < 8 {
+                    lo_byte = lo_byte + bit * pow2_int(col);
+                } else {
+                    hi_byte = hi_byte + bit * pow2_int(col - 8);
+                }
+                col = col + 1;
+            }
+            out_bytes = append(out_bytes, lo_byte);
+            out_bytes = append(out_bytes, hi_byte);
+            chk = chk + 1;
+        }
+        let seed_hex = bytes_to_hex(out_bytes);
+        // Fujisaki-Okamoto commitment check rejects perturbed lattice vectors before returning DEK.
+        assert(constant_time_equal(sha256("LWE-FO-v1|" + self.key_id + "|" + seed_hex), fo_commit), "LWE Fujisaki-Okamoto check failed");
+        return sha256("LWE-DEK-v1|" + self.key_id + "|" + seed_hex);
+    }
+}
+
+fn lwe_pq_protect_file(src_path: String, vault_path: String, pq_kp: LwePqKeyPair) -> Map {
+    let info = read_file_bytes_hex(src_path);
+    let kem = pq_kp.encapsulate_128bit_seed();
+    let aad = "LWE-PQ-v1|" + pq_kp.key_id + "|" + kem["fo_commit"];
+    let env = {
+        "method": "POST-QUANTUM-MATRIX-LWE-16 + FO + AES-256-GCM",
+        "key_id": pq_kp.key_id,
+        "fo_commit": kem["fo_commit"],
+        "chunks": kem["chunks"],
+        "aad": aad,
+        "file_ct": aes_gcm_encrypt(kem["dek"], info["hex"], aad),
+        "plaintext_sha256": info["sha256"]
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn lwe_pq_unprotect_file(vault_path: String, out_path: String, pq_kp: LwePqKeyPair) -> Int {
+    let env = json_parse(read_file(vault_path));
+    assert(env["key_id"] == pq_kp.key_id, "LWE key_id mismatch");
+    let dek = pq_kp.decapsulate_128bit_seed(env["chunks"], env["fo_commit"]);
+
+    let lease = acquire_decrypt_lease(pq_kp.key_id, "PQ-LWE-16");
+    linear_consume(lease);
+
+    let plain_hex = aes_gcm_decrypt(dek, env["file_ct"], env["aad"]);
+    assert(constant_time_equal(sha256(plain_hex), env["plaintext_sha256"]), "LWE decrypted digest mismatch");
+    return write_hex_to_file(out_path, plain_hex);
+}
+
+// ----------------------------------------------------------------------------
+// Method 11: Threshold (3-of-5) Shamir SSS + TOTP 2FA + @secret/@linear/@verify
+// ----------------------------------------------------------------------------
+
+class ShamirKeyShare {
+    fn init(self, vault_id: String, share_index_x: String, share_value_y: String, custodian: String, share_mac: String) -> Void {
+        self.vault_id = vault_id;
+        self.x = share_index_x;
+        self.y = share_value_y;
+        self.custodian = custodian;
+        self.share_mac = share_mac;
+    }
+
+    fn copy_with_y(self, new_y: String) -> ShamirKeyShare {
+        return ShamirKeyShare(self.vault_id, self.x, new_y, self.custodian, self.share_mac);
+    }
+}
+
+class ShamirTotpVault {
+    fn init(self, vault_id: String, threshold_k: Int, total_n: Int, custodians: List) -> Void {
+        assert(len(custodians) == total_n, "Custodian list mismatch");
+        assert(verify_cryptographic_policy(150000, threshold_k, total_n, 16) >= 100000, "Verified policy failed");
+        self.vault_id = vault_id;
+        self.k = threshold_k;
+        self.n = total_n;
+        self.prime = kvc_shamir_prime();
+        self.custodians = custodians;
+        self.share_mac_key = sanitize(hmac_sha256(load_hsm_root_entropy(), "shamir:share-mac:" + vault_id));
+        self.totp_seed = sanitize(totp_secret());
+    }
+
+    fn compute_share_mac(self, x: String, y: String, custodian: String) -> String {
+        return hmac_sha256(self.share_mac_key, "SSS-SHARE-v1|" + self.vault_id + "|" + x + "|" + y + "|" + custodian);
+    }
+
+    fn seal_with_shares(self, src_path: String, vault_path: String) -> Map {
+        let info = read_file_bytes_hex(src_path);
+        let dek_hex = random_bytes_hex(32);
+        let coeffs = [bigint("0x" + dek_hex)];
+        let c_idx = 1;
+        while c_idx < self.k {
+            coeffs = append(coeffs, big_mod_pos(bigint("0x" + random_bytes_hex(32)), self.prime));
+            c_idx = c_idx + 1;
+        }
+        let shares = [];
+        let i = 1;
+        while i <= self.n {
+            let x_str = str(i);
+            let y_acc = "0";
+            let x_pow = "1";
+            let j = 0;
+            while j < self.k {
+                y_acc = big_mod_pos(big_add(y_acc, big_mul(coeffs[j], x_pow)), self.prime);
+                x_pow = big_mod_pos(big_mul(x_pow, x_str), self.prime);
+                j = j + 1;
+            }
+            let cust = self.custodians[i - 1];
+            shares = append(shares, ShamirKeyShare(self.vault_id, x_str, y_acc, cust, self.compute_share_mac(x_str, y_acc, cust)));
+            i = i + 1;
+        }
+        let aad = "SHAMIR-" + str(self.k) + "-OF-" + str(self.n) + "+TOTP|" + self.vault_id + "|" + info["sha256"];
+        write_file(vault_path, json_stringify({
+            "method": "SHAMIR-GF(P257) + TOTP",
+            "vault_id": self.vault_id,
+            "aad": aad,
+            "ciphertext": aes_gcm_encrypt(dek_hex, info["hex"], aad),
+            "plaintext_sha256": info["sha256"]
+        }));
+        return {"shares": shares};
+    }
+
+    fn recover_secret_lagrange(self, submitted: List) -> String {
+        let count = len(submitted);
+        let i = 0;
+        while i < count {
+            let sh = submitted[i];
+            assert(constant_time_equal(self.compute_share_mac(sh.x, sh.y, sh.custodian), sh.share_mac), "Tampered Shamir share MAC");
+            let j = i + 1;
+            while j < count {
+                assert(sh.x != submitted[j].x, "Duplicate Shamir share index");
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        let acc = "0";
+        i = 0;
+        while i < count {
+            let num = "1";
+            let den = "1";
+            let j = 0;
+            while j < count {
+                if i != j {
+                    num = big_mod_pos(big_mul(num, big_sub("0", submitted[j].x)), self.prime);
+                    den = big_mod_pos(big_mul(den, big_sub(submitted[i].x, submitted[j].x)), self.prime);
+                }
+                j = j + 1;
+            }
+            let lc = big_mod_pos(big_mul(num, big_modinv(den, self.prime)), self.prime);
+            acc = big_mod_pos(big_add(acc, big_mul(submitted[i].y, lc)), self.prime);
+            i = i + 1;
+        }
+        return acc;
+    }
+
+    fn unseal_with_quorum_and_totp(self, vault_path: String, out_path: String, submitted: List, otp: String, ts: Int) -> Int {
+        assert(totp_verify(self.totp_seed, otp, 1, ts), "Invalid RFC 6238 TOTP token");
+        let env = json_parse(read_file(vault_path));
+        let dek_hex = big_to_fixed_hex(self.recover_secret_lagrange(submitted), 64);
+
+        let lease = acquire_decrypt_lease(self.vault_id, "SHAMIR-TOTP");
+        linear_consume(lease);
+
+        let plain_hex = aes_gcm_decrypt(dek_hex, env["ciphertext"], env["aad"]);
+        assert(constant_time_equal(sha256(plain_hex), env["plaintext_sha256"]), "Shamir digest mismatch");
+        return write_hex_to_file(out_path, plain_hex);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Method 12: Quantum Optical BB84 Protocol (Born cos^2 Collapse & QBER Abort)
+// ----------------------------------------------------------------------------
+
+fn quantum_born_detection_prob(angle_diff_deg: Float) -> Float {
+    let rad = angle_diff_deg * kvc_pi() / 180.0;
+    let c = cos(rad);
+    return c * c;
+}
+
+class QuantumBb84Channel {
+    fn init(self, channel_id: String, qber_max_bps: Int) -> Void {
+        assert(verify_physics_security_params(qber_max_bps, 32, 16) >= 1860, "BB84 policy violation");
+        // Self-check Born law Malus Law probabilities: 0 deg -> 1.0, 45 deg -> 0.5, 90 deg -> 0.0.
+        let p0 = quantum_born_detection_prob(0.0);
+        let p45 = quantum_born_detection_prob(45.0);
+        let p90 = quantum_born_detection_prob(90.0);
+        assert(p0 > 0.9999 and p45 > 0.4999 and p45 < 0.5001 and p90 < 0.0001, "Born probability law mismatch");
+
+        self.channel_id = channel_id;
+        self.qber_threshold = qber_max_bps / 10000.0;
+    }
+
+    fn establish_sifted_key(self, num_photons: Int, eve_intercept_percent: Int) -> Map {
+        // CSPRNG photon bits, Alice bases (0='+', 1='x'), Bob bases, & Eve noise gate.
+        let rand_a = hex_to_bytes(random_bytes_hex(num_photons));
+        let rand_b = hex_to_bytes(random_bytes_hex(num_photons));
+        let rand_e = hex_to_bytes(random_bytes_hex(num_photons));
+
+        let alice_sift = [];
+        let bob_sift = [];
+        let i = 0;
+        while i < num_photons {
+            let a_bit = rand_a[i] % 2;
+            let a_basis = floor(rand_a[i] / 2) % 2;
+            let b_basis = rand_b[i] % 2;
+
+            // If Eve intercepts photon (e_pct < eve_intercept_percent), her conjugate basis measurement
+            // collapses superposition (Born P = cos^2(45 deg) = 0.5 error when e_basis != a_basis).
+            let sent_bit = a_bit;
+            if (rand_e[i] % 100) < eve_intercept_percent {
+                let e_basis = floor(rand_e[i] / 100) % 2;
+                if e_basis != a_basis {
+                    // Conjugate basis state collapse to random eigenstate 0/1.
+                    sent_bit = floor(rand_e[i] / 200) % 2;
+                }
+            }
+
+            if a_basis == b_basis {
+                // Aligned Alice/Bob analyzer (delta_theta = 0 deg -> Born P = 1.0 of receiving collapsed state).
+                alice_sift = append(alice_sift, a_bit);
+                bob_sift = append(bob_sift, sent_bit);
+            }
+            i = i + 1;
+        }
+
+        // Public parity sample (half the sifted bits) measures physical QBER for eavesdropper detection.
+        let parity_len = floor(len(alice_sift) / 2);
+        let errors = 0;
+        let idx = 0;
+        while idx < parity_len {
+            if alice_sift[idx] != bob_sift[idx] {
+                errors = errors + 1;
+            }
+            idx = idx + 1;
+        }
+        let qber = errors / parity_len;
+        assert(qber <= self.qber_threshold, "BB84 ABORT: QBER exceeded eavesdropper security threshold");
+
+        // Privacy amplification: Universal-2 HMAC extractor over secret remainder of sifted bits.
+        let priv_bits = slice(alice_sift, parity_len, len(alice_sift));
+        let key_hex = hmac_sha256("BB84-PA|" + self.channel_id, bytes_to_hex(priv_bits));
+        return {
+            "sifted_bits": len(alice_sift),
+            "qber": qber,
+            "priv_amp_key": key_hex
+        };
+    }
+}
+
+fn quantum_bb84_protect_and_unprotect(src_path: String, vault_path: String, out_path: String, chan: QuantumBb84Channel) -> Map {
+    let info = read_file_bytes_hex(src_path);
+    let qkd = chan.establish_sifted_key(512, 0);
+    let aad = "BB84-QKD|" + chan.channel_id + "|sifted=" + str(qkd["sifted_bits"]) + "|qber=" + str(qkd["qber"]);
+    let env = {
+        "method": "QUANTUM-BB84-POLARIZATION + PRIVACY-AMP + AES-256-GCM",
+        "channel_id": chan.channel_id,
+        "aad": aad,
+        "ciphertext": aes_gcm_encrypt(qkd["priv_amp_key"], info["hex"], aad),
+        "plaintext_sha256": info["sha256"]
+    };
+    write_file(vault_path, json_stringify(env));
+
+    let lease = acquire_decrypt_lease(chan.channel_id, "BB84-QKD");
+    linear_consume(lease);
+
+    let plain_hex = aes_gcm_decrypt(qkd["priv_amp_key"], env["ciphertext"], aad);
+    assert(constant_time_equal(sha256(plain_hex), env["plaintext_sha256"]), "BB84 digest mismatch");
+    let written = write_hex_to_file(out_path, plain_hex);
+    return {"bytes": written, "sifted": qkd["sifted_bits"], "qber": qkd["qber"]};
+}
+
+// ----------------------------------------------------------------------------
+// Method 13: Hamiltonian Symplectic Chaos + Reversible CA Wave + Entropy Check
+// ----------------------------------------------------------------------------
+
+fn shannon_entropy_bits_per_byte(bs: List) -> Float {
+    let counts = [];
+    let c = 0;
+    while c < 256 {
+        counts = append(counts, 0);
+        c = c + 1;
+    }
+    let i = 0;
+    let n = len(bs);
+    while i < n {
+        let b = bs[i];
+        counts[b] = counts[b] + 1;
+        i = i + 1;
+    }
+    let h = 0.0;
+    let ln2 = ln(2.0);
+    if n != 0 {
+        if ln2 != 0.0 {
+            c = 0;
+            while c < 256 {
+                if counts[c] > 0 {
+                    let p = counts[c] / n;
+                    h = h - p * (ln(p) / ln2);
+                }
+                c = c + 1;
+            }
+        }
+    }
+    return h;
+}
+
+class SymplecticChaosKey {
+    fn init(self, key_id: String, burn_kicks: Int) -> Void {
+        assert(verify_physics_security_params(1100, burn_kicks, 16) >= 1860, "Symplectic policy failed");
+        let master = random_bytes_hex(32);
+        self.key_id = key_id;
+        self.burn_kicks = burn_kicks;
+        self.enc_seed = hmac_sha256(master, "symp:phase:" + key_id);
+        self.mac_key = hmac_sha256(master, "symp:mac:" + key_id);
+
+        // Canonical initial phase point (q0, p0) in Z_M x Z_M and coupling K.
+        let sbytes = hex_to_bytes(self.enc_seed);
+        self.q0 = le_bytes_to_u32(sbytes, 0) % 4294967291;
+        self.p0 = le_bytes_to_u32(sbytes, 4) % 4294967291;
+        self.k_coupling = (le_bytes_to_u32(sbytes, 8) % 65521) + 131;
+    }
+
+    fn symplectic_step(self, q: Int, p: Int, nonce_word: Int) -> List {
+        // Liouville area-preserving discrete Chirikov-Taylor kick-drift map (det(J) = 1 mod M):
+        // Nonlinear potential gradient mixes trigonometric-like cubic/quadratic phase mod M.
+        let kick_arg = (q + nonce_word) % 4294967291;
+        let q2 = (kick_arg * 2654435761) % 4294967291;
+        let force = ((self.k_coupling * ((q2 % 1048573) + 1)) + floor(q2 / 65536)) % 4294967291;
+        let p_next = (p + force) % 4294967291;
+        let q_next = (q + p_next) % 4294967291;
+        return [q_next, p_next];
+    }
+
+    fn generate_phase_bytes(self, nbytes: Int, q_start: Int, p_start: Int, nonce_word: Int) -> List {
+        let qp = [q_start, p_start];
+        let b = 0;
+        while b < self.burn_kicks {
+            qp = self.symplectic_step(qp[0], qp[1], nonce_word);
+            b = b + 1;
+        }
+        let out = [];
+        while len(out) < nbytes {
+            qp = self.symplectic_step(qp[0], qp[1], nonce_word);
+            let mix = sha256(self.enc_seed + "|" + str(qp[0]) + "|" + str(qp[1]) + "|" + str(nonce_word));
+            let mbytes = hex_to_bytes(mix);
+            let i = 0;
+            while i < len(mbytes) and len(out) < nbytes {
+                out = append(out, mbytes[i]);
+                i = i + 1;
+            }
+        }
+        return out;
+    }
+
+    fn ca_wave_apply_round(self, state: List, r: Int, reverse_sweep: Bool) -> List {
+        // Reverses index sweep order on decryption so odd-length circular boundaries invert identically.
+        let n = len(state);
+        let parity = r % 2;
+        if reverse_sweep {
+            let i = n - 1;
+            if i % 2 != parity {
+                i = i - 1;
+            }
+            while i >= parity {
+                let left = state[(i - 1 + n) % n];
+                let right = state[(i + 1) % n];
+                let drive = (left * 5 + right * 11 + r * 37) % 256;
+                state[i] = byte_xor(state[i], drive);
+                i = i - 2;
+            }
+        } else {
+            let i = parity;
+            while i < n {
+                let left = state[(i - 1 + n) % n];
+                let right = state[(i + 1) % n];
+                let drive = (left * 5 + right * 11 + r * 37) % 256;
+                state[i] = byte_xor(state[i], drive);
+                i = i + 2;
+            }
+        }
+        return state;
+    }
+
+    fn ca_wave_forward(self, bytes: List, wave_rounds: Int) -> List {
+        let state = concat([], bytes);
+        if len(state) < 2 {
+            return state;
+        }
+        let r = 0;
+        while r < wave_rounds {
+            state = self.ca_wave_apply_round(state, r, false);
+            r = r + 1;
+        }
+        return state;
+    }
+
+    fn ca_wave_inverse(self, bytes: List, wave_rounds: Int) -> List {
+        let state = concat([], bytes);
+        if len(state) < 2 {
+            return state;
+        }
+        let r = wave_rounds - 1;
+        while r >= 0 {
+            state = self.ca_wave_apply_round(state, r, true);
+            r = r - 1;
+        }
+        return state;
+    }
+}
+
+fn symplectic_protect_file(src_path: String, vault_path: String, key: SymplecticChaosKey) -> Map {
+    let raw = fs_read_bytes(src_path);
+    let nonce_hex = random_bytes_hex(8);
+    let nonce_word = le_bytes_to_u32(hex_to_bytes(nonce_hex), 0) % 4294967291;
+
+    let diffused = key.ca_wave_forward(raw, 4);
+    let ks = key.generate_phase_bytes(len(raw), key.q0, key.p0, nonce_word);
+    let ct_bytes = xor_byte_lists(diffused, ks);
+    let ct_hex = bytes_to_hex(ct_bytes);
+    let entropy = shannon_entropy_bits_per_byte(ct_bytes);
+    let mac = hmac_sha256(key.mac_key, "SYMP-CA-v1|" + key.key_id + "|" + nonce_hex + "|" + ct_hex);
+
+    let env = {
+        "method": "HAMILTONIAN-SYMPLECTIC-DET1 + WAVE-CA + EtM",
+        "key_id": key.key_id,
+        "nonce_hex": nonce_hex,
+        "entropy_bits_per_byte": entropy,
+        "ciphertext_hex": ct_hex,
+        "mac_tag": mac
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn symplectic_unprotect_file(vault_path: String, out_path: String, key: SymplecticChaosKey) -> Int {
+    let env = json_parse(read_file(vault_path));
+    assert(env["key_id"] == key.key_id, "Symplectic key_id mismatch");
+    let expected_mac = hmac_sha256(key.mac_key, "SYMP-CA-v1|" + key.key_id + "|" + env["nonce_hex"] + "|" + env["ciphertext_hex"]);
+    assert(constant_time_equal(expected_mac, env["mac_tag"]), "Symplectic EtM MAC failed");
+
+    let lease = acquire_decrypt_lease(key.key_id, "SYMPLECTIC-CHAOS");
+    linear_consume(lease);
+
+    let ct_bytes = hex_to_bytes(env["ciphertext_hex"]);
+    let nonce_word = le_bytes_to_u32(hex_to_bytes(env["nonce_hex"]), 0) % 4294967291;
+    let ks = key.generate_phase_bytes(len(ct_bytes), key.q0, key.p0, nonce_word);
+    let plain = key.ca_wave_inverse(xor_byte_lists(ct_bytes, ks), 4);
+    return fs_write_bytes(out_path, plain);
+}
+
+// ----------------------------------------------------------------------------
+// Method 14: Multi-Recipient Post-Quantum Hybrid Vault + Audit Hash Chain
+// ----------------------------------------------------------------------------
+
+fn append_audit_event(chain: List, actor: String, action: String, target: String, detail: String) -> List {
+    let prev_hash = sha256("KOVREK-AUDIT-GENESIS");
+    if len(chain) > 0 {
+        prev_hash = chain[len(chain) - 1]["entry_hash"];
+    }
+    let body = prev_hash + "|" + actor + "|" + action + "|" + target + "|" + detail;
+    let entry_hash = sha256(body);
+    return append(chain, {
+        "seq": len(chain),
+        "prev_hash": prev_hash,
+        "actor": actor,
+        "action": action,
+        "target": target,
+        "detail": detail,
+        "entry_hash": entry_hash
+    });
+}
+
+fn verify_audit_chain(chain: List) -> Bool {
+    let expected_prev = sha256("KOVREK-AUDIT-GENESIS");
+    let i = 0;
+    while i < len(chain) {
+        let e = chain[i];
+        if not constant_time_equal(e["prev_hash"], expected_prev) {
+            return false;
+        }
+        let recalc = sha256(e["prev_hash"] + "|" + e["actor"] + "|" + e["action"] + "|" + e["target"] + "|" + e["detail"]);
+        if not constant_time_equal(e["entry_hash"], recalc) {
+            return false;
+        }
+        expected_prev = e["entry_hash"];
+        i = i + 1;
+    }
+    return true;
+}
+
+fn multi_recipient_protect_file(
+    src_path: String,
+    vault_path: String,
+    passphrase: String,
+    rsa_pub: RsaPublicKey,
+    ec_pub: EcPublicKey,
+    pq_kp: LwePqKeyPair
+) -> Map {
+    let info = read_file_bytes_hex(src_path);
+    let dek_hex = random_bytes_hex(32);
+    let aad = "MULTI-HYBRID-PQ-v1|" + info["sha256"];
+    let file_ct = aes_gcm_encrypt(dek_hex, info["hex"], aad);
+
+    // Wrap the single file DEK orthogonally into 4 independent cryptographic slots:
+    let kdf_salt = random_bytes_hex(16);
+    let kek_pass = pbkdf2_sha256(passphrase, kdf_salt, 120000, 32);
+    let rsa_kem = rsa_kem_encapsulate(rsa_pub);
+    let ec_kem = ecies_encapsulate(ec_pub);
+    let lwe_kem = pq_kp.encapsulate_128bit_seed();
+
+    let audit = append_audit_event([], "vault-sealer", "SEAL_4_SLOTS", vault_path, info["sha256"]);
+    let env = {
+        "method": "MULTI-RECIPIENT-HYBRID(PBKDF2 + RSA + secp256k1 + PQ-LWE)",
+        "aad": aad,
+        "file_ct": file_ct,
+        "plaintext_sha256": info["sha256"],
+        "slot_passphrase": {"salt_hex": kdf_salt, "iters": 120000, "wrapped_dek": aes_gcm_encrypt(kek_pass, dek_hex, "SLOT-PASS|" + aad)},
+        "slot_rsa": {"key_id": rsa_pub.key_id, "c_kem": rsa_kem["c_kem"], "wrapped_dek": aes_gcm_encrypt(rsa_kem["dek"], dek_hex, "SLOT-RSA|" + aad)},
+        "slot_ecies": {"key_id": ec_pub.key_id, "rx": ec_kem["rx"], "ry": ec_kem["ry"], "wrapped_dek": aes_gcm_encrypt(ec_kem["dek"], dek_hex, "SLOT-ECIES|" + aad)},
+        "slot_lwe_pq": {"key_id": pq_kp.key_id, "fo_commit": lwe_kem["fo_commit"], "chunks": lwe_kem["chunks"], "wrapped_dek": aes_gcm_encrypt(lwe_kem["dek"], dek_hex, "SLOT-LWE|" + aad)},
+        "audit_chain": audit
+    };
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+fn multi_recipient_unseal_with_slot(vault_path: String, out_path: String, slot_name: String, cred_obj: Any) -> Map {
+    let env = json_parse(read_file(vault_path));
+    assert(verify_audit_chain(env["audit_chain"]), "Audit hash chain integrity failure");
+
+    let dek_hex = "";
+    if slot_name == "passphrase" {
+        let s = env["slot_passphrase"];
+        let kek = pbkdf2_sha256(cred_obj, s["salt_hex"], s["iters"], 32);
+        dek_hex = aes_gcm_decrypt(kek, s["wrapped_dek"], "SLOT-PASS|" + env["aad"]);
+    } else if slot_name == "rsa" {
+        let s = env["slot_rsa"];
+        dek_hex = aes_gcm_decrypt(rsa_kem_decapsulate(cred_obj, s["c_kem"]), s["wrapped_dek"], "SLOT-RSA|" + env["aad"]);
+    } else if slot_name == "ecies" {
+        let s = env["slot_ecies"];
+        dek_hex = aes_gcm_decrypt(ecies_decapsulate(cred_obj, s["rx"], s["ry"]), s["wrapped_dek"], "SLOT-ECIES|" + env["aad"]);
+    } else if slot_name == "lwe" {
+        let s = env["slot_lwe_pq"];
+        dek_hex = aes_gcm_decrypt(cred_obj.decapsulate_128bit_seed(s["chunks"], s["fo_commit"]), s["wrapped_dek"], "SLOT-LWE|" + env["aad"]);
+    } else {
+        throw "Unknown multi-recipient slot: " + slot_name;
+    }
+
+    let lease = acquire_decrypt_lease("multi-vault", "SLOT:" + slot_name);
+    linear_consume(lease);
+
+    let plain_hex = aes_gcm_decrypt(dek_hex, env["file_ct"], env["aad"]);
+    assert(constant_time_equal(sha256(plain_hex), env["plaintext_sha256"]), "Multi-slot plaintext hash mismatch");
+    let written = write_hex_to_file(out_path, plain_hex);
+
+    env["audit_chain"] = append_audit_event(env["audit_chain"], slot_name, "UNSEAL_OK", out_path, env["plaintext_sha256"]);
+    write_file(vault_path, json_stringify(env));
+    return env;
+}
+
+// ============================================================================
+// Package-Namespace Factory Helpers (for `import_package("kvcrypto").new_*`)
+// ============================================================================
+
+fn new_aead_file_key(key_id: String, policy_version: Int) -> Any { return AeadFileKey(key_id, policy_version); }
+fn new_stream_split_key(key_id: String) -> Any { return StreamSplitKey(key_id); }
+fn new_passphrase_kek_policy(policy_id: String, iterations: Int) -> Any { return PassphraseKekPolicy(policy_id, iterations); }
+fn new_chacha_poly_key(key_id: String) -> Any { return ChaChaPolyKey(key_id); }
+fn new_cbc_block_vault_key(key_id: String, rounds: Int) -> Any { return CbcBlockVaultKey(key_id, rounds); }
+fn new_rsa_private_key(key_id: String, role: String, p: String, q: String, e: String) -> Any { return RsaPrivateKey(key_id, role, p, q, e); }
+fn new_ec_private_key(key_id: String) -> Any { return EcPrivateKey(key_id); }
+fn new_dh_domain_params(group_name: String, p: String, q: String, g: String) -> Any { return DhDomainParams(group_name, p, q, g); }
+fn new_dh_static_key_pair(key_id: String, params: Any) -> Any { return DhStaticKeyPair(key_id, params); }
+fn new_elgamal_zkp_key_pair(key_id: String) -> Any { return ElGamalZkpKeyPair(key_id); }
+fn new_lwe_pq_key_pair(key_id: String) -> Any { return LwePqKeyPair(key_id); }
+fn new_shamir_totp_vault(vault_id: String, threshold_k: Int, total_n: Int, custodians: List) -> Any { return ShamirTotpVault(vault_id, threshold_k, total_n, custodians); }
+fn new_quantum_bb84_channel(channel_id: String, qber_max_bps: Int) -> Any { return QuantumBb84Channel(channel_id, qber_max_bps); }
+fn new_symplectic_chaos_key(key_id: String, burn_kicks: Int) -> Any { return SymplecticChaosKey(key_id, burn_kicks); }

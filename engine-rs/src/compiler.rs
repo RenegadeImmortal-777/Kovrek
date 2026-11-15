@@ -897,10 +897,27 @@ impl Compiler {
         params: &[(String, Option<String>)],
         return_type: &Option<String>,
         body: &[Stmt],
+        register_in_module_funcs: bool,
     ) -> Result<(), String> {
         let (child_code, child_dbg) = self.compile_child(params, body, self.cur_line)?;
         let def_ip = self.code.len();
         self.child_debugs.push((def_ip, 0, child_dbg));
+        let runtime_decs: Vec<&Expr> = decorators
+            .iter()
+            .filter(|d| !crate::pipeline::is_static_effect_decorator(d))
+            .collect();
+        if runtime_decs.is_empty() && register_in_module_funcs && !self.local_mode {
+            // Static-only module functions register directly in `funcs` like plain `fn`
+            // so forward references and `import_package` exports work uniformly.
+            self.code.push(Op::Def(
+                name.to_string(),
+                params.to_vec(),
+                return_type.clone(),
+                false,
+                child_code,
+            ));
+            return Ok(());
+        }
         let fn_key = unique_closure_key("dec", name);
         self.code.push(Op::Def(
             fn_key.clone(),
@@ -909,10 +926,6 @@ impl Compiler {
             false,
             child_code,
         ));
-        let runtime_decs: Vec<&Expr> = decorators
-            .iter()
-            .filter(|d| !crate::pipeline::is_static_effect_decorator(d))
-            .collect();
         if runtime_decs.is_empty() {
             self.code.push(Op::FunctionRef(fn_key));
             self.emit_define(name, false, None);
@@ -1252,7 +1265,7 @@ impl Compiler {
                         }
                         Stmt::DecoratedFn(decs, method, params, ret, mbody) => {
                             push_def(method);
-                            class_c.emit_decorated_fn(decs, method, params, ret, mbody)?;
+                            class_c.emit_decorated_fn(decs, method, params, ret, mbody, false)?;
                         }
                         Stmt::Class(nested_cls, ..) => {
                             push_def(nested_cls);
@@ -1328,7 +1341,7 @@ impl Compiler {
                 }
             }
             Stmt::DecoratedFn(decorators, name, params, return_type, body) => {
-                self.emit_decorated_fn(decorators, name, params, return_type, body)?;
+                self.emit_decorated_fn(decorators, name, params, return_type, body, true)?;
             }
             Stmt::AsyncFn(name, params, return_type, body) => {
                 let (child_code, child_dbg) = self.compile_child(params, body, self.cur_line)?;
