@@ -1,0 +1,86 @@
+name: Autonomous Package Factory & PQ Bundle Publisher
+
+on:
+  schedule:
+    # Runs automatically every 6 hours to synthesize, formally verify (@verify),
+    # PQ-certify (.pcc.json), and bundle Kovrek packages.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      grow_ecosystem:
+        description: "Synthesize & commit the next formally verified package into packages/"
+        required: false
+        default: "true"
+  push:
+    paths:
+      - "packages/**"
+      - "scripts/package_factory.kvr"
+      - ".github/workflows/package-factory.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  package-factory:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-rs
+
+      - name: Build Kovrek Sovereign Engine
+        working-directory: engine-rs
+        run: cargo build --release --locked
+
+      - name: Run Autonomous Package Synthesizer & PQ Registry Signer
+        env:
+          KOVREK_FACTORY_GROW: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.grow_ecosystem == 'true')) && '1' || '0' }}
+        run: |
+          ./engine-rs/target/release/kovrek check scripts/package_factory.kvr
+          ./engine-rs/target/release/kovrek run scripts/package_factory.kvr
+
+      - name: Pack .kvpkg.json Bundles for All Packages
+        run: |
+          set -euo pipefail
+          mkdir -p dist/packages/bundles
+          for pkg_dir in packages/*; do
+            if [ -d "$pkg_dir" ]; then
+              pkg_name="$(basename "$pkg_dir")"
+              ./engine-rs/target/release/kovrek pkg pack "$pkg_dir" "dist/packages/bundles/${pkg_name}.kvpkg.json"
+            fi
+          done
+
+      - name: Validate Entire Package Matrix (100% Check + Run Gate)
+        run: sh ./scripts/package-matrix.sh
+
+      - name: Commit & Push Newly Synthesized Verified Package
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain packages/ registry/index.json)" ]; then
+            git config user.name "kovrek-autonomous-factory[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add packages/ registry/index.json
+            NEW_PKGS="$(git status --porcelain packages/ | awk '{print $2}' | cut -d/ -f2 | sort -u | tr '\n' ' ')"
+            git commit -m "feat(packages): autonomous synthesis & formal PCC verification of ${NEW_PKGS}"
+            git pull --rebase origin master
+            git push origin HEAD:master
+          else
+            echo "No new package changes to commit."
+          fi
+
+      - name: Upload PQ-Signed Package Bundles & Registry Manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: kovrek-pq-signed-packages
+          path: dist/packages/**
+          if-no-files-found: error

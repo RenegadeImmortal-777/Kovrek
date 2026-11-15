@@ -1,0 +1,218 @@
+// ============================================================================
+// KOVREK AUTONOMOUS PACKAGE FACTORY & POST-QUANTUM REGISTRY BUILDER
+// (scripts/package_factory.kvr)
+// ============================================================================
+//
+// 1. Synthesizes formally verified (@verify) domain packages into `packages/`
+//    from a curated blueprint queue (and optional combinatorial extensions),
+//    generates a Post-Quantum Proof-Carrying Code certificate (.pcc.json) via
+//    `certify_source` + `verify_certificate` (ML-DSA-SIS + FORS-SHAKE256),
+//    and registers the new package in `registry/index.json`.
+// 2. Scans every package in `registry/index.json`, computes SHA3-512 digests
+//    for all package entrypoints, and emits a Post-Quantum signed registry
+//    manifest (`dist/packages/pq_registry_manifest.json`).
+//
+// Usage:
+//   .\bin\kovrek-native.exe run scripts\package_factory.kvr
+//   (Set env KOVREK_FACTORY_GROW=1 to synthesize the next package in queue)
+// ============================================================================
+
+fn blueprint_catalog() -> List {
+    return [
+        {
+            "name": "kvquantum",
+            "version": "1.0.0",
+            "description": "Exact statevector quantum circuits, Bell/GHZ entanglement & Grover search",
+            "source": "// kvquantum: Sovereign Quantum Circuit, Entanglement Entropy & Grover Search\n\n@verify\nfn validate_qubit_count(n: Int) -> Int {\n    requires(n >= 1, \"n >= 1\");\n    let clamped = n;\n    if clamped > 12 {\n        clamped = 12;\n    }\n    ensures(clamped >= 1, \"clamped >= 1\");\n    ensures(clamped <= 12, \"clamped <= 12\");\n    return clamped;\n}\n\nfn bell_pair() -> Map {\n    return qcircuit_run(2, [[\"H\", 0], [\"CNOT\", 0, 1]]);\n}\n\nfn ghz_state(num_qubits: Int) -> Map {\n    let n = validate_qubit_count(num_qubits);\n    if n < 2 { n = 2; }\n    let ops = [[\"H\", 0]];\n    let i = 0;\n    while i < n - 1 {\n        ops = concat(ops, [[\"CNOT\", i, i + 1]]);\n        i = i + 1;\n    }\n    return qcircuit_run(n, ops);\n}\n\nfn grover_find(num_qubits: Int, marked_state: Int) -> Map {\n    return qgrover_search(num_qubits, marked_state);\n}\n\nfn bipartite_entropy(num_qubits: Int, ops: List, sub_a: List) -> Number {\n    return qentanglement_entropy(num_qubits, ops, sub_a);\n}\n"
+        },
+        {
+            "name": "kvecc",
+            "version": "1.0.0",
+            "description": "Cosmic-ray self-healing Extended Hamming (72,64) SECDED memory containers",
+            "source": "// kvecc: Cosmic-Ray Self-Healing SECDED (72,64) Memory Containers\n\n@verify\nfn clamp_bit_position(bit_idx: Int) -> Int {\n    requires(bit_idx >= 0, \"bit_idx >= 0\");\n    let pos = bit_idx;\n    if pos > 71 {\n        pos = 71;\n    }\n    ensures(pos >= 0, \"pos >= 0\");\n    ensures(pos <= 71, \"pos <= 71\");\n    return pos;\n}\n\nfn protect(payload: String) -> String {\n    return ecc_encode(payload);\n}\n\nfn heal(token: String) -> Map {\n    return ecc_decode(token);\n}\n\nfn inject_single_fault(token: String, word_idx: Int, bit_idx: Int) -> String {\n    let safe_bit = clamp_bit_position(bit_idx);\n    return ecc_flip_bit(token, word_idx, safe_bit);\n}\n\nfn verify_self_healing(payload: String) -> Bool {\n    let tok = ecc_encode(payload);\n    let damaged = ecc_flip_bit(tok, 0, 7);\n    let rep = ecc_decode(damaged);\n    return rep[\"ok\"] and rep[\"healed\"] and rep[\"text\"] == payload;\n}\n"
+        },
+        {
+            "name": "kvpcc",
+            "version": "1.0.0",
+            "description": "Post-Quantum Proof-Carrying Code (PCC) formal verification certificates",
+            "source": "// kvpcc: Post-Quantum Proof-Carrying Code (PCC) Certificates\n\n@verify\nfn require_min_obligations(count: Int) -> Int {\n    requires(count >= 1, \"count >= 1\");\n    let c = count;\n    ensures(c >= 1, \"c >= 1\");\n    return c;\n}\n\nfn issue_keypair() -> Map {\n    return pq_sign_keygen();\n}\n\nfn certify(kvr_source: String, secret_key: String) -> String {\n    return certify_source(kvr_source, secret_key);\n}\n\nfn verify(kvr_source: String, cert_json: String, public_key: String) -> Map {\n    return verify_certificate(kvr_source, cert_json, public_key);\n}\n"
+        },
+        {
+            "name": "kvpqsign",
+            "version": "1.0.0",
+            "description": "Post-Quantum ML-DSA-SIS + FORS-SHAKE256 dual lattice & hash-tree signatures",
+            "source": "// kvpqsign: Post-Quantum Dual Lattice + Stateless Hash-Tree Signatures\n\n@verify\nfn clamp_threshold(k: Int, n: Int) -> Int {\n    requires(k >= 1, \"k >= 1\");\n    requires(n >= 1, \"n >= 1\");\n    let out = k;\n    if out > n {\n        out = n;\n    }\n    ensures(out >= 1, \"out >= 1\");\n    return out;\n}\n\nfn keygen() -> Map {\n    return pq_sign_keygen();\n}\n\nfn sign_detached(secret_key: String, message: String) -> String {\n    return pq_sign(secret_key, message);\n}\n\nfn verify_detached(public_key: String, message: String, signature: String) -> Bool {\n    return pq_verify(public_key, message, signature);\n}\n\nfn sign_envelope(secret_key: String, public_key: String, payload: String) -> Map {\n    let sig = pq_sign(secret_key, payload);\n    return {\n        \"scheme\": \"ML-DSA-SIS+FORS-SHAKE256\",\n        \"payload\": payload,\n        \"sha3_512\": sha3_512(payload),\n        \"public_key\": public_key,\n        \"signature\": sig\n    };\n}\n\nfn verify_envelope(env: Map) -> Bool {\n    if sha3_512(env[\"payload\"]) != env[\"sha3_512\"] {\n        return false;\n    }\n    return pq_verify(env[\"public_key\"], env[\"payload\"], env[\"signature\"]);\n}\n"
+        },
+        {
+            "name": "kvvault",
+            "version": "1.0.0",
+            "description": "MYSTIQUE-1024 / MAESTRO / OBSCURE streaming file vault policies & guardrails",
+            "source": "// kvvault: Sovereign MYSTIQUE-1024, MAESTRO & OBSCURE Vault Policy Engine\n\n@verify\nfn clamp_argon2_kib(mem_kib: Int) -> Int {\n    requires(mem_kib >= 0, \"mem_kib >= 0\");\n    let m = mem_kib;\n    if m < 8 { m = 8; }\n    if m > 4194304 { m = 4194304; }\n    ensures(m >= 8, \"m >= 8\");\n    ensures(m <= 4194304, \"m <= 4194304\");\n    return m;\n}\n\nfn keygen() -> Map {\n    return pq_hybrid_keygen();\n}\n\nfn seal_standard(src: String, dst: String, passphrase: String, recipient_pub: String) -> Map {\n    return vault_seal_file(src, dst, {\n        \"cipher\": \"mystique\",\n        \"obscure\": false,\n        \"passphrase\": passphrase,\n        \"recipient_pub\": recipient_pub,\n        \"mem_kib\": clamp_argon2_kib(16384),\n        \"iterations\": 2,\n        \"ratchet_every\": 8,\n        \"pad_bucket\": 4096\n    });\n}\n\nfn seal_obscure(src: String, dst: String, passphrase: String) -> Map {\n    return vault_seal_file(src, dst, {\n        \"cipher\": \"mystique\",\n        \"obscure\": true,\n        \"passphrase\": passphrase,\n        \"mem_kib\": clamp_argon2_kib(16384),\n        \"iterations\": 2,\n        \"ratchet_every\": 8,\n        \"pad_bucket\": 4096\n    });\n}\n\nfn unseal(vault_path: String, out_path: String, creds: Map) -> Map {\n    return vault_unseal_file(vault_path, out_path, creds);\n}\n\nfn inspect(vault_path: String) -> Map {\n    return vault_inspect(vault_path);\n}\n"
+        },
+        {
+            "name": "kvsilicon",
+            "version": "1.0.0",
+            "description": "Hardware silicon acceleration (AES-NI, PCLMULQDQ, AVX2, FMA) & SIMD diagnostics",
+            "source": "// kvsilicon: Hardware Silicon Acceleration & SIMD Feature Telemetry\n\n@verify\nfn clamp_vector_lanes(lanes: Int) -> Int {\n    requires(lanes >= 1, \"lanes >= 1\");\n    let l = lanes;\n    if l > 64 { l = 64; }\n    ensures(l >= 1, \"l >= 1\");\n    ensures(l <= 64, \"l <= 64\");\n    return l;\n}\n\nfn features() -> Map {\n    return simd_info();\n}\n\nfn has_hardware_aes() -> Bool {\n    let info = simd_info();\n    return info[\"aes_ni\"];\n}\n\nfn optimal_simd_lanes() -> Int {\n    let info = simd_info();\n    if info[\"avx2\"] {\n        return clamp_vector_lanes(8);\n    }\n    return clamp_vector_lanes(4);\n}\n"
+        }
+    ];
+}
+
+fn synthesize_combinatorial_blueprint(seq: Int) -> Map {
+    let name = f"kvsovereign_{seq}";
+    let bound = seq * 100;
+    let src = f"// {name}: Autonomous Formally Verified Sovereign Module #{seq}\n\n"
+            + "@verify\n"
+            + f"fn enforce_bound_{seq}(val: Int) -> Int {{\n"
+            + "    requires(val >= 0, \"val >= 0\");\n"
+            + "    let r = val;\n"
+            + f"    if r > {bound} {{ r = {bound}; }}\n"
+            + "    ensures(r >= 0, \"r >= 0\");\n"
+            + f"    ensures(r <= {bound}, \"r <= {bound}\");\n"
+            + "    return r;\n"
+            + "}\n\n"
+            + "fn module_info() -> Map {\n"
+            + f"    return {{\"name\": \"{name}\", \"sequence\": {seq}, \"max_bound\": {bound}}};\n"
+            + "}\n\n"
+            + "fn seal_frame(payload: String) -> String {\n"
+            + "    return ecc_encode(payload);\n"
+            + "}\n";
+    return {
+        "name": name,
+        "version": "1.0.0",
+        "description": f"Autonomous formally verified sovereign module #{seq}",
+        "source": src
+    };
+}
+
+fn run_factory() {
+    print("============================================================================");
+    print("  KOVREK AUTONOMOUS PACKAGE FACTORY & PQ REGISTRY BUILDER");
+    print("============================================================================");
+
+    let index_path = "registry/index.json";
+    let index_obj = json_parse(read_file(index_path));
+    let pkgs_map = index_obj["packages"];
+
+    let grow_env = env_get("KOVREK_FACTORY_GROW");
+    let should_grow = grow_env == "1" or grow_env == "true" or grow_env == "TRUE";
+
+    let signer_keys = pq_sign_keygen("kovrek-autonomous-package-factory-v1");
+    let synthesized_name = "";
+
+    if should_grow {
+        let catalog = blueprint_catalog();
+        let chosen = null;
+        let i = 0;
+        while i < len(catalog) {
+            let item = catalog[i];
+            let cand_name = item["name"];
+            if get(pkgs_map, cand_name) == null {
+                chosen = item;
+                break;
+            }
+            i = i + 1;
+        }
+        if chosen == null {
+            let seq = 1;
+            while get(pkgs_map, f"kvsovereign_{seq}") != null {
+                seq = seq + 1;
+            }
+            chosen = synthesize_combinatorial_blueprint(seq);
+        }
+
+        let pkg_name = chosen["name"];
+        let pkg_ver  = chosen["version"];
+        let pkg_src  = chosen["source"];
+        let pkg_dir  = path_join("packages", pkg_name);
+        let entry_fn = pkg_name + ".kvr";
+        let entry_path = path_join(pkg_dir, entry_fn);
+        let manifest_path = path_join(pkg_dir, "kovrek.json");
+        let pcc_path = path_join(pkg_dir, pkg_name + ".pcc.json");
+
+        // 1. Formally verify & generate Post-Quantum Proof-Carrying Code certificate
+        let pcc_cert = certify_source(pkg_src, signer_keys["secret_key"]);
+        let pcc_check = verify_certificate(pkg_src, pcc_cert, signer_keys["public_key"]);
+        assert(pcc_check["valid"] and pcc_check["contracts_proven"] >= 1, "Factory PCC verification failed");
+
+        // 2. Write package files
+        fs_mkdir(pkg_dir);
+        write_file(entry_path, pkg_src);
+        write_file(manifest_path, json_stringify({
+            "name": pkg_name,
+            "version": pkg_ver,
+            "entry": entry_fn,
+            "description": chosen["description"]
+        }) + "\n");
+        write_file(pcc_path, pcc_cert + "\n");
+
+        // 3. Register in registry/index.json
+        pkgs_map[pkg_name] = {
+            "entry": entry_fn,
+            "source": "../packages/" + pkg_name,
+            "version": pkg_ver
+        };
+        index_obj["packages"] = pkgs_map;
+        write_file(index_path, json_stringify(index_obj) + "\n");
+        synthesized_name = pkg_name;
+
+        print(f"  [+] Synthesized & Verified Package : {pkg_name} v{pkg_ver}");
+        print(f"      Formal Contracts Proven        : {pcc_check['contracts_proven']}");
+        print(f"      PQ Proof Certificate           : {pcc_path}");
+    } else {
+        print("  [i] KOVREK_FACTORY_GROW not set; skipping new package synthesis.");
+    }
+
+    // --- Phase 2: Build Post-Quantum Signed Registry Manifest (dist/packages) ---
+    let dist_dir = env_get("KOVREK_FACTORY_OUT_DIR");
+    if dist_dir == null or dist_dir == "" {
+        fs_mkdir("dist");
+        dist_dir = path_join("dist", "packages");
+    }
+    fs_mkdir(dist_dir);
+
+    let all_names = sorted(keys(pkgs_map));
+    let manifest_entries = {};
+    let digest_transcript = "KOVREK-PQ-REGISTRY-V1";
+    let idx = 0;
+    while idx < len(all_names) {
+        let name = all_names[idx];
+        let meta = pkgs_map[name];
+        let entry_rel = meta["entry"];
+        let pkg_file = path_join(path_join("packages", name), entry_rel);
+        if path_exists(pkg_file) {
+            let content = read_file(pkg_file);
+            let h = sha3_512(content);
+            manifest_entries[name] = {
+                "version": meta["version"],
+                "entry": entry_rel,
+                "sha3_512": h,
+                "bytes": len(content)
+            };
+            digest_transcript = digest_transcript + "|" + name + ":" + h;
+        }
+        idx = idx + 1;
+    }
+
+    let registry_sig = pq_sign(signer_keys["secret_key"], digest_transcript);
+    assert(pq_verify(signer_keys["public_key"], digest_transcript, registry_sig), "Registry PQ signature check");
+
+    let signed_registry = {
+        "format": "KOVREK-PQ-REGISTRY-V1",
+        "signature_scheme": "ML-DSA-SIS+FORS-SHAKE256",
+        "total_packages": len(all_names),
+        "synthesized_in_run": synthesized_name,
+        "public_key": signer_keys["public_key"],
+        "transcript_sha3_512": sha3_512(digest_transcript),
+        "signature": registry_sig,
+        "packages": manifest_entries
+    };
+    let out_manifest = path_join(dist_dir, "pq_registry_manifest.json");
+    write_file(out_manifest, json_stringify(signed_registry) + "\n");
+
+    print(f"  [+] Total Registered Packages      : {len(all_names)}");
+    print(f"  [+] PQ-Signed Registry Manifest    : {out_manifest}");
+    print("============================================================================");
+}
+
+run_factory();
