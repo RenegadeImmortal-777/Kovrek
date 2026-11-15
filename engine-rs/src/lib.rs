@@ -42,6 +42,7 @@ mod plugin;
 mod pq_crypto;
 mod project;
 mod py_bridge;
+mod quantum_ecc;
 mod registry;
 mod runtime;
 mod security;
@@ -892,6 +893,134 @@ fn run_vault_cli(args: &[String]) -> Result<(), String> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        Some("sign-keygen") => {
+            let mut out_prefix: Option<String> = None;
+            let mut idx = 1usize;
+            while idx < args.len() {
+                match args[idx].as_str() {
+                    "--out" => {
+                        let v = next_flag_val(args, &mut idx, "--out")?;
+                        out_prefix = Some(v.to_string());
+                    }
+                    other => {
+                        return Err(format!(
+                            "unknown option '{other}' for kovrek vault sign-keygen"
+                        ));
+                    }
+                }
+            }
+            let (pub_key, sec_key) = crate::pq_crypto::pq_sign_keygen();
+            if let Some(prefix) = out_prefix {
+                let pub_path = format!("{prefix}.sig.pub");
+                let sec_path = format!("{prefix}.sig.sec");
+                fs::write(&pub_path, format!("{pub_key}\n"))
+                    .map_err(|e| format!("failed to write '{pub_path}': {e}"))?;
+                fs::write(&sec_path, format!("{sec_key}\n"))
+                    .map_err(|e| format!("failed to write '{sec_path}': {e}"))?;
+                println!("wrote ML-DSA-SIS + FORS-SHAKE256 public key : {pub_path}");
+                println!("wrote ML-DSA-SIS + FORS-SHAKE256 secret key : {sec_path}");
+            } else {
+                println!("PUBLIC_KEY={pub_key}");
+                println!("SECRET_KEY={sec_key}");
+            }
+            Ok(())
+        }
+        Some("sign") => {
+            let mut pos: Vec<String> = Vec::new();
+            let mut seckey_arg: Option<String> = None;
+            let mut out_sig: Option<String> = None;
+            let mut idx = 1usize;
+            while idx < args.len() {
+                match args[idx].as_str() {
+                    "--seckey" => {
+                        let v = next_flag_val(args, &mut idx, "--seckey")?;
+                        seckey_arg = Some(read_vault_key_arg(v, "kvsign1sec:")?);
+                    }
+                    "--out" => {
+                        let v = next_flag_val(args, &mut idx, "--out")?;
+                        out_sig = Some(v.to_string());
+                    }
+                    flag if flag.starts_with('-') => {
+                        return Err(format!("unknown option '{flag}' for kovrek vault sign"));
+                    }
+                    arg => {
+                        pos.push(arg.to_string());
+                        idx += 1;
+                    }
+                }
+            }
+            if pos.len() != 1 {
+                return Err(
+                    "usage: kovrek vault sign <file> --seckey <key-or-file> [--out <sig-file>]"
+                        .into(),
+                );
+            }
+            let sk = seckey_arg
+                .ok_or_else(|| "kovrek vault sign requires --seckey <key-or-file>".to_string())?;
+            let data =
+                fs::read(&pos[0]).map_err(|e| format!("failed to read '{}': {e}", pos[0]))?;
+            let sig = crate::pq_crypto::pq_sign(&sk, &data)?;
+            if let Some(sig_path) = out_sig {
+                fs::write(&sig_path, format!("{sig}\n"))
+                    .map_err(|e| format!("failed to write '{sig_path}': {e}"))?;
+                println!("wrote post-quantum signature: {sig_path}");
+            } else {
+                println!("{sig}");
+            }
+            Ok(())
+        }
+        Some("verify") => {
+            let mut pos: Vec<String> = Vec::new();
+            let mut pubkey_arg: Option<String> = None;
+            let mut sig_arg: Option<String> = None;
+            let mut idx = 1usize;
+            while idx < args.len() {
+                match args[idx].as_str() {
+                    "--pubkey" => {
+                        let v = next_flag_val(args, &mut idx, "--pubkey")?;
+                        pubkey_arg = Some(read_vault_key_arg(v, "kvsign1pub:")?);
+                    }
+                    "--sig" => {
+                        let v = next_flag_val(args, &mut idx, "--sig")?;
+                        sig_arg = Some(read_vault_key_arg(v, "kvsign1sig:")?);
+                    }
+                    flag if flag.starts_with('-') => {
+                        return Err(format!("unknown option '{flag}' for kovrek vault verify"));
+                    }
+                    arg => {
+                        pos.push(arg.to_string());
+                        idx += 1;
+                    }
+                }
+            }
+            if pos.len() != 1 {
+                return Err(
+                    "usage: kovrek vault verify <file> --pubkey <key-or-file> --sig <sig-or-file>"
+                        .into(),
+                );
+            }
+            let pk = pubkey_arg
+                .ok_or_else(|| "kovrek vault verify requires --pubkey <key-or-file>".to_string())?;
+            let sig = sig_arg
+                .ok_or_else(|| "kovrek vault verify requires --sig <sig-or-file>".to_string())?;
+            let data =
+                fs::read(&pos[0]).map_err(|e| format!("failed to read '{}': {e}", pos[0]))?;
+            let ok = crate::pq_crypto::pq_verify(&pk, &data, &sig)?;
+            if !ok {
+                return Err("post-quantum signature verification FAILED".into());
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "scheme": "ML-DSA-SIS+FORS-SHAKE256",
+                    "file": pos[0],
+                    "bytes_verified": data.len(),
+                }))
+                .map_err(|e| e.to_string())?
             );
             Ok(())
         }
@@ -8327,5 +8456,38 @@ ja(20000);
 
         drop(_guard);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sovereign_next_century_quantum_ecc_pcc_and_pq_signatures() {
+        let script = r#"
+            let hw = simd_info();
+            assert(len(hw["arch"]) > 0, "simd_info arch");
+
+            let kp = pq_sign_keygen("deterministic-seed-alpha");
+            let sig = pq_sign(kp["secret_key"], "Kovrek 23rd Century Sovereign Frame");
+            assert(pq_verify(kp["public_key"], "Kovrek 23rd Century Sovereign Frame", sig), "pq_verify valid");
+            assert(not pq_verify(kp["public_key"], "Tampered Frame", sig), "pq_verify tampered");
+
+            let bell = qcircuit_run(2, [["H", 0], ["CNOT", 0, 1]]);
+            assert(bell["entanglement_entropy_q0"] > 0.999, "Bell entropy");
+            let ghz_ent = qentanglement_entropy(4, [["H", 0], ["CNOT", 0, 1], ["CNOT", 1, 2], ["CNOT", 2, 3]], [0, 1]);
+            assert(ghz_ent > 0.999 and ghz_ent < 1.001, "GHZ bipartition entropy");
+
+            let grover = qgrover_search(6, 42);
+            assert(grover["measured_state"] == 42 and grover["target_probability"] > 0.99, "Grover search");
+
+            let tok = ecc_encode("COSMIC-RAY-IMMUNE-MEMORY-BLOCK");
+            let flipped = ecc_flip_bit(ecc_flip_bit(tok, 0, 12), 5, 67);
+            let healed = ecc_decode(flipped);
+            assert(healed["ok"] and healed["healed"] and healed["corrected_bits"] == 2, "SECDED heal");
+            assert(healed["text"] == "COSMIC-RAY-IMMUNE-MEMORY-BLOCK", "SECDED text");
+
+            let src = "@verify\nfn clamp10(v: Int) -> Int {\n    requires(v >= 0, \"v>=0\");\n    let out = v;\n    if out > 10 { out = 10; }\n    ensures(out >= 0, \"out>=0\");\n    ensures(out <= 10, \"out<=10\");\n    return out;\n}\n";
+            let cert = certify_source(src, kp["secret_key"]);
+            let vrep = verify_certificate(src, cert, kp["public_key"]);
+            assert(vrep["valid"] and vrep["contracts_proven"] >= 2, "PCC valid");
+        "#;
+        run_source(script).expect("sovereign next-century builtins should succeed");
     }
 }

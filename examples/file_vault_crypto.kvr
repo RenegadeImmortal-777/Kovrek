@@ -332,8 +332,41 @@ fn run_complete_crypto_suite() -> Void {
         fs_write_bytes(p15_obs_t, raw_obs);
         expect_error("OBSCURE tamper rejected", fn() { sovereign_unseal_file(p15_obs_t, p15_obs_fail, {"passphrase": "obscure-blind-pass"}); });
         assert(not path_exists(p15_obs_fail), "Tampered unseal must remove partial output");
-        print(f"[15/15 PASS] MYSTIQUE+MAESTRO+OBSCURE  | {n15}B bin  | 1024b 4-engine + ML-KEM-1024/X25519 + zero-leak");
-        print("ALL 15 ENCRYPTION PARADIGMS, KEY STRUCTURES, & SECURITY MECHANISMS PASSED.");
+        print(f"[15/16 PASS] MYSTIQUE+MAESTRO+OBSCURE  | {n15}B bin  | 1024b 4-engine + ML-KEM-1024/X25519 + zero-leak");
+
+        // ------------------------------------------------------------------------
+        // 16. NEXT-CENTURY SOVEREIGN STACK: ML-DSA-SIS+FORS-SHAKE256 Signatures,
+        //     Exact Quantum Entanglement/Grover Simulator, SECDED (72,64) ECC, & PCC
+        // ------------------------------------------------------------------------
+        let hw = simd_info();
+        assert(len(hw["arch"]) > 0, "Hardware SIMD arch info required");
+
+        let text_payload = "KOVREK SOVEREIGN 22ND CENTURY PAYLOAD // ML-DSA-SIS+FORS-SHAKE256 + SECDED(72,64)";
+        let sig_kp = sovereign_sign_keygen();
+        let sig_token = sovereign_sign(sig_kp["secret_key"], text_payload);
+        assert(sovereign_verify(sig_kp["public_key"], text_payload, sig_token), "PQ dual lattice+hash signature verify");
+        assert(not sovereign_verify(sig_kp["public_key"], text_payload + "!", sig_token), "PQ signature tamper reject");
+
+        let bell_res = qcircuit_run(2, [["H", 0], ["CNOT", 0, 1]]);
+        assert(bell_res["entanglement_entropy_q0"] > 0.999 and bell_res["entanglement_entropy_q0"] < 1.001, "Bell entanglement entropy == 1.0 bit");
+        let grover_res = qgrover_search(6, 42);
+        assert(grover_res["measured_state"] == 42 and grover_res["target_probability"] > 0.99, "Grover 6-qubit search |42> amplification");
+
+        let ecc_tok = ecc_protect_text(text_payload);
+        let ecc_irradiated = ecc_flip_bit(ecc_flip_bit(ecc_flip_bit(ecc_tok, 0, 5), 2, 33), 6, 71);
+        let ecc_healed = ecc_heal_text(ecc_irradiated);
+        assert(ecc_healed["ok"] and ecc_healed["healed"] and ecc_healed["corrected_bits"] == 3, "SECDED (72,64) cosmic-ray self-healing");
+        assert(constant_time_equal(ecc_healed["text"], text_payload), "SECDED healed payload exact match");
+
+        let verified_src = "@verify\nfn safe_clamp(x: Int) -> Int {\n    requires(x >= 0, \"x>=0\");\n    let r = x;\n    if r > 100 { r = 100; }\n    ensures(r >= 0, \"r>=0\");\n    ensures(r <= 100, \"r<=100\");\n    return r;\n}\n";
+        let pcc_cert = certify_kvr_source(verified_src, sig_kp["secret_key"]);
+        let pcc_check = verify_kvr_certificate(verified_src, pcc_cert, sig_kp["public_key"]);
+        assert(pcc_check["valid"] and pcc_check["contracts_proven"] >= 2, "Post-Quantum Proof-Carrying Code certificate valid");
+        let pcc_tampered = verify_kvr_certificate(verified_src + "// tamper", pcc_cert, sig_kp["public_key"]);
+        assert(not pcc_tampered["valid"], "Tampered source must fail PCC verification");
+
+        print(f"[16/16 PASS] PQ-SIGN+QUANTUM+ECC+PCC   | {len(text_payload)}B txt | ML-DSA-SIS+FORS + Grover/Bell + SECDED(72,64) + PCC");
+        print("ALL 16 ENCRYPTION PARADIGMS, QUANTUM SIMULATORS, SELF-HEALING ECC, & PCC MECHANISMS PASSED.");
     } catch suite_err {
         throw suite_err;
     } finally {

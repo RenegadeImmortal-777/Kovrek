@@ -2151,3 +2151,34 @@ fn new_lwe_pq_key_pair(key_id: String) -> Any { return LwePqKeyPair(key_id); }
 fn new_shamir_totp_vault(vault_id: String, threshold_k: Int, total_n: Int, custodians: List) -> Any { return ShamirTotpVault(vault_id, threshold_k, total_n, custodians); }
 fn new_quantum_bb84_channel(channel_id: String, qber_max_bps: Int) -> Any { return QuantumBb84Channel(channel_id, qber_max_bps); }
 fn new_symplectic_chaos_key(key_id: String, burn_kicks: Int) -> Any { return SymplecticChaosKey(key_id, burn_kicks); }
+
+// --- Next-Century Sovereign Post-Quantum Signatures, Quantum Simulation, ECC & PCC ---
+
+fn sovereign_sign_keygen() -> Map {
+    return pq_sign_keygen();
+}
+
+fn sovereign_sign(secret_key: String, message: String) -> String {
+    return pq_sign(secret_key, message);
+}
+
+fn sovereign_verify(public_key: String, message: String, signature: String) -> Bool {
+    return pq_verify(public_key, message, signature);
+}
+
+fn ecc_protect_text(text: String) -> String {
+    return ecc_encode(text);
+}
+
+fn ecc_heal_text(token: String) -> Map {
+    return ecc_decode(token);
+}
+
+fn certify_kvr_source(source: String, secret_key: String) -> String {
+    return certify_source(source, secret_key);
+}
+
+fn verify_kvr_certificate(source: String, cert_json: String, public_key: String) -> Map {
+    return verify_certificate(source, cert_json, public_key);
+}
+

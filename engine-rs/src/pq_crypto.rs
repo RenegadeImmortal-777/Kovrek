@@ -1713,6 +1713,533 @@ pub(crate) fn pq_hybrid_decaps_raw(sec_bytes: &[u8], ct_wire: &[u8]) -> Result<[
     Ok(combined)
 }
 
+// ============================================================================
+// Sovereign Post-Quantum Dual Signature Engine (ML-DSA-SIS + FORS-SHAKE256)
+// ============================================================================
+// Combines two mathematically orthogonal post-quantum signature families:
+// 1. Module-LWE / Module-SIS Lattice Fiat-Shamir with Aborts (q = 8,380,417)
+// 2. Stateless FORS-SHAKE256 Merkle Forest Authentication Paths (FIPS 202/205)
+
+const PQSIG_Q: i64 = 8_380_417;
+const PQSIG_N: usize = 64;
+const PQSIG_K: usize = 3;
+const PQSIG_L: usize = 3;
+const PQSIG_ETA: i64 = 2;
+const PQSIG_TAU: usize = 16;
+const PQSIG_BETA: i64 = 32; // TAU * ETA
+const PQSIG_GAMMA1: i64 = 131_072; // 2^17
+const PQSIG_GAMMA2: i64 = 95_232; // (Q - 1) / 88
+const PQSIG_ALPHA: i64 = 2 * PQSIG_GAMMA2;
+
+const FORS_TREES: usize = 8;
+const FORS_HEIGHT: usize = 4;
+const FORS_LEAVES: usize = 1 << FORS_HEIGHT; // 16
+
+const PQSIG_PUB_PREFIX: &str = "kvsign1pub:";
+const PQSIG_SEC_PREFIX: &str = "kvsign1sec:";
+const PQSIG_SIG_PREFIX: &str = "kvsign1sig:";
+
+type SigPoly = [i64; PQSIG_N];
+
+#[inline(always)]
+fn mod_sig_q(x: i64) -> i64 {
+    let r = x % PQSIG_Q;
+    if r < 0 { r + PQSIG_Q } else { r }
+}
+
+fn sig_poly_add(a: &SigPoly, b: &SigPoly) -> SigPoly {
+    let mut out = [0i64; PQSIG_N];
+    for i in 0..PQSIG_N {
+        out[i] = mod_sig_q(a[i] + b[i]);
+    }
+    out
+}
+
+fn sig_poly_sub(a: &SigPoly, b: &SigPoly) -> SigPoly {
+    let mut out = [0i64; PQSIG_N];
+    for i in 0..PQSIG_N {
+        out[i] = mod_sig_q(a[i] - b[i]);
+    }
+    out
+}
+
+/// Negacyclic polynomial multiplication in Z_q[X]/(X^N + 1).
+fn sig_poly_mul_mod(a: &SigPoly, b: &SigPoly) -> SigPoly {
+    let mut out = [0i64; PQSIG_N];
+    for i in 0..PQSIG_N {
+        for j in 0..PQSIG_N {
+            let prod = a[i] * b[j];
+            if i + j < PQSIG_N {
+                out[i + j] = (out[i + j] + prod) % PQSIG_Q;
+            } else {
+                out[i + j - PQSIG_N] = (out[i + j - PQSIG_N] - prod) % PQSIG_Q;
+            }
+        }
+    }
+    for coeff in &mut out {
+        *coeff = mod_sig_q(*coeff);
+    }
+    out
+}
+
+/// Exact integer negacyclic multiplication (without mod q reduction) for c * s.
+fn sig_poly_mul_int(a: &SigPoly, b: &SigPoly) -> SigPoly {
+    let mut out = [0i64; PQSIG_N];
+    for i in 0..PQSIG_N {
+        for j in 0..PQSIG_N {
+            let prod = a[i] * b[j];
+            if i + j < PQSIG_N {
+                out[i + j] += prod;
+            } else {
+                out[i + j - PQSIG_N] -= prod;
+            }
+        }
+    }
+    out
+}
+
+/// FIPS 204 Algorithm 36 Decompose(r, alpha = 2*gamma2): r = r1*alpha + r0 mod q.
+fn sig_decompose(r: i64) -> (i64, i64) {
+    let r_plus = mod_sig_q(r);
+    let mut r0 = r_plus % PQSIG_ALPHA;
+    if r0 > PQSIG_GAMMA2 {
+        r0 -= PQSIG_ALPHA;
+    }
+    if r_plus - r0 == PQSIG_Q - 1 {
+        (0, r0 - 1)
+    } else {
+        ((r_plus - r0) / PQSIG_ALPHA, r0)
+    }
+}
+
+fn expand_sig_matrix_a(rho: &[u8; 32]) -> [[SigPoly; PQSIG_L]; PQSIG_K] {
+    let mut mat = [[[0i64; PQSIG_N]; PQSIG_L]; PQSIG_K];
+    for i in 0..PQSIG_K {
+        for j in 0..PQSIG_L {
+            let mut seed = [0u8; 36];
+            seed[..32].copy_from_slice(rho);
+            seed[32..36].copy_from_slice(&[b'A', i as u8, j as u8, 0]);
+            let stream = shake128(&seed, PQSIG_N * 4);
+            for k in 0..PQSIG_N {
+                let raw = u32::from_le_bytes([
+                    stream[k * 4],
+                    stream[k * 4 + 1],
+                    stream[k * 4 + 2],
+                    stream[k * 4 + 3],
+                ]) as i64;
+                mat[i][j][k] = raw % PQSIG_Q;
+            }
+        }
+    }
+    mat
+}
+
+fn sample_eta_poly(seed: &[u8; 32], domain: u8, idx: u8) -> SigPoly {
+    let mut inp = [0u8; 34];
+    inp[..32].copy_from_slice(seed);
+    inp[32] = domain;
+    inp[33] = idx;
+    let stream = shake256(&inp, PQSIG_N);
+    let mut p = [0i64; PQSIG_N];
+    for i in 0..PQSIG_N {
+        p[i] = ((stream[i] % 5) as i64) - PQSIG_ETA;
+    }
+    p
+}
+
+fn sample_gamma1_poly(seed: &[u8; 32], kappa: u16, idx: u8) -> SigPoly {
+    let mut inp = [0u8; 35];
+    inp[..32].copy_from_slice(seed);
+    inp[32..34].copy_from_slice(&kappa.to_le_bytes());
+    inp[34] = idx;
+    let stream = shake256(&inp, PQSIG_N * 4);
+    let span = (2 * PQSIG_GAMMA1) as u64;
+    let mut p = [0i64; PQSIG_N];
+    for i in 0..PQSIG_N {
+        let v = u32::from_le_bytes([
+            stream[i * 4],
+            stream[i * 4 + 1],
+            stream[i * 4 + 2],
+            stream[i * 4 + 3],
+        ]) as u64;
+        p[i] = (v % span) as i64 - (PQSIG_GAMMA1 - 1);
+    }
+    p
+}
+
+fn sample_challenge_ball(c_tilde: &[u8; 32]) -> SigPoly {
+    let stream = shake256(c_tilde, 128);
+    let mut c = [0i64; PQSIG_N];
+    let signs = u64::from_le_bytes(stream[0..8].try_into().unwrap());
+    let mut pos = 8usize;
+    for i in (PQSIG_N - PQSIG_TAU)..PQSIG_N {
+        let j = (stream[pos] as usize) % (i + 1);
+        pos += 1;
+        c[i] = c[j];
+        let bit = (signs >> (i - (PQSIG_N - PQSIG_TAU))) & 1;
+        c[j] = if bit == 1 { -1 } else { 1 };
+    }
+    c
+}
+
+fn fors_leaf_secret(fors_seed: &[u8; 32], tree: usize, leaf: usize) -> [u8; 32] {
+    let mut inp = [0u8; 36];
+    inp[..32].copy_from_slice(fors_seed);
+    inp[32] = b'F';
+    inp[33] = tree as u8;
+    inp[34..36].copy_from_slice(&(leaf as u16).to_le_bytes());
+    let out = shake256(&inp, 32);
+    out.as_slice().try_into().unwrap()
+}
+
+fn fors_node_hash(
+    pub_seed: &[u8; 32],
+    tree: usize,
+    level: usize,
+    idx: usize,
+    val: &[u8],
+) -> [u8; 32] {
+    let mut inp = Vec::with_capacity(38 + val.len());
+    inp.extend_from_slice(pub_seed);
+    inp.push(b'N');
+    inp.push(tree as u8);
+    inp.push(level as u8);
+    inp.push(idx as u8);
+    inp.extend_from_slice(val);
+    sha3_256(&inp)
+}
+
+fn fors_build_tree(fors_seed: &[u8; 32], pub_seed: &[u8; 32], tree: usize) -> Vec<Vec<[u8; 32]>> {
+    let mut levels: Vec<Vec<[u8; 32]>> = Vec::with_capacity(FORS_HEIGHT + 1);
+    let mut cur = Vec::with_capacity(FORS_LEAVES);
+    for l in 0..FORS_LEAVES {
+        let sk = fors_leaf_secret(fors_seed, tree, l);
+        cur.push(fors_node_hash(pub_seed, tree, 0, l, &sk));
+    }
+    levels.push(cur);
+    for lvl in 0..FORS_HEIGHT {
+        let prev = &levels[lvl];
+        let mut next = Vec::with_capacity(prev.len() / 2);
+        for i in 0..(prev.len() / 2) {
+            let mut pair = [0u8; 64];
+            pair[..32].copy_from_slice(&prev[2 * i]);
+            pair[32..].copy_from_slice(&prev[2 * i + 1]);
+            next.push(fors_node_hash(pub_seed, tree, lvl + 1, i, &pair));
+        }
+        levels.push(next);
+    }
+    levels
+}
+
+fn fors_compute_root(fors_seed: &[u8; 32], pub_seed: &[u8; 32]) -> [u8; 32] {
+    let mut roots_concat = Vec::with_capacity(FORS_TREES * 32);
+    for t in 0..FORS_TREES {
+        let levels = fors_build_tree(fors_seed, pub_seed, t);
+        roots_concat.extend_from_slice(&levels[FORS_HEIGHT][0]);
+    }
+    sha3_256(&roots_concat)
+}
+
+pub(crate) fn pq_sign_keygen_deterministic(master_seed: &[u8; 32]) -> (String, String) {
+    let expanded = shake256(master_seed, 96);
+    let rho: [u8; 32] = expanded[0..32].try_into().unwrap();
+    let s_seed: [u8; 32] = expanded[32..64].try_into().unwrap();
+    let fors_seed: [u8; 32] = expanded[64..96].try_into().unwrap();
+
+    let mat_a = expand_sig_matrix_a(&rho);
+    let mut s1 = [[0i64; PQSIG_N]; PQSIG_L];
+    let mut s2 = [[0i64; PQSIG_N]; PQSIG_K];
+    for j in 0..PQSIG_L {
+        s1[j] = sample_eta_poly(&s_seed, b'1', j as u8);
+    }
+    for i in 0..PQSIG_K {
+        s2[i] = sample_eta_poly(&s_seed, b'2', i as u8);
+    }
+
+    let mut t = [[0i64; PQSIG_N]; PQSIG_K];
+    for i in 0..PQSIG_K {
+        let mut acc = [0i64; PQSIG_N];
+        for j in 0..PQSIG_L {
+            let prod = sig_poly_mul_mod(&mat_a[i][j], &s1[j]);
+            acc = sig_poly_add(&acc, &prod);
+        }
+        t[i] = sig_poly_add(&acc, &s2[i]);
+    }
+
+    let fors_root = fors_compute_root(&fors_seed, &rho);
+
+    // Public key wire: rho(32) || fors_root(32) || t(3 * 64 * 4 = 768) = 832 bytes
+    let mut pub_bytes = Vec::with_capacity(64 + PQSIG_K * PQSIG_N * 4);
+    pub_bytes.extend_from_slice(&rho);
+    pub_bytes.extend_from_slice(&fors_root);
+    for i in 0..PQSIG_K {
+        for k in 0..PQSIG_N {
+            pub_bytes.extend_from_slice(&(t[i][k] as u32).to_le_bytes());
+        }
+    }
+
+    // Secret key wire: master_seed(32) || pub_bytes(832) = 864 bytes
+    let mut sec_bytes = Vec::with_capacity(32 + pub_bytes.len());
+    sec_bytes.extend_from_slice(master_seed);
+    sec_bytes.extend_from_slice(&pub_bytes);
+
+    (
+        format!("{PQSIG_PUB_PREFIX}{}", bytes_to_hex(&pub_bytes)),
+        format!("{PQSIG_SEC_PREFIX}{}", bytes_to_hex(&sec_bytes)),
+    )
+}
+
+pub(crate) fn pq_sign_keygen() -> (String, String) {
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    let out = pq_sign_keygen_deterministic(&seed);
+    zeroize_bytes(&mut seed);
+    out
+}
+
+pub(crate) fn pq_sign(armored_sec: &str, msg: &[u8]) -> Result<String, String> {
+    let trimmed = armored_sec.trim();
+    let hex_part = trimmed
+        .strip_prefix(PQSIG_SEC_PREFIX)
+        .ok_or("secret key must start with 'kvsign1sec:'")?;
+    let mut sec_bytes = hex_to_bytes(hex_part)?;
+    let expected_len = 32 + 64 + PQSIG_K * PQSIG_N * 4;
+    if sec_bytes.len() != expected_len {
+        zeroize_bytes(&mut sec_bytes);
+        return Err("invalid post-quantum signing secret key length".into());
+    }
+    let mut master_seed = [0u8; 32];
+    master_seed.copy_from_slice(&sec_bytes[0..32]);
+    let pub_bytes = sec_bytes[32..].to_vec();
+    zeroize_bytes(&mut sec_bytes);
+
+    let mut expanded = shake256(&master_seed, 96);
+    zeroize_bytes(&mut master_seed);
+    let rho: [u8; 32] = expanded[0..32].try_into().unwrap();
+    let s_seed: [u8; 32] = expanded[32..64].try_into().unwrap();
+    let fors_seed: [u8; 32] = expanded[64..96].try_into().unwrap();
+    zeroize_bytes(&mut expanded);
+
+    let mat_a = expand_sig_matrix_a(&rho);
+    let mut s1 = [[0i64; PQSIG_N]; PQSIG_L];
+    let mut s2 = [[0i64; PQSIG_N]; PQSIG_K];
+    for j in 0..PQSIG_L {
+        s1[j] = sample_eta_poly(&s_seed, b'1', j as u8);
+    }
+    for i in 0..PQSIG_K {
+        s2[i] = sample_eta_poly(&s_seed, b'2', i as u8);
+    }
+
+    let tr = sha3_256(&pub_bytes);
+    let mut mu_in = Vec::with_capacity(32 + msg.len());
+    mu_in.extend_from_slice(&tr);
+    mu_in.extend_from_slice(msg);
+    let mu = sha3_512(&mu_in);
+
+    // Build FORS authentication proof for message digest mu
+    let mut fors_proof = Vec::with_capacity(FORS_TREES * (1 + FORS_HEIGHT) * 32);
+    for t in 0..FORS_TREES {
+        let leaf_idx = (mu[t] as usize) & (FORS_LEAVES - 1);
+        let sk_leaf = fors_leaf_secret(&fors_seed, t, leaf_idx);
+        fors_proof.extend_from_slice(&sk_leaf);
+        let levels = fors_build_tree(&fors_seed, &rho, t);
+        let mut idx = leaf_idx;
+        for lvl in 0..FORS_HEIGHT {
+            let sibling = idx ^ 1;
+            fors_proof.extend_from_slice(&levels[lvl][sibling]);
+            idx >>= 1;
+        }
+    }
+
+    let mut rnd_seed_in = Vec::with_capacity(96);
+    rnd_seed_in.extend_from_slice(&s_seed);
+    rnd_seed_in.extend_from_slice(&mu);
+    let y_seed: [u8; 32] = shake256(&rnd_seed_in, 32).as_slice().try_into().unwrap();
+    zeroize_bytes(&mut rnd_seed_in);
+
+    // Fiat-Shamir with Aborts rejection sampling loop
+    for kappa in 0u16..1024 {
+        let mut y = [[0i64; PQSIG_N]; PQSIG_L];
+        for j in 0..PQSIG_L {
+            y[j] = sample_gamma1_poly(&y_seed, kappa, j as u8);
+        }
+
+        let mut w = [[0i64; PQSIG_N]; PQSIG_K];
+        let mut w1_bytes = Vec::with_capacity(PQSIG_K * PQSIG_N);
+        for i in 0..PQSIG_K {
+            let mut acc = [0i64; PQSIG_N];
+            for j in 0..PQSIG_L {
+                let prod = sig_poly_mul_mod(&mat_a[i][j], &y[j]);
+                acc = sig_poly_add(&acc, &prod);
+            }
+            w[i] = acc;
+            for k in 0..PQSIG_N {
+                let (w1, _) = sig_decompose(w[i][k]);
+                w1_bytes.push(w1 as u8);
+            }
+        }
+
+        let mut ch_in = Vec::with_capacity(64 + w1_bytes.len());
+        ch_in.extend_from_slice(&mu);
+        ch_in.extend_from_slice(&w1_bytes);
+        let c_tilde = sha3_256(&ch_in);
+        let c_poly = sample_challenge_ball(&c_tilde);
+
+        let mut z = [[0i64; PQSIG_N]; PQSIG_L];
+        let mut reject = false;
+        for j in 0..PQSIG_L {
+            let cs1 = sig_poly_mul_int(&c_poly, &s1[j]);
+            for k in 0..PQSIG_N {
+                z[j][k] = y[j][k] + cs1[k];
+                if z[j][k].abs() >= PQSIG_GAMMA1 - PQSIG_BETA {
+                    reject = true;
+                }
+            }
+        }
+        if reject {
+            continue;
+        }
+
+        for i in 0..PQSIG_K {
+            let cs2 = sig_poly_mul_int(&c_poly, &s2[i]);
+            for k in 0..PQSIG_N {
+                let w_minus_cs2 = mod_sig_q(w[i][k] - cs2[k]);
+                let (r1, r0) = sig_decompose(w_minus_cs2);
+                if r0.abs() >= PQSIG_GAMMA2 - PQSIG_BETA || (r1 as u8) != w1_bytes[i * PQSIG_N + k]
+                {
+                    reject = true;
+                }
+            }
+        }
+        if reject {
+            continue;
+        }
+
+        // Valid signature found: c_tilde(32) || z(3*64*4 = 768) || fors_proof(8*5*32 = 1280)
+        let mut sig_wire = Vec::with_capacity(32 + PQSIG_L * PQSIG_N * 4 + fors_proof.len());
+        sig_wire.extend_from_slice(&c_tilde);
+        for j in 0..PQSIG_L {
+            for k in 0..PQSIG_N {
+                sig_wire.extend_from_slice(&(z[j][k] as i32).to_le_bytes());
+            }
+        }
+        sig_wire.extend_from_slice(&fors_proof);
+        return Ok(format!("{PQSIG_SIG_PREFIX}{}", bytes_to_hex(&sig_wire)));
+    }
+    Err("post-quantum lattice signature rejection loop exceeded bound".into())
+}
+
+pub(crate) fn pq_verify(armored_pub: &str, msg: &[u8], armored_sig: &str) -> Result<bool, String> {
+    let pub_hex = armored_pub
+        .trim()
+        .strip_prefix(PQSIG_PUB_PREFIX)
+        .ok_or("public key must start with 'kvsign1pub:'")?;
+    let sig_hex = armored_sig
+        .trim()
+        .strip_prefix(PQSIG_SIG_PREFIX)
+        .ok_or("signature must start with 'kvsign1sig:'")?;
+    let pub_bytes = hex_to_bytes(pub_hex)?;
+    let sig_bytes = hex_to_bytes(sig_hex)?;
+
+    let expected_pub = 64 + PQSIG_K * PQSIG_N * 4;
+    let fors_bytes_len = FORS_TREES * (1 + FORS_HEIGHT) * 32;
+    let expected_sig = 32 + PQSIG_L * PQSIG_N * 4 + fors_bytes_len;
+    if pub_bytes.len() != expected_pub || sig_bytes.len() != expected_sig {
+        return Ok(false);
+    }
+
+    let rho: [u8; 32] = pub_bytes[0..32].try_into().unwrap();
+    let expected_fors_root: [u8; 32] = pub_bytes[32..64].try_into().unwrap();
+    let mut t = [[0i64; PQSIG_N]; PQSIG_K];
+    let mut off = 64usize;
+    for i in 0..PQSIG_K {
+        for k in 0..PQSIG_N {
+            let v = u32::from_le_bytes(pub_bytes[off..off + 4].try_into().unwrap()) as i64;
+            if !(0..PQSIG_Q).contains(&v) {
+                return Ok(false);
+            }
+            t[i][k] = v;
+            off += 4;
+        }
+    }
+
+    let c_tilde: [u8; 32] = sig_bytes[0..32].try_into().unwrap();
+    let mut z = [[0i64; PQSIG_N]; PQSIG_L];
+    let mut s_off = 32usize;
+    for j in 0..PQSIG_L {
+        for k in 0..PQSIG_N {
+            let v = i32::from_le_bytes(sig_bytes[s_off..s_off + 4].try_into().unwrap()) as i64;
+            if v.abs() >= PQSIG_GAMMA1 - PQSIG_BETA {
+                return Ok(false);
+            }
+            z[j][k] = v;
+            s_off += 4;
+        }
+    }
+    let fors_proof = &sig_bytes[s_off..];
+
+    let tr = sha3_256(&pub_bytes);
+    let mut mu_in = Vec::with_capacity(32 + msg.len());
+    mu_in.extend_from_slice(&tr);
+    mu_in.extend_from_slice(msg);
+    let mu = sha3_512(&mu_in);
+
+    // 1. Verify FORS-SHAKE256 Merkle authentication paths
+    let mut roots_concat = Vec::with_capacity(FORS_TREES * 32);
+    let stride = (1 + FORS_HEIGHT) * 32;
+    for tree in 0..FORS_TREES {
+        let base = tree * stride;
+        let sk_leaf = &fors_proof[base..base + 32];
+        let mut idx = (mu[tree] as usize) & (FORS_LEAVES - 1);
+        let mut node = fors_node_hash(&rho, tree, 0, idx, sk_leaf);
+        for lvl in 0..FORS_HEIGHT {
+            let sib_off = base + (1 + lvl) * 32;
+            let sib = &fors_proof[sib_off..sib_off + 32];
+            let mut pair = [0u8; 64];
+            if idx & 1 == 0 {
+                pair[..32].copy_from_slice(&node);
+                pair[32..].copy_from_slice(sib);
+            } else {
+                pair[..32].copy_from_slice(sib);
+                pair[32..].copy_from_slice(&node);
+            }
+            idx >>= 1;
+            node = fors_node_hash(&rho, tree, lvl + 1, idx, &pair);
+        }
+        roots_concat.extend_from_slice(&node);
+    }
+    let recalc_fors_root = sha3_256(&roots_concat);
+    let fors_ok = ct_eq_slices(&recalc_fors_root, &expected_fors_root);
+
+    // 2. Verify Module-LWE / Module-SIS Lattice relation: HighBits(A*z - c*t) == w1
+    let mat_a = expand_sig_matrix_a(&rho);
+    let c_poly = sample_challenge_ball(&c_tilde);
+    let mut w1_prime = Vec::with_capacity(PQSIG_K * PQSIG_N);
+    for i in 0..PQSIG_K {
+        let mut az = [0i64; PQSIG_N];
+        for j in 0..PQSIG_L {
+            let z_mod = z[j].map(mod_sig_q);
+            let prod = sig_poly_mul_mod(&mat_a[i][j], &z_mod);
+            az = sig_poly_add(&az, &prod);
+        }
+        let c_mod = c_poly.map(mod_sig_q);
+        let ct_poly = sig_poly_mul_mod(&c_mod, &t[i]);
+        let w_prime = sig_poly_sub(&az, &ct_poly);
+        for k in 0..PQSIG_N {
+            let (w1, _) = sig_decompose(w_prime[k]);
+            w1_prime.push(w1 as u8);
+        }
+    }
+
+    let mut ch_in = Vec::with_capacity(64 + w1_prime.len());
+    ch_in.extend_from_slice(&mu);
+    ch_in.extend_from_slice(&w1_prime);
+    let recalc_c = sha3_256(&ch_in);
+    let lattice_ok = ct_eq_slices(&recalc_c, &c_tilde);
+
+    Ok((fors_ok & lattice_ok) == 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1848,5 +2375,25 @@ mod tests {
         let other_sec_raw = parse_pq_hybrid_sec(&other_sec).unwrap();
         let ss_wrong = pq_hybrid_decaps_raw(&other_sec_raw, &ct_wire).unwrap();
         assert_ne!(ss_wrong, ss_enc);
+    }
+
+    #[test]
+    fn sovereign_pq_dual_lattice_and_hash_signatures_roundtrip_and_tamper() {
+        let (pub_key, sec_key) = pq_sign_keygen_deterministic(&[0x42u8; 32]);
+        let msg = b"Kovrek Multi-Century Sovereign Code & Vault Signature";
+        let sig = pq_sign(&sec_key, msg).unwrap();
+        assert!(pq_verify(&pub_key, msg, &sig).unwrap());
+
+        // Tampered message must fail
+        assert!(!pq_verify(&pub_key, b"Tampered message", &sig).unwrap());
+
+        // Tampered signature byte (in either lattice z or FORS path) must fail
+        let last_ch = if sig.ends_with('a') { 'b' } else { 'a' };
+        let bad_sig = format!("{}{last_ch}", &sig[..sig.len() - 1]);
+        assert!(!pq_verify(&pub_key, msg, &bad_sig).unwrap());
+
+        // Wrong public key must fail
+        let (other_pub, _) = pq_sign_keygen_deterministic(&[0x99u8; 32]);
+        assert!(!pq_verify(&other_pub, msg, &sig).unwrap());
     }
 }

@@ -85,6 +85,11 @@ sim_stop();
 # Direct native binary or standalone Wasm emission (zero C toolchain required)
 .\bin\kovrek-native.exe aot --direct examples\hello.kvr hello.exe
 .\bin\kovrek-native.exe wasm examples\hello.kvr -o hello.wasm
+
+# Sovereign Post-Quantum Vault (MYSTIQUE-1024 / MAESTRO / OBSCURE + ML-DSA-SIS+FORS Signatures)
+.\bin\kovrek-native.exe run examples\file_vault_crypto.kvr
+.\bin\kovrek-native.exe vault keygen --out my_vault_key
+.\bin\kovrek-native.exe vault sign-keygen --out my_signing_key
 ```
 
 ### Option B: Build from Source (`cargo`)
@@ -106,6 +111,7 @@ Every file in [examples/sovereign/](examples/sovereign) is verified directly aga
 | [01_verify_safety.kvr](examples/sovereign/01_verify_safety.kvr) | `@verify` loop invariants (`3` proven contracts), `@secret`/`sanitize(...)`, `@linear` resource consume, `auto_arena` escape reclamation | `kovrek verify` / `kovrek run` |
 | [02_crash_sim_actors.kvr](examples/sovereign/02_crash_sim_actors.kvr) | Fault-injectable VFS (`sim_fs_sync`/`sim_fs_crash`), supervised OTP actors + TCP RPC (`actor_node_listen`/`actor_remote_ask`) | `kovrek run` |
 | [03_gpu_flash_autograd.kvr](examples/sovereign/03_gpu_flash_autograd.kvr) | `gpu_kernel_inspect` (`tiled_matmul` + `attention_causal` SPIR-V/HLSL), `gpu_fused_layernorm`, `bf16` cast, reverse-mode autograd + Adam, `profile_start`/`profile_stop` | `kovrek run` / `kovrek profile` |
+| [file_vault_crypto.kvr](examples/file_vault_crypto.kvr) | `MYSTIQUE-1024` (`ML-KEM-1024 + X25519`), `MAESTRO` 1024-bit 4-engine AEAD (`AES-NI` + `ChaCha20-Poly1305` + `KMAC256` + `Keccak-p[1600,24]`), `OBSCURE` zero-metadata vaults, `ML-DSA-SIS + FORS-SHAKE256` PQ signatures, Quantum entanglement/Grover simulator, `SECDED(72,64)` cosmic-ray self-healing memory, and Proof-Carrying Code (`certify_source`) | `kovrek run` |
 
 ---
 
@@ -119,6 +125,7 @@ Every file in [examples/sovereign/](examples/sovereign) is verified directly aga
 | **GPU, ML & Interop** | Vulkan SPIR-V + Direct3D 11 (`cs_5_0` HLSL) compute + multi-threaded CPU fallback, single-pass `gpu_fuse` & `gpu_fused_linear`, `groupshared` tiled GEMM, causal online FlashAttention, fused Residual+LayerNorm+activation, `f16`/`bf16` casting, N-D autograd tensors + Adam, CPython C-API + PEP 3118 + strided PyCapsule DLPack (`tensor_to_dlpack`/`py_from_dlpack`) |
 | **Actors & Tooling** | OTP supervision trees (`one_for_one`/`one_for_all`/`rest_for_one`), TCP actor RPC, SplitMix64 cluster & crash-safe VFS simulation, LSP + reversible DAP (`stepBack`, forward/reverse data watchpoints), topological DAG notebooks (`kovrek notebook`), flight-recorder profiler (`profile_start`/`profile_stop`/`kovrek profile`), VS Code extension |
 | **Packages & FFI** | 77 verified packages (`package-matrix.ps1`), HMAC-SHA256 signed bundles (`.kvpkg`), semver + workspaces, HTTP registry (`kovrek pkg serve`), `kovrek_plugin_v1` native `cdylib` ABI, C header struct/enum/`#define` bindgen (`kovrek ffi bindgen`), dynamic `x86_64` C-ABI `ffi_call` + bounded `mem_*` buffers |
+| **Post-Quantum Crypto, Quantum Sim & ECC** | `MYSTIQUE-1024` (`FIPS 203 ML-KEM-1024 + X25519`), `MAESTRO` 1024-bit 4-engine cascade (`AES-256-GCM` with hardware `x86_64 AES-NI`, `ChaCha20-Poly1305`, `SHAKE256/KMAC256` duplex, `Keccak-p[1600,24]` wide-block sponge), `OBSCURE` zero-metadata steganographic vaults (`kovrek vault`), `ML-DSA-SIS + FORS-SHAKE256` dual post-quantum signatures (`pq_sign_*`), exact statevector quantum simulator (`qcircuit_run`, `qentanglement_entropy`, `qgrover_search`), cosmic-ray self-healing `SECDED (72,64)` ECC memory (`ecc_encode`/`ecc_decode`), and Post-Quantum Proof-Carrying Code (`certify_source`/`verify_certificate`) |
 
 ---
 

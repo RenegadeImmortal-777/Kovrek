@@ -165,9 +165,11 @@ Native, without Python:
 - **Application**: HTTP client, path-traversal-hardened static/routed/dynamic web
   servers, request and response headers, persistent stateful reactive notebook server
   (`kovrek notebook [dir] [port]`), SQLite with parameter binding, ORM foundations.
-- **Security**: SHA-256, HMAC-SHA256, PBKDF2, constant-time equality, lockfile
-  integrity audit with tamper detection, capability enforcement (`--caps`, manifest
-  `"capabilities"`, `cap_restrict`), and pure-Rust C header FFI bindgen (`kovrek ffi bindgen`).
+- **Security, Post-Quantum Cryptography, Quantum Simulation & Self-Healing ECC**:
+  - Hardware `x86_64` `AES-NI` silicon acceleration (`detect_hardware_crypto_simd`, `simd_info`, `kovrek doctor`) with constant-time portable fallback,
+  - `pq_crypto.rs` and `vault_stream.rs` implement NIST FIPS 202 (`SHA3-256`, `SHA3-512`, `SHAKE128`, `SHAKE256`), NIST SP 800-185 (`KMAC256`), RFC 7693 (`BLAKE2b`), RFC 9106 (`Argon2id` memory-hard KDF), RFC 7748 (`X25519`), NIST FIPS 203 (`ML-KEM-1024`), `MYSTIQUE-1024` hybrid KEM, `MAESTRO` 1024-bit 4-engine independent cascade (`AES-256-GCM` + `ChaCha20-Poly1305` + `SHAKE256/KMAC256` + `Keccak-p[1600,24]` wide-block sponge + 512-bit tag), `OBSCURE` zero-metadata opaque streaming file vaults (`kovrek vault keygen|encrypt|decrypt|inspect`), and `ML-DSA-SIS + FORS-SHAKE256` dual Module-LWE/SIS lattice + stateless hash-tree post-quantum digital signatures (`pq_sign_keygen`, `pq_sign`, `pq_verify`, `kovrek vault sign-keygen|sign|verify`),
+  - `quantum_ecc.rs` implements an exact statevector quantum circuit simulator (`qcircuit_run`), partial-trace von Neumann entanglement entropy $S(\rho_A)$ (`qentanglement_entropy`), Grover's $O(\sqrt{N})$ quantum search (`qgrover_search`), cosmic-ray self-healing Extended Hamming `(72, 64)` SECDED memory (`ecc_encode`, `ecc_decode`, `ecc_flip_bit`), and Post-Quantum Proof-Carrying Code (`certify_source`, `verify_certificate`),
+  - SHA-256, HMAC-SHA256, PBKDF2, constant-time equality, lockfile integrity audit with tamper detection, capability enforcement (`--caps`, manifest `"capabilities"`, `cap_restrict`), and pure-Rust C header FFI bindgen (`kovrek ffi bindgen`).
 - **Data/ML**: dataframe transforms and joins, statistics, linear algebra,
   regression, clustering, ML metrics, fused single-pass Vulkan SPIR-V & HLSL GPU
   pipelines (`gpu_fuse`, `gpu_fuse_inspect`), CPython DLPack zero-copy tensor interop

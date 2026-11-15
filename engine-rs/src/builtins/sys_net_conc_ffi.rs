@@ -2893,6 +2893,334 @@ impl Vm {
                     .collect::<Result<_, _>>()?;
                 crate::plugin::ffi_call(lib_path, symbol, ret_type, &param_types, arg_list)?
             }
+            "simd_info" => {
+                if !a.is_empty() {
+                    return Err("simd_info expects 0 arguments".into());
+                }
+                let (aes_ni, pclmulqdq, avx2, fma, sha_ni) =
+                    crate::security::detect_hardware_crypto_simd();
+                Val::Map(vec![
+                    (
+                        Val::Str("arch".into()),
+                        Val::Str(std::env::consts::ARCH.to_string()),
+                    ),
+                    (Val::Str("aes_ni".into()), Val::Bool(aes_ni)),
+                    (Val::Str("pclmulqdq".into()), Val::Bool(pclmulqdq)),
+                    (Val::Str("avx2".into()), Val::Bool(avx2)),
+                    (Val::Str("fma".into()), Val::Bool(fma)),
+                    (Val::Str("sha_ni".into()), Val::Bool(sha_ni)),
+                ])
+            }
+            "pq_sign_keygen" => {
+                if a.len() > 1 {
+                    return Err("pq_sign_keygen expects () or (seed_hex_or_str)".into());
+                }
+                let (pk, sk) = if a.len() == 1 {
+                    let Val::Str(seed_str) = &a[0] else {
+                        return Err("pq_sign_keygen seed must be String".into());
+                    };
+                    let seed = crate::pq_crypto::sha3_256(seed_str.as_bytes());
+                    crate::pq_crypto::pq_sign_keygen_deterministic(&seed)
+                } else {
+                    crate::pq_crypto::pq_sign_keygen()
+                };
+                Val::Map(vec![
+                    (
+                        Val::Str("algorithm".into()),
+                        Val::Str("ML-DSA-SIS+FORS-SHAKE256".into()),
+                    ),
+                    (Val::Str("public_key".into()), Val::Str(pk)),
+                    (Val::Str("secret_key".into()), Val::Str(sk)),
+                ])
+            }
+            "pq_sign" => {
+                if a.len() != 2 {
+                    return Err("pq_sign expects (secret_key, message)".into());
+                }
+                let (Val::Str(sk), Val::Str(msg)) = (&a[0], &a[1]) else {
+                    return Err("pq_sign expects (String, String)".into());
+                };
+                let sig = crate::pq_crypto::pq_sign(sk, msg.as_bytes())?;
+                Val::Str(sig)
+            }
+            "pq_verify" => {
+                if a.len() != 3 {
+                    return Err("pq_verify expects (public_key, message, signature)".into());
+                }
+                let (Val::Str(pk), Val::Str(msg), Val::Str(sig)) = (&a[0], &a[1], &a[2]) else {
+                    return Err("pq_verify expects (String, String, String)".into());
+                };
+                let ok = crate::pq_crypto::pq_verify(pk, msg.as_bytes(), sig)?;
+                Val::Bool(ok)
+            }
+            "qcircuit_run" => {
+                if a.len() != 2 {
+                    return Err("qcircuit_run expects (num_qubits, gates_list)".into());
+                }
+                let Val::Num(nq_f) = a[0] else {
+                    return Err("qcircuit_run num_qubits must be Number".into());
+                };
+                let Val::List(gates) = &a[1] else {
+                    return Err("qcircuit_run gates_list must be List".into());
+                };
+                let nq = nq_f as usize;
+                let mut qc = crate::quantum_ecc::QuantumCircuit::new(nq)?;
+                for g in gates {
+                    let Val::List(op) = g else {
+                        return Err("qcircuit_run gate entry must be List [gate_name, ...]".into());
+                    };
+                    if op.is_empty() {
+                        return Err("qcircuit_run gate entry cannot be empty".into());
+                    }
+                    let Val::Str(gname) = &op[0] else {
+                        return Err("qcircuit_run gate name must be String".into());
+                    };
+                    let arg_usize = |idx: usize, name: &str| -> Result<usize, String> {
+                        match op.get(idx) {
+                            Some(Val::Num(v)) if v.is_finite() && *v >= 0.0 => Ok(*v as usize),
+                            _ => Err(format!(
+                                "qcircuit_run gate '{name}' expects qubit index at pos {idx}"
+                            )),
+                        }
+                    };
+                    let arg_f64 = |idx: usize, name: &str| -> Result<f64, String> {
+                        match op.get(idx) {
+                            Some(Val::Num(v)) if v.is_finite() => Ok(*v),
+                            _ => Err(format!(
+                                "qcircuit_run gate '{name}' expects angle at pos {idx}"
+                            )),
+                        }
+                    };
+                    match gname.to_ascii_uppercase().as_str() {
+                        "H" => qc.h(arg_usize(1, "H")?)?,
+                        "X" => qc.x(arg_usize(1, "X")?)?,
+                        "Y" => qc.y(arg_usize(1, "Y")?)?,
+                        "Z" => qc.z(arg_usize(1, "Z")?)?,
+                        "S" => qc.s_gate(arg_usize(1, "S")?)?,
+                        "T" => qc.t_gate(arg_usize(1, "T")?)?,
+                        "RX" => qc.rx(arg_usize(1, "RX")?, arg_f64(2, "RX")?)?,
+                        "RY" => qc.ry(arg_usize(1, "RY")?, arg_f64(2, "RY")?)?,
+                        "RZ" => qc.rz(arg_usize(1, "RZ")?, arg_f64(2, "RZ")?)?,
+                        "CNOT" | "CX" => qc.cnot(arg_usize(1, "CNOT")?, arg_usize(2, "CNOT")?)?,
+                        "CZ" => qc.cz(arg_usize(1, "CZ")?, arg_usize(2, "CZ")?)?,
+                        "SWAP" => qc.swap(arg_usize(1, "SWAP")?, arg_usize(2, "SWAP")?)?,
+                        "CCX" | "TOFFOLI" => qc.ccx(
+                            arg_usize(1, "CCX")?,
+                            arg_usize(2, "CCX")?,
+                            arg_usize(3, "CCX")?,
+                        )?,
+                        "CPHASE" | "CP" => qc.cphase(
+                            arg_usize(1, "CPHASE")?,
+                            arg_usize(2, "CPHASE")?,
+                            arg_f64(3, "CPHASE")?,
+                        )?,
+                        "QFT" => qc.qft()?,
+                        other => return Err(format!("qcircuit_run unknown gate '{other}'")),
+                    }
+                }
+                let probs = qc.probabilities();
+                let mut best_state = 0usize;
+                let mut best_prob = -1.0f64;
+                for (idx, &p) in probs.iter().enumerate() {
+                    if p > best_prob {
+                        best_prob = p;
+                        best_state = idx;
+                    }
+                }
+                let entropy_q0 = if nq >= 2 {
+                    qc.entanglement_entropy(&[0])?
+                } else {
+                    0.0
+                };
+                Val::Map(vec![
+                    (Val::Str("num_qubits".into()), Val::Num(nq as f64)),
+                    (
+                        Val::Str("probabilities".into()),
+                        Val::List(probs.into_iter().map(Val::Num).collect()),
+                    ),
+                    (Val::Str("top_state".into()), Val::Num(best_state as f64)),
+                    (Val::Str("top_probability".into()), Val::Num(best_prob)),
+                    (
+                        Val::Str("entanglement_entropy_q0".into()),
+                        Val::Num(entropy_q0),
+                    ),
+                ])
+            }
+            "qentanglement_entropy" => {
+                if a.len() != 3 {
+                    return Err(
+                        "qentanglement_entropy expects (num_qubits, gates_list, subsystem_a_qubits)"
+                            .into(),
+                    );
+                }
+                let Val::Num(nq_f) = a[0] else {
+                    return Err("qentanglement_entropy num_qubits must be Number".into());
+                };
+                let Val::List(gates) = &a[1] else {
+                    return Err("qentanglement_entropy gates_list must be List".into());
+                };
+                let Val::List(sub_a_vals) = &a[2] else {
+                    return Err("qentanglement_entropy subsystem_a_qubits must be List".into());
+                };
+                let mut qc = crate::quantum_ecc::QuantumCircuit::new(nq_f as usize)?;
+                for g in gates {
+                    let Val::List(op) = g else {
+                        return Err("qentanglement_entropy gate entry must be List".into());
+                    };
+                    if op.is_empty() {
+                        return Err("qentanglement_entropy gate entry cannot be empty".into());
+                    }
+                    let Val::Str(gname) = &op[0] else {
+                        return Err("qentanglement_entropy gate name must be String".into());
+                    };
+                    let arg_usize = |idx: usize| -> Result<usize, String> {
+                        match op.get(idx) {
+                            Some(Val::Num(v)) if v.is_finite() && *v >= 0.0 => Ok(*v as usize),
+                            _ => Err("qentanglement_entropy invalid qubit index".into()),
+                        }
+                    };
+                    let arg_f64 = |idx: usize| -> Result<f64, String> {
+                        match op.get(idx) {
+                            Some(Val::Num(v)) if v.is_finite() => Ok(*v),
+                            _ => Err("qentanglement_entropy invalid angle".into()),
+                        }
+                    };
+                    match gname.to_ascii_uppercase().as_str() {
+                        "H" => qc.h(arg_usize(1)?)?,
+                        "X" => qc.x(arg_usize(1)?)?,
+                        "Y" => qc.y(arg_usize(1)?)?,
+                        "Z" => qc.z(arg_usize(1)?)?,
+                        "S" => qc.s_gate(arg_usize(1)?)?,
+                        "T" => qc.t_gate(arg_usize(1)?)?,
+                        "RX" => qc.rx(arg_usize(1)?, arg_f64(2)?)?,
+                        "RY" => qc.ry(arg_usize(1)?, arg_f64(2)?)?,
+                        "RZ" => qc.rz(arg_usize(1)?, arg_f64(2)?)?,
+                        "CNOT" | "CX" => qc.cnot(arg_usize(1)?, arg_usize(2)?)?,
+                        "CZ" => qc.cz(arg_usize(1)?, arg_usize(2)?)?,
+                        "SWAP" => qc.swap(arg_usize(1)?, arg_usize(2)?)?,
+                        "CCX" | "TOFFOLI" => qc.ccx(arg_usize(1)?, arg_usize(2)?, arg_usize(3)?)?,
+                        "QFT" => qc.qft()?,
+                        other => {
+                            return Err(format!("qentanglement_entropy unknown gate '{other}'"));
+                        }
+                    }
+                }
+                let mut sub_a = Vec::with_capacity(sub_a_vals.len());
+                for v in sub_a_vals {
+                    let Val::Num(idx) = v else {
+                        return Err("qentanglement_entropy subsystem qubits must be Numbers".into());
+                    };
+                    sub_a.push(*idx as usize);
+                }
+                Val::Num(qc.entanglement_entropy(&sub_a)?)
+            }
+            "qgrover_search" => {
+                if a.len() != 2 {
+                    return Err("qgrover_search expects (num_qubits, marked_state)".into());
+                }
+                let (Val::Num(nq_f), Val::Num(target_f)) = (&a[0], &a[1]) else {
+                    return Err("qgrover_search expects (Number, Number)".into());
+                };
+                let (iters, top_state, target_prob, _probs) =
+                    crate::quantum_ecc::run_grover_search(*nq_f as usize, *target_f as usize)?;
+                Val::Map(vec![
+                    (Val::Str("num_qubits".into()), Val::Num(*nq_f)),
+                    (Val::Str("marked_state".into()), Val::Num(*target_f)),
+                    (
+                        Val::Str("optimal_iterations".into()),
+                        Val::Num(iters as f64),
+                    ),
+                    (
+                        Val::Str("measured_state".into()),
+                        Val::Num(top_state as f64),
+                    ),
+                    (Val::Str("target_probability".into()), Val::Num(target_prob)),
+                ])
+            }
+            "ecc_encode" => {
+                if a.len() != 1 {
+                    return Err("ecc_encode expects (data_str)".into());
+                }
+                let Val::Str(s) = &a[0] else {
+                    return Err("ecc_encode expects String".into());
+                };
+                Val::Str(crate::quantum_ecc::secded_encode(s.as_bytes()))
+            }
+            "ecc_decode" => {
+                if a.len() != 1 {
+                    return Err("ecc_decode expects (kvecc1_token)".into());
+                }
+                let Val::Str(tok) = &a[0] else {
+                    return Err("ecc_decode expects String".into());
+                };
+                let rep = crate::quantum_ecc::secded_decode_and_heal(tok)?;
+                let text = String::from_utf8_lossy(&rep.payload).to_string();
+                Val::Map(vec![
+                    (Val::Str("ok".into()), Val::Bool(true)),
+                    (Val::Str("healed".into()), Val::Bool(rep.healed)),
+                    (
+                        Val::Str("corrected_bits".into()),
+                        Val::Num(rep.corrected_bits as f64),
+                    ),
+                    (
+                        Val::Str("total_words".into()),
+                        Val::Num(rep.total_words as f64),
+                    ),
+                    (Val::Str("text".into()), Val::Str(text)),
+                    (Val::Str("sha3_256".into()), Val::Str(rep.sha3_256_hex)),
+                ])
+            }
+            "ecc_flip_bit" => {
+                if a.len() != 3 {
+                    return Err("ecc_flip_bit expects (kvecc1_token, word_index, bit_index)".into());
+                }
+                let (Val::Str(tok), Val::Num(w), Val::Num(b)) = (&a[0], &a[1], &a[2]) else {
+                    return Err("ecc_flip_bit expects (String, Number, Number)".into());
+                };
+                Val::Str(crate::quantum_ecc::secded_flip_bit(
+                    tok,
+                    *w as usize,
+                    *b as usize,
+                )?)
+            }
+            "certify_source" => {
+                if a.len() != 2 {
+                    return Err("certify_source expects (kvr_source, secret_key)".into());
+                }
+                let (Val::Str(src), Val::Str(sk)) = (&a[0], &a[1]) else {
+                    return Err("certify_source expects (String, String)".into());
+                };
+                Val::Str(crate::quantum_ecc::certify_verified_source(src, sk)?)
+            }
+            "verify_certificate" => {
+                if a.len() != 3 {
+                    return Err(
+                        "verify_certificate expects (kvr_source, certificate_json, public_key)"
+                            .into(),
+                    );
+                }
+                let (Val::Str(src), Val::Str(cert), Val::Str(pk)) = (&a[0], &a[1], &a[2]) else {
+                    return Err("verify_certificate expects (String, String, String)".into());
+                };
+                let rep = crate::quantum_ecc::verify_code_certificate(src, cert, pk)?;
+                Val::Map(vec![
+                    (Val::Str("valid".into()), Val::Bool(rep.valid)),
+                    (Val::Str("sha3_512".into()), Val::Str(rep.sha3_512_hex)),
+                    (
+                        Val::Str("contracts_proven".into()),
+                        Val::Num(rep.contracts_proven as f64),
+                    ),
+                    (
+                        Val::Str("functions_checked".into()),
+                        Val::Num(rep.functions_checked as f64),
+                    ),
+                    (
+                        Val::Str("invariants_checked".into()),
+                        Val::Num(rep.invariants_checked as f64),
+                    ),
+                    (Val::Str("scheme".into()), Val::Str(rep.engine_scheme)),
+                ])
+            }
             _ => return Ok(None),
         };
         Ok(Some(v))

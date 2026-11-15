@@ -51,6 +51,11 @@ pub(crate) fn new_project(name: &str) -> Result<(), String> {
 pub(crate) fn doctor() {
     println!("Kovrek {VERSION}");
     println!("engine: native Rust bytecode VM + AOT");
+    let (aes_ni, pclmul, avx2, fma, sha_ni) = crate::security::detect_hardware_crypto_simd();
+    println!(
+        "crypto-hw: aes-ni={} pclmulqdq={} avx2={} fma={} sha-ni={}",
+        aes_ni, pclmul, avx2, fma, sha_ni
+    );
     println!(
         "jit: {}",
         if crate::jit::jit_available() {

@@ -382,7 +382,55 @@ fn xtime(a: u8) -> u8 {
     (a << 1) ^ (0x1b & hi_mask)
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "aes")]
+unsafe fn aes256_encrypt_block_aesni(rk: &[[u8; 16]; 15], input: &[u8; 16]) -> [u8; 16] {
+    use std::arch::x86_64::{
+        _mm_aesenc_si128, _mm_aesenclast_si128, _mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128,
+    };
+    unsafe {
+        let mut state = _mm_xor_si128(
+            _mm_loadu_si128(input.as_ptr().cast()),
+            _mm_loadu_si128(rk[0].as_ptr().cast()),
+        );
+        for round in 1..14 {
+            state = _mm_aesenc_si128(state, _mm_loadu_si128(rk[round].as_ptr().cast()));
+        }
+        state = _mm_aesenclast_si128(state, _mm_loadu_si128(rk[14].as_ptr().cast()));
+        let mut out = [0u8; 16];
+        _mm_storeu_si128(out.as_mut_ptr().cast(), state);
+        out
+    }
+}
+
+pub(crate) fn detect_hardware_crypto_simd() -> (bool, bool, bool, bool, bool) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        (
+            std::is_x86_feature_detected!("aes"),
+            std::is_x86_feature_detected!("pclmulqdq"),
+            std::is_x86_feature_detected!("avx2"),
+            std::is_x86_feature_detected!("fma"),
+            std::is_x86_feature_detected!("sha"),
+        )
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        (false, false, false, false, false)
+    }
+}
+
 fn aes256_encrypt_block(rk: &[[u8; 16]; 15], input: &[u8; 16]) -> [u8; 16] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("aes") {
+            return unsafe { aes256_encrypt_block_aesni(rk, input) };
+        }
+    }
+    aes256_encrypt_block_portable(rk, input)
+}
+
+fn aes256_encrypt_block_portable(rk: &[[u8; 16]; 15], input: &[u8; 16]) -> [u8; 16] {
     let mut s = *input;
     for i in 0..16 {
         s[i] ^= rk[0][i];
@@ -1606,5 +1654,13 @@ mod tests {
         assert!(chacha20_poly1305_decrypt_token("vault-master", &tampered, b"hdr").is_err());
         // Cross-cipher token downgrade/confusion must fail cleanly
         assert!(aes_gcm_decrypt_token("vault-master", &tok, b"hdr").is_err());
+
+        // Verify hardware AES-NI and portable constant-time AES-256 produce identical blocks
+        let rk = aes256_expand_key(&key);
+        let sample_in: [u8; 16] = *b"KovrekSiliconAES";
+        assert_eq!(
+            aes256_encrypt_block(&rk, &sample_in),
+            aes256_encrypt_block_portable(&rk, &sample_in)
+        );
     }
 }
