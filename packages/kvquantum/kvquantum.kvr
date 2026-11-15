@@ -1,0 +1,35 @@
+// kvquantum: Sovereign Quantum Circuit, Entanglement Entropy & Grover Search
+
+@verify
+fn validate_qubit_count(n: Int) -> Int {
+    requires(n >= 1, "n >= 1");
+    let clamped = n;
+    if clamped > 12 { clamped = 12; }
+    ensures(clamped >= 1, "clamped >= 1");
+    ensures(clamped <= 12, "clamped <= 12");
+    return clamped;
+}
+
+fn bell_pair() -> Map {
+    return qcircuit_run(2, [["H", 0], ["CNOT", 0, 1]]);
+}
+
+fn ghz_state(num_qubits: Int) -> Map {
+    let n = validate_qubit_count(num_qubits);
+    if n < 2 { n = 2; }
+    let ops = [["H", 0]];
+    let i = 0;
+    while i < n - 1 {
+        ops = concat(ops, [["CNOT", i, i + 1]]);
+        i = i + 1;
+    }
+    return qcircuit_run(n, ops);
+}
+
+fn grover_find(num_qubits: Int, marked_state: Int) -> Map {
+    return qgrover_search(num_qubits, marked_state);
+}
+
+fn bipartite_entropy(num_qubits: Int, ops: List, sub_a: List) -> Number {
+    return qentanglement_entropy(num_qubits, ops, sub_a);
+}

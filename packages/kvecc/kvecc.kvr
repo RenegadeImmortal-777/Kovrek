@@ -1,0 +1,31 @@
+// kvecc: Cosmic-Ray Self-Healing SECDED (72,64) Memory Containers
+
+@verify
+fn clamp_bit_position(bit_idx: Int) -> Int {
+    requires(bit_idx >= 0, "bit_idx >= 0");
+    let pos = bit_idx;
+    if pos > 71 { pos = 71; }
+    ensures(pos >= 0, "pos >= 0");
+    ensures(pos <= 71, "pos <= 71");
+    return pos;
+}
+
+fn protect(payload: String) -> String {
+    return ecc_encode(payload);
+}
+
+fn heal(token: String) -> Map {
+    return ecc_decode(token);
+}
+
+fn inject_single_fault(token: String, word_idx: Int, bit_idx: Int) -> String {
+    let safe_bit = clamp_bit_position(bit_idx);
+    return ecc_flip_bit(token, word_idx, safe_bit);
+}
+
+fn verify_self_healing(payload: String) -> Bool {
+    let tok = ecc_encode(payload);
+    let damaged = ecc_flip_bit(tok, 0, 7);
+    let rep = ecc_decode(damaged);
+    return rep["ok"] and rep["healed"] and rep["text"] == payload;
+}

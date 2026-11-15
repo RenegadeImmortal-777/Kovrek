@@ -1,0 +1,21 @@
+// kvpcc: Post-Quantum Proof-Carrying Code (PCC) Certificates
+
+@verify
+fn require_min_obligations(count: Int) -> Int {
+    requires(count >= 1, "count >= 1");
+    let c = count;
+    ensures(c >= 1, "c >= 1");
+    return c;
+}
+
+fn issue_keypair() -> Map {
+    return pq_sign_keygen();
+}
+
+fn certify(kvr_source: String, secret_key: String) -> String {
+    return certify_source(kvr_source, secret_key);
+}
+
+fn verify(kvr_source: String, cert_json: String, public_key: String) -> Map {
+    return verify_certificate(kvr_source, cert_json, public_key);
+}

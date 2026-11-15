@@ -1,0 +1,34 @@
+// kvpqsign: Post-Quantum Dual Lattice + Stateless Hash-Tree Signatures
+
+@verify
+fn clamp_threshold(k: Int, n: Int) -> Int {
+    requires(k >= 1, "k >= 1");
+    requires(n >= 1, "n >= 1");
+    let out = k;
+    if out > n { out = n; }
+    ensures(out >= 1, "out >= 1");
+    return out;
+}
+
+fn keygen() -> Map {
+    return pq_sign_keygen();
+}
+
+fn sign_detached(secret_key: String, message: String) -> String {
+    return pq_sign(secret_key, message);
+}
+
+fn verify_detached(public_key: String, message: String, signature: String) -> Bool {
+    return pq_verify(public_key, message, signature);
+}
+
+fn sign_envelope(secret_key: String, public_key: String, payload: String) -> Map {
+    let sig = pq_sign(secret_key, payload);
+    return {
+        "scheme": "ML-DSA-SIS+FORS-SHAKE256",
+        "payload": payload,
+        "sha3_512": sha3_512(payload),
+        "public_key": public_key,
+        "signature": sig
+    };
+}

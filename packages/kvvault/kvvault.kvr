@@ -1,0 +1,20 @@
+// kvvault: Sovereign MYSTIQUE-1024, MAESTRO & OBSCURE Vault Policy Engine
+
+@verify
+fn clamp_argon2_kib(mem_kib: Int) -> Int {
+    requires(mem_kib >= 0, "mem_kib >= 0");
+    let m = mem_kib;
+    if m < 8 { m = 8; }
+    if m > 4194304 { m = 4194304; }
+    ensures(m >= 8, "m >= 8");
+    ensures(m <= 4194304, "m <= 4194304");
+    return m;
+}
+
+fn keygen() -> Map {
+    return pq_hybrid_keygen();
+}
+
+fn inspect(vault_path: String) -> Map {
+    return vault_inspect(vault_path);
+}
