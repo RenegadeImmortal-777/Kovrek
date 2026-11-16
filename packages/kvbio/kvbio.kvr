@@ -1,0 +1,16 @@
+// kvbio: Bioinformatics & Computational Genomics
+
+@verify
+fn clamp_phred_quality(q: Int) -> Int {
+    requires(q >= 0, "q >= 0");
+    let phred = q;
+    if phred > 93 { phred = 93; }
+    ensures(phred >= 0, "phred >= 0");
+    ensures(phred <= 93, "phred <= 93");
+    return phred;
+}
+
+fn phred_error_prob(q: Int) -> Number {
+    let safe_q = clamp_phred_quality(q);
+    return 10.0 ** (-safe_q * 0.1);
+}

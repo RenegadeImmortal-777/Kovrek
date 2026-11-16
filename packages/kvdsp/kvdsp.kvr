@@ -1,0 +1,15 @@
+// kvdsp: Digital Signal Processing, Windowing & FIR Convolution
+
+@verify
+fn clamp_tap_count(taps: Int) -> Int {
+    requires(taps >= 1, "taps >= 1");
+    let t = taps;
+    if t > 4096 { t = 4096; }
+    ensures(t >= 1, "t >= 1");
+    ensures(t <= 4096, "t <= 4096");
+    return t;
+}
+
+fn hamming_coeff(idx: Int, inv_span: Number) -> Number {
+    return 0.54 - 0.46 * cos(2.0 * 3.141592653589793 * idx * inv_span);
+}

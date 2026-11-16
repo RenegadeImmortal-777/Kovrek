@@ -1,0 +1,17 @@
+// kvkalman: Discrete-Time Kalman State & Covariance Estimator
+
+@verify
+fn clamp_gain_milli(k_milli: Int) -> Int {
+    requires(k_milli >= 0, "k_milli >= 0");
+    let k = k_milli;
+    if k > 1000 { k = 1000; }
+    ensures(k >= 0, "k >= 0");
+    ensures(k <= 1000, "k <= 1000");
+    return k;
+}
+
+fn kalman_1d_step(x_est: Number, z_obs: Number, gain: Number) -> Map {
+    let x_new = x_est + gain * (z_obs - x_est);
+    let p_factor = 1.0 - gain;
+    return {"state": x_new, "covariance_scale": p_factor, "gain": gain};
+}

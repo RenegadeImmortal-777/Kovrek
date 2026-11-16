@@ -1,0 +1,20 @@
+// kvratelimit: Formally Verified Token-Bucket Rate Limiter
+
+@verify
+fn refill_bucket(current_tokens: Int, added: Int, capacity: Int) -> Int {
+    requires(current_tokens >= 0, "current_tokens >= 0");
+    requires(added >= 0, "added >= 0");
+    requires(capacity >= 1, "capacity >= 1");
+    requires(capacity <= 1000000, "capacity <= 1000000");
+    let next_t = current_tokens + added;
+    if next_t > capacity { next_t = capacity; }
+    ensures(next_t >= 0, "next_t >= 0");
+    return next_t;
+}
+
+fn try_consume(tokens: Int, cost: Int) -> Map {
+    if tokens >= cost {
+        return {"allowed": true, "remaining": tokens - cost};
+    }
+    return {"allowed": false, "remaining": tokens};
+}

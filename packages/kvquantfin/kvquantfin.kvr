@@ -1,0 +1,21 @@
+// kvquantfin: Quantitative Finance, Kelly Criterion & Risk Metrics
+
+@verify
+fn clamp_leverage_bps(bps: Int) -> Int {
+    requires(bps >= 0, "bps >= 0");
+    let c = bps;
+    if c > 10000 { c = 10000; }
+    ensures(c >= 0, "c >= 0");
+    ensures(c <= 10000, "c <= 10000");
+    return c;
+}
+
+fn kelly_edge(win_prob: Number, payoff_multiple: Number) -> Number {
+    let edge = win_prob * (payoff_multiple + 1.0) - 1.0;
+    if edge < 0.0 { return 0.0; }
+    return edge;
+}
+
+fn discount_factor(rate: Number, years: Number) -> Number {
+    return exp(-rate * years);
+}

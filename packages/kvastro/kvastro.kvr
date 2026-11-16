@@ -1,0 +1,15 @@
+// kvastro: Orbital Mechanics & Astrodynamics
+
+@verify
+fn clamp_altitude_km(alt_km: Int) -> Int {
+    requires(alt_km >= 160, "alt_km >= 160");
+    let a = alt_km;
+    if a > 1000000 { a = 1000000; }
+    ensures(a >= 160, "a >= 160");
+    ensures(a <= 1000000, "a <= 1000000");
+    return a;
+}
+
+fn orbital_energy_specific(mu: Number, inv_r: Number, inv_a: Number) -> Number {
+    return mu * (2.0 * inv_r - inv_a);
+}

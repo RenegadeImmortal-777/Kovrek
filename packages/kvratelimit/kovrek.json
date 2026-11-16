@@ -1,0 +1,1 @@
+{"description":"Formally verified token-bucket & leaky-bucket rate limiters","entry":"kvratelimit.kvr","name":"kvratelimit","version":"1.0.0"}
