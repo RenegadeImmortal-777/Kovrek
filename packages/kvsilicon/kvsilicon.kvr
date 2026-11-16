@@ -1,0 +1,20 @@
+// kvsilicon: Hardware Silicon Acceleration & SIMD Feature Telemetry
+
+@verify
+fn clamp_vector_lanes(lanes: Int) -> Int {
+    requires(lanes >= 1, "lanes >= 1");
+    let l = lanes;
+    if l > 64 { l = 64; }
+    ensures(l >= 1, "l >= 1");
+    ensures(l <= 64, "l <= 64");
+    return l;
+}
+
+fn features() -> Map {
+    return simd_info();
+}
+
+fn has_hardware_aes() -> Bool {
+    let info = simd_info();
+    return info["aes_ni"];
+}

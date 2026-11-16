@@ -1,0 +1,1 @@
+{"description":"Hardware silicon acceleration (AES-NI, PCLMULQDQ, AVX2, FMA) & SIMD diagnostics","entry":"kvsilicon.kvr","name":"kvsilicon","version":"1.0.0"}

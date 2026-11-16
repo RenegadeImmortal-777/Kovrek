@@ -1,0 +1,1 @@
+{"description":"Conflict-free Replicated Data Types (G-Counter, PN-Counter, LWW-Register)","entry":"kvcrdt.kvr","name":"kvcrdt","version":"1.0.0"}

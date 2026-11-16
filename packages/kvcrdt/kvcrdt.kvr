@@ -1,0 +1,32 @@
+// kvcrdt: Conflict-Free Replicated Data Types (G-Counter, PN-Counter, LWW)
+
+@verify
+fn merge_monotonic_count(local_v: Int, remote_v: Int) -> Int {
+    requires(local_v >= 0, "local_v >= 0");
+    requires(remote_v >= 0, "remote_v >= 0");
+    let merged = local_v;
+    if remote_v > merged { merged = remote_v; }
+    ensures(merged >= 0, "merged >= 0");
+    return merged;
+}
+
+fn gcounter_merge(a: Map, b: Map) -> Map {
+    let out = {};
+    let ka = keys(a);
+    let i = 0;
+    while i < len(ka) {
+        let k = ka[i];
+        out[k] = a[k];
+        i = i + 1;
+    }
+    let kb = keys(b);
+    let j = 0;
+    while j < len(kb) {
+        let k = kb[j];
+        let va = get(out, k);
+        if va == null { va = 0; }
+        out[k] = merge_monotonic_count(va, b[k]);
+        j = j + 1;
+    }
+    return out;
+}

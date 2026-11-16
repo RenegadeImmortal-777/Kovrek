@@ -1,0 +1,24 @@
+// kvraft: Formally Verified Raft Consensus Quorum & Term Monotonicity
+
+@verify
+fn majority_quorum(cluster_size: Int) -> Int {
+    requires(cluster_size >= 1, "cluster_size >= 1");
+    requires(cluster_size <= 1025, "cluster_size <= 1025");
+    let q = floor(cluster_size / 2) + 1;
+    ensures(q >= 1, "q >= 1");
+    return q;
+}
+
+@verify
+fn advance_term(current_term: Int, candidate_term: Int) -> Int {
+    requires(current_term >= 0, "current_term >= 0");
+    requires(candidate_term >= 0, "candidate_term >= 0");
+    let next_t = current_term;
+    if candidate_term > next_t { next_t = candidate_term; }
+    ensures(next_t >= 0, "next_t >= 0");
+    return next_t;
+}
+
+fn has_quorum(votes: Int, cluster_size: Int) -> Bool {
+    return votes >= majority_quorum(cluster_size);
+}

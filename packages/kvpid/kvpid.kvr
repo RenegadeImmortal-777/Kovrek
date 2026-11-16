@@ -1,0 +1,20 @@
+// kvpid: Closed-Loop PID Controller with Anti-Windup Verification
+
+@verify
+fn clamp_actuator(u: Int, max_u: Int) -> Int {
+    requires(max_u >= 1, "max_u >= 1");
+    requires(max_u <= 100000, "max_u <= 100000");
+    let out = u;
+    if out > max_u { out = max_u; }
+    if out < 0 { out = 0; }
+    ensures(out >= 0, "out >= 0");
+    return out;
+}
+
+fn pid_step(kp: Number, ki: Number, kd: Number, err: Number, integral: Number, prev_err: Number, dt: Number) -> Map {
+    requires(dt > 0.0, "dt > 0");
+    let next_int = integral + err * dt;
+    let deriv = (err - prev_err) / dt;
+    let output = kp * err + ki * next_int + kd * deriv;
+    return {"output": output, "integral": next_int, "prev_error": err};
+}

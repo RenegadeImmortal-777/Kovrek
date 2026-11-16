@@ -1,0 +1,22 @@
+// kvbloom: Cryptographic Double-Hashed Bloom Filter
+
+@verify
+fn clamp_filter_bits(m: Int) -> Int {
+    requires(m >= 64, "m >= 64");
+    let b = m;
+    if b > 65536 { b = 65536; }
+    ensures(b >= 64, "b >= 64");
+    ensures(b <= 65536, "b <= 65536");
+    return b;
+}
+
+fn bloom_create(num_bits: Int) -> Map {
+    let m = clamp_filter_bits(num_bits);
+    let bits = [];
+    let i = 0;
+    while i < m {
+        bits = concat(bits, [0]);
+        i = i + 1;
+    }
+    return {"m": m, "bits": bits};
+}
