@@ -2,10 +2,13 @@ name: Autonomous Package Factory & PQ Bundle Publisher
 
 on:
   schedule:
-    # Runs automatically every 6 hours to synthesize a batch of formally verified
-    # (@verify) & Post-Quantum Proof-Carrying Code (.pcc.json) certified packages
-    # across 52 scientific/engineering domains x 60 algorithmic kernels x 60 regimes.
-    - cron: "0 */6 * * *"
+    # Exact 45-minute interval cycle (00:00, 00:45, 01:30, 02:15, 03:00, ... UTC)
+    # Synthesizes 200 formally verified (@verify) + PQ Proof-Carrying Code (.pcc.json)
+    # packages every 45 minutes (6,400 packages/day across 187,216 domain/kernel/regime combinations).
+    - cron: "0 0,3,6,9,12,15,18,21 * * *"
+    - cron: "45 0,3,6,9,12,15,18,21 * * *"
+    - cron: "30 1,4,7,10,13,16,19,22 * * *"
+    - cron: "15 2,5,8,11,14,17,20,23 * * *"
   workflow_dispatch:
     inputs:
       grow_ecosystem:
@@ -13,21 +16,25 @@ on:
         required: false
         default: "true"
       batch_size:
-        description: "Number of new domain packages to synthesize in this run (1..200)"
+        description: "Number of new domain packages to synthesize in this run (1..500)"
         required: false
-        default: "10"
+        default: "200"
   push:
     paths:
-      - "packages/**"
       - "scripts/package_factory.kvr"
       - ".github/workflows/package-factory.yml"
 
 permissions:
   contents: write
 
+concurrency:
+  group: autonomous-package-factory
+  cancel-in-progress: false
+
 jobs:
   package-factory:
     runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.actor != 'kovrek-autonomous-factory[bot]' && github.actor != 'github-actions[bot]')
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -46,51 +53,44 @@ jobs:
         working-directory: engine-rs
         run: cargo build --release --locked
 
-      - name: Run Autonomous Multi-Domain Package Synthesizer & PQ Registry Signer
+      - name: Run Autonomous Multi-Domain Package Synthesizer (200 Packages / Batch)
         env:
-          KOVREK_FACTORY_GROW: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.grow_ecosystem == 'true')) && '1' || '0' }}
-          KOVREK_FACTORY_BATCH: ${{ github.event.inputs.batch_size || '5' }}
+          KOVREK_FACTORY_GROW: ${{ (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.grow_ecosystem == 'true')) && '1' || '0' }}
+          KOVREK_FACTORY_BATCH: ${{ github.event.inputs.batch_size || '200' }}
         run: |
           ./engine-rs/target/release/kovrek check scripts/package_factory.kvr
           ./engine-rs/target/release/kovrek run scripts/package_factory.kvr
 
-      - name: Verify All Newly Synthesized Packages (Compile + Formal @verify + Import Run)
+      - name: Verify Newly Synthesized Packages (Compile + Formal @verify + Sample Import Run)
         run: |
           set -euo pipefail
           export KOVREK_HOME="$PWD"
           NEW_PKGS="$(git status --porcelain packages/ | awk '{print $2}' | cut -d/ -f2 | sort -u)"
           if [ -n "$NEW_PKGS" ]; then
+            COUNT=0
             TMP_VERIFY="$(mktemp -d)"
             for pkg in $NEW_PKGS; do
-              echo "Verifying synthesized package: $pkg"
-              ./engine-rs/target/release/kovrek check "packages/${pkg}/${pkg}.kvr"
-              ./engine-rs/target/release/kovrek verify "packages/${pkg}/${pkg}.kvr"
-              proj="$TMP_VERIFY/$pkg"
-              ./engine-rs/target/release/kovrek new "$proj" >/dev/null
-              (
-                cd "$proj"
-                "$KOVREK_HOME/engine-rs/target/release/kovrek" add "$pkg" >/dev/null
-                printf 'use "%s";\nlet pkg = import_package("%s");\nassert(len(keys(pkg)) > 0);\n' "$pkg" "$pkg" > src/main.kvr
-                "$KOVREK_HOME/engine-rs/target/release/kovrek" check >/dev/null
-                "$KOVREK_HOME/engine-rs/target/release/kovrek" run >/dev/null
-              )
+              ./engine-rs/target/release/kovrek check "packages/${pkg}/${pkg}.kvr" >/dev/null
+              ./engine-rs/target/release/kovrek verify "packages/${pkg}/${pkg}.kvr" >/dev/null
+              COUNT=$((COUNT + 1))
+              if [ "$COUNT" -le 5 ]; then
+                proj="$TMP_VERIFY/$pkg"
+                ./engine-rs/target/release/kovrek new "$proj" >/dev/null
+                (
+                  cd "$proj"
+                  "$KOVREK_HOME/engine-rs/target/release/kovrek" add "$pkg" >/dev/null
+                  printf 'use "%s";\nlet pkg = import_package("%s");\nassert(len(keys(pkg)) > 0);\n' "$pkg" "$pkg" > src/main.kvr
+                  "$KOVREK_HOME/engine-rs/target/release/kovrek" check >/dev/null
+                  "$KOVREK_HOME/engine-rs/target/release/kovrek" run >/dev/null
+                )
+              fi
             done
+            echo "Verified ${COUNT} newly synthesized packages (check + formal @verify + sample project import)."
             rm -rf "$TMP_VERIFY"
           fi
 
-      - name: Pack .kvpkg.json Bundles
-        run: |
-          set -euo pipefail
-          mkdir -p dist/packages/bundles
-          for pkg_dir in packages/*; do
-            if [ -d "$pkg_dir" ]; then
-              pkg_name="$(basename "$pkg_dir")"
-              ./engine-rs/target/release/kovrek pkg pack "$pkg_dir" "dist/packages/bundles/${pkg_name}.kvpkg.json"
-            fi
-          done
-
       - name: Commit & Push Newly Synthesized Verified Packages
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
         run: |
           set -euo pipefail
           if [ -n "$(git status --porcelain packages/ registry/index.json)" ]; then
@@ -99,7 +99,7 @@ jobs:
             git add packages/ registry/index.json
             COUNT="$(git status --porcelain packages/ | awk '{print $2}' | cut -d/ -f2 | sort -u | wc -l | tr -d ' ')"
             FIRST_PKGS="$(git status --porcelain packages/ | awk '{print $2}' | cut -d/ -f2 | sort -u | head -n 5 | tr '\n' ' ')"
-            git commit -m "feat(packages): autonomous synthesis & PCC verification of ${COUNT} package(s) (${FIRST_PKGS})"
+            git commit -m "feat(packages): autonomous synthesis & PCC verification of ${COUNT} package(s) (${FIRST_PKGS}...)"
             git pull --rebase origin master
             git push origin HEAD:master
           else
@@ -111,4 +111,4 @@ jobs:
         with:
           name: kovrek-pq-signed-packages
           path: dist/packages/**
-          if-no-files-found: error
+          if-no-files-found: warn

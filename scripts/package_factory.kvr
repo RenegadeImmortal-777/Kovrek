@@ -491,11 +491,11 @@ fn run_factory() {
     let should_grow = grow_env == "1" or grow_env == "true" or grow_env == "TRUE";
 
     let batch_env = env_get("KOVREK_FACTORY_BATCH");
-    let batch_size = 5;
+    let batch_size = 200;
     if batch_env != null and batch_env != "" {
         batch_size = int(batch_env);
         if batch_size < 1 { batch_size = 1; }
-        if batch_size > 200 { batch_size = 200; }
+        if batch_size > 500 { batch_size = 500; }
     }
 
     let signer_keys = pq_sign_keygen("kovrek-autonomous-package-factory-v1");
