@@ -1,0 +1,25 @@
+// kv_cryo_newton_rad100k: Cryogenics & Josephson Superconductivity — Damped Newton-Raphson Secant Solver (rad100k regime)
+// Combinatorial Synthesis Index #2338 (Domain=cryo, Kernel=newton, Regime=rad100k)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 100000 {
+        clamped = 100000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 100000, "clamped <= 100000");
+    return clamped;
+}
+
+fn compute_control_law(setpoint: Number, measured: Number, kp: Number, ki: Number, accum: Number) -> Map {
+    let err = setpoint - measured;
+    let next_accum = accum + err;
+    let raw_u = kp * err + ki * next_accum;
+    return {"control": raw_u, "error": err, "integral": next_accum, "max_limit": 100000};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_cryo_newton_rad100k", "domain": "cryo", "kernel": "newton", "regime": "rad100k", "max_budget": 100000};
+}
