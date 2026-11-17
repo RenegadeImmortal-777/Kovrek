@@ -1,0 +1,24 @@
+// kv_net_astar_fips2: BBR Congestion Control & Programmable Dataplanes — Admissible Heuristic A* Frontier Evaluator (fips2 regime)
+// Combinatorial Synthesis Index #1554 (Domain=net, Kernel=astar, Regime=fips2)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 32768 {
+        clamped = 32768;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 32768, "clamped <= 32768");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 1500};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_net_astar_fips2", "domain": "net", "kernel": "astar", "regime": "fips2", "max_budget": 32768};
+}
