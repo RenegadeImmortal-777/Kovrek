@@ -1,0 +1,27 @@
+// kv_qkd_shannon_amb300k: Decoy-State BB84 & Entanglement Repeater Routing — Renyi-Shannon Differential Entropy Functional (amb300k regime)
+// Combinatorial Synthesis Index #1037 (Domain=qkd, Kernel=shannon, Regime=amb300k)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 3000 {
+        clamped = 3000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 3000, "clamped <= 3000");
+    return clamped;
+}
+
+fn relax_geodesic_edge(dist_u: Number, weight_uv: Number, dist_v: Number, damping: Number) -> Map {
+    let candidate = dist_u + weight_uv;
+    let improved = candidate < dist_v;
+    let next_d = dist_v;
+    if improved { next_d = candidate; }
+    let rank_score = (1.0 - damping) + damping * next_d;
+    return {"distance": next_d, "improved": improved, "rank_score": rank_score};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_qkd_shannon_amb300k", "domain": "qkd", "kernel": "shannon", "regime": "amb300k", "max_budget": 3000};
+}
