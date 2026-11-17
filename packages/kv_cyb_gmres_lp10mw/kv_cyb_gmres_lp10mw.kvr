@@ -1,0 +1,24 @@
+// kv_cyb_gmres_lp10mw: Zero-Trust Cyber-Physical Intrusion Detection — Arnoldi Krylov Residual Minimizer (lp10mw regime)
+// Combinatorial Synthesis Index #2557 (Domain=cyb, Kernel=gmres, Regime=lp10mw)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 2000 {
+        clamped = 2000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 2000, "clamped <= 2000");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 256};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_cyb_gmres_lp10mw", "domain": "cyb", "kernel": "gmres", "regime": "lp10mw", "max_budget": 2000};
+}

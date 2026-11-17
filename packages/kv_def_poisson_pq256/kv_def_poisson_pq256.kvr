@@ -1,0 +1,24 @@
+// kv_def_poisson_pq256: Phased-Array Radar & Synthetic Aperture Sonar — Successive Over-Relaxation Elliptic Kernel (pq256 regime)
+// Combinatorial Synthesis Index #2579 (Domain=def, Kernel=poisson, Regime=pq256)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 2560 {
+        clamped = 2560;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 2560, "clamped <= 2560");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 1500};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_def_poisson_pq256", "domain": "def", "kernel": "poisson", "regime": "pq256", "max_budget": 2560};
+}

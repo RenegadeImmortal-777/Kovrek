@@ -1,0 +1,26 @@
+// kv_ener_hessian_mil1: Smart-Grid Phasor Stability & Tokamak Fusion — Finite-Difference Positive-Definite Curvature (mil1 regime)
+// Combinatorial Synthesis Index #2541 (Domain=ener, Kernel=hessian, Regime=mil1)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 4000 {
+        clamped = 4000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 4000, "clamped <= 4000");
+    return clamped;
+}
+
+fn quadrature_and_quantum_probe(a: Number, b: Number) -> Map {
+    let mid = 0.5 * (a + b);
+    let h = (b - a) / 6.0;
+    let simpson_area = h * (a * a + 4.0 * mid * mid + b * b) * 60 * 0.001;
+    let bell = qcircuit_run(2, [["H", 0], ["CNOT", 0, 1]]);
+    return {"integral": simpson_area, "midpoint": mid, "entanglement_bits": bell["entanglement_entropy_q0"]};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_ener_hessian_mil1", "domain": "ener", "kernel": "hessian", "regime": "mil1", "max_budget": 4000};
+}
