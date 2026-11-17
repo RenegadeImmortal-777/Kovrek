@@ -1,0 +1,27 @@
+// kv_imag_rk4_pq512: MRI k-Space Reconstruction & Hyperspectral Optics — Runge-Kutta 4th-Order ODE Integrator (pq512 regime)
+// Combinatorial Synthesis Index #1934 (Domain=imag, Kernel=rk4, Regime=pq512)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 5120 {
+        clamped = 5120;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 5120, "clamped <= 5120");
+    return clamped;
+}
+
+fn integrate_step(y0: Number, dt: Number, deriv_scale: Number) -> Number {
+    let c = 512;
+    let k1 = dt * (-deriv_scale * y0 + c * 0.001);
+    let k2 = dt * (-deriv_scale * (y0 + 0.5 * k1) + c * 0.001);
+    let k3 = dt * (-deriv_scale * (y0 + 0.5 * k2) + c * 0.001);
+    let k4 = dt * (-deriv_scale * (y0 + k3) + c * 0.001);
+    return y0 + (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0;
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_imag_rk4_pq512", "domain": "imag", "kernel": "rk4", "regime": "pq512", "max_budget": 5120};
+}
