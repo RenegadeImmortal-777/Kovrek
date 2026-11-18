@@ -1,0 +1,24 @@
+// kv_iot_gmres_nasa1: Ultra-Low-Power Mesh Sensor Telemetry — Arnoldi Krylov Residual Minimizer (nasa1 regime)
+// Combinatorial Synthesis Index #2777 (Domain=iot, Kernel=gmres, Regime=nasa1)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 12000 {
+        clamped = 12000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 12000, "clamped <= 12000");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 3.3};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_iot_gmres_nasa1", "domain": "iot", "kernel": "gmres", "regime": "nasa1", "max_budget": 12000};
+}
