@@ -1,0 +1,25 @@
+// kv_geo_bezier_pq256: Seismic Wave Tomography & Plate Geodynamics — De Casteljau Cubic Bernstein Evaluator (pq256 regime)
+// Combinatorial Synthesis Index #3283 (Domain=geo, Kernel=bezier, Regime=pq256)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 2560 {
+        clamped = 2560;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 2560, "clamped <= 2560");
+    return clamped;
+}
+
+fn compute_control_law(setpoint: Number, measured: Number, kp: Number, ki: Number, accum: Number) -> Map {
+    let err = setpoint - measured;
+    let next_accum = accum + err;
+    let raw_u = kp * err + ki * next_accum;
+    return {"control": raw_u, "error": err, "integral": next_accum, "max_limit": 2560};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_geo_bezier_pq256", "domain": "geo", "kernel": "bezier", "regime": "pq256", "max_budget": 2560};
+}
