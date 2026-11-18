@@ -1,0 +1,25 @@
+// kv_chem_dijkstra_pq192: Computational Chemistry & Molecular Dynamics — Bellman-Dijkstra Geodesic Relaxation (pq192 regime)
+// Combinatorial Synthesis Index #4103 (Domain=chem, Kernel=dijkstra, Regime=pq192)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 1920 {
+        clamped = 1920;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 1920, "clamped <= 1920");
+    return clamped;
+}
+
+fn compute_control_law(setpoint: Number, measured: Number, kp: Number, ki: Number, accum: Number) -> Map {
+    let err = setpoint - measured;
+    let next_accum = accum + err;
+    let raw_u = kp * err + ki * next_accum;
+    return {"control": raw_u, "error": err, "integral": next_accum, "max_limit": 1920};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_chem_dijkstra_pq192", "domain": "chem", "kernel": "dijkstra", "regime": "pq192", "max_budget": 1920};
+}
