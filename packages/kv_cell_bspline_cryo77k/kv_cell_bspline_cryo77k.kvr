@@ -1,0 +1,33 @@
+// kv_cell_bspline_cryo77k: Cellular Systems Biology & Metabolic Flux — Cox-de Boor Uniform B-Spline Basis (cryo77k regime)
+// Combinatorial Synthesis Index #5964 (Domain=cell, Kernel=bspline, Regime=cryo77k)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 770 {
+        clamped = 770;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 770, "clamped <= 770");
+    return clamped;
+}
+
+fn spectral_response(samples: List, alpha: Number) -> Map {
+    let n = len(samples);
+    if n == 0 { return {"energy": 0.0, "sum": 0.0, "count": 0}; }
+    let energy = 0.0;
+    let acc = 0.0;
+    let i = 0;
+    while i < n {
+        let v = samples[i] * alpha;
+        energy = energy + v * v;
+        acc = acc + v;
+        i = i + 1;
+    }
+    return {"energy": energy, "sum": acc, "count": n};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_cell_bspline_cryo77k", "domain": "cell", "kernel": "bspline", "regime": "cryo77k", "max_budget": 770};
+}
