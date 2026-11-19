@@ -1,0 +1,24 @@
+// kv_chem_astar_esa1: Computational Chemistry & Molecular Dynamics — Admissible Heuristic A* Frontier Evaluator (esa1 regime)
+// Combinatorial Synthesis Index #6651 (Domain=chem, Kernel=astar, Regime=esa1)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 15000 {
+        clamped = 15000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 15000, "clamped <= 15000");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 8.31446};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_chem_astar_esa1", "domain": "chem", "kernel": "astar", "regime": "esa1", "max_budget": 15000};
+}
