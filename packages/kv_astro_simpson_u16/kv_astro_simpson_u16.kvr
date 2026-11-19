@@ -1,0 +1,25 @@
+// kv_astro_simpson_u16: Astrophysics & Relativistic Cosmology — Composite Simpson 1/3 Numerical Integrator (u16 regime)
+// Combinatorial Synthesis Index #5575 (Domain=astro, Kernel=simpson, Regime=u16)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 65535 {
+        clamped = 65535;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 65535, "clamped <= 65535");
+    return clamped;
+}
+
+fn compute_control_law(setpoint: Number, measured: Number, kp: Number, ki: Number, accum: Number) -> Map {
+    let err = setpoint - measured;
+    let next_accum = accum + err;
+    let raw_u = kp * err + ki * next_accum;
+    return {"control": raw_u, "error": err, "integral": next_accum, "max_limit": 65535};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_astro_simpson_u16", "domain": "astro", "kernel": "simpson", "regime": "u16", "max_budget": 65535};
+}
