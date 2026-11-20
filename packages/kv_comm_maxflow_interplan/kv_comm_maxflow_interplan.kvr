@@ -1,0 +1,33 @@
+// kv_comm_maxflow_interplan: 6G Terahertz OFDM & Channel Coding — Bottleneck Residual Capacity Augmenter (interplan regime)
+// Combinatorial Synthesis Index #9377 (Domain=comm, Kernel=maxflow, Regime=interplan)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 1000000 {
+        clamped = 1000000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 1000000, "clamped <= 1000000");
+    return clamped;
+}
+
+fn spectral_response(samples: List, alpha: Number) -> Map {
+    let n = len(samples);
+    if n == 0 { return {"energy": 0.0, "sum": 0.0, "count": 0}; }
+    let energy = 0.0;
+    let acc = 0.0;
+    let i = 0;
+    while i < n {
+        let v = samples[i] * alpha;
+        energy = energy + v * v;
+        acc = acc + v;
+        i = i + 1;
+    }
+    return {"energy": energy, "sum": acc, "count": n};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_comm_maxflow_interplan", "domain": "comm", "kernel": "maxflow", "regime": "interplan", "max_budget": 1000000};
+}
