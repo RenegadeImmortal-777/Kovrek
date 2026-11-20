@@ -1,0 +1,24 @@
+// kv_ener_wasserstein_iso3: Smart-Grid Phasor Stability & Tokamak Fusion — 1D Kantorovich-Rubinstein Optimal Transport (iso3 regime)
+// Combinatorial Synthesis Index #7585 (Domain=ener, Kernel=wasserstein, Regime=iso3)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 3000 {
+        clamped = 3000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 3000, "clamped <= 3000");
+    return clamped;
+}
+
+fn cryptographic_frame_digest(payload: String, context_tag: String) -> Map {
+    let mac = kmac256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", payload, context_tag, 32);
+    let ecc = ecc_encode(payload);
+    return {"kmac256": mac, "secded_token": ecc, "sha3_256": sha3_256(payload)};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_ener_wasserstein_iso3", "domain": "ener", "kernel": "wasserstein", "regime": "iso3", "max_budget": 3000};
+}

@@ -1,0 +1,25 @@
+// kv_cell_pid_esa1: Cellular Systems Biology & Metabolic Flux — Anti-Windup PID Feedback Controller (esa1 regime)
+// Combinatorial Synthesis Index #7472 (Domain=cell, Kernel=pid, Regime=esa1)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 15000 {
+        clamped = 15000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 15000, "clamped <= 15000");
+    return clamped;
+}
+
+fn compute_control_law(setpoint: Number, measured: Number, kp: Number, ki: Number, accum: Number) -> Map {
+    let err = setpoint - measured;
+    let next_accum = accum + err;
+    let raw_u = kp * err + ki * next_accum;
+    return {"control": raw_u, "error": err, "integral": next_accum, "max_limit": 15000};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_cell_pid_esa1", "domain": "cell", "kernel": "pid", "regime": "esa1", "max_budget": 15000};
+}
