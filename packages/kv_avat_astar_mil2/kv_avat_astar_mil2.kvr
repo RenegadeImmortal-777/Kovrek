@@ -1,0 +1,24 @@
+// kv_avat_astar_mil2: Avionics & Fly-By-Wire Envelope Protection — Admissible Heuristic A* Frontier Evaluator (mil2 regime)
+// Combinatorial Synthesis Index #8936 (Domain=avat, Kernel=astar, Regime=mil2)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 8000 {
+        clamped = 8000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 8000, "clamped <= 8000");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 250};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_avat_astar_mil2", "domain": "avat", "kernel": "astar", "regime": "mil2", "max_budget": 8000};
+}

@@ -1,0 +1,33 @@
+// kv_grid_pade_fips1: Exascale Topology-Aware Job Scheduling — Diagonal [2/2] Padé Rational Approximant (fips1 regime)
+// Combinatorial Synthesis Index #8828 (Domain=grid, Kernel=pade, Regime=fips1)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 16384 {
+        clamped = 16384;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 16384, "clamped <= 16384");
+    return clamped;
+}
+
+fn spectral_response(samples: List, alpha: Number) -> Map {
+    let n = len(samples);
+    if n == 0 { return {"energy": 0.0, "sum": 0.0, "count": 0}; }
+    let energy = 0.0;
+    let acc = 0.0;
+    let i = 0;
+    while i < n {
+        let v = samples[i] * alpha;
+        energy = energy + v * v;
+        acc = acc + v;
+        i = i + 1;
+    }
+    return {"energy": energy, "sum": acc, "count": n};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_grid_pade_fips1", "domain": "grid", "kernel": "pade", "regime": "fips1", "max_budget": 16384};
+}
