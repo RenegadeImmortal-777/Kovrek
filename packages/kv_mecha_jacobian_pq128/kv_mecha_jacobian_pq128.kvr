@@ -1,0 +1,27 @@
+// kv_mecha_jacobian_pq128: Compliant Actuators & Soft Continuum Robotics — Central-Difference Condition Number Probe (pq128 regime)
+// Combinatorial Synthesis Index #8385 (Domain=mecha, Kernel=jacobian, Regime=pq128)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 1280 {
+        clamped = 1280;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 1280, "clamped <= 1280");
+    return clamped;
+}
+
+fn entropy_and_hazard_metrics(prob_p: Number, prob_q: Number, shape_k: Number) -> Map {
+    let p = prob_p;
+    if p <= 0.000001 { p = 0.000001; }
+    if p >= 0.999999 { p = 0.999999; }
+    let shannon_bits = -(p * log(p) + (1.0 - p) * log(1.0 - p)) * 1.4426950408889634;
+    let transport_l1 = abs(p - prob_q);
+    return {"shannon_bits": shannon_bits, "wasserstein_1d": transport_l1, "shape": shape_k};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_mecha_jacobian_pq128", "domain": "mecha", "kernel": "jacobian", "regime": "pq128", "max_budget": 1280};
+}
