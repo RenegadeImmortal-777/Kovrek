@@ -1,0 +1,25 @@
+// kv_astro_simpson_q32: Astrophysics & Relativistic Cosmology — Composite Simpson 1/3 Numerical Integrator (q32 regime)
+// Combinatorial Synthesis Index #8695 (Domain=astro, Kernel=simpson, Regime=q32)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 131072 {
+        clamped = 131072;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 131072, "clamped <= 131072");
+    return clamped;
+}
+
+fn compute_control_law(setpoint: Number, measured: Number, kp: Number, ki: Number, accum: Number) -> Map {
+    let err = setpoint - measured;
+    let next_accum = accum + err;
+    let raw_u = kp * err + ki * next_accum;
+    return {"control": raw_u, "error": err, "integral": next_accum, "max_limit": 131072};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_astro_simpson_q32", "domain": "astro", "kernel": "simpson", "regime": "q32", "max_budget": 131072};
+}

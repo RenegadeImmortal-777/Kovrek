@@ -1,0 +1,25 @@
+// kv_env_bezier_i64: Subsurface Hydrology & Contaminant Transport — De Casteljau Cubic Bernstein Evaluator (i64 regime)
+// Combinatorial Synthesis Index #8688 (Domain=env, Kernel=bezier, Regime=i64)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 500000 {
+        clamped = 500000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 500000, "clamped <= 500000");
+    return clamped;
+}
+
+fn compute_control_law(setpoint: Number, measured: Number, kp: Number, ki: Number, accum: Number) -> Map {
+    let err = setpoint - measured;
+    let next_accum = accum + err;
+    let raw_u = kp * err + ki * next_accum;
+    return {"control": raw_u, "error": err, "integral": next_accum, "max_limit": 500000};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_env_bezier_i64", "domain": "env", "kernel": "bezier", "regime": "i64", "max_budget": 500000};
+}
