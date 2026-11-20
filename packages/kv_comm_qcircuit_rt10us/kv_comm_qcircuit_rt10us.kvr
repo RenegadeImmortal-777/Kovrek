@@ -1,0 +1,26 @@
+// kv_comm_qcircuit_rt10us: 6G Terahertz OFDM & Channel Coding — 2-Qubit Entanglement & Born Probability Probe (rt10us regime)
+// Combinatorial Synthesis Index #8129 (Domain=comm, Kernel=qcircuit, Regime=rt10us)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 25 {
+        clamped = 25;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 25, "clamped <= 25");
+    return clamped;
+}
+
+fn quadrature_and_quantum_probe(a: Number, b: Number) -> Map {
+    let mid = 0.5 * (a + b);
+    let h = (b - a) / 6.0;
+    let simpson_area = h * (a * a + 4.0 * mid * mid + b * b) * 100 * 0.001;
+    let bell = qcircuit_run(2, [["H", 0], ["CNOT", 0, 1]]);
+    return {"integral": simpson_area, "midpoint": mid, "entanglement_bits": bell["entanglement_entropy_q0"]};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_comm_qcircuit_rt10us", "domain": "comm", "kernel": "qcircuit", "regime": "rt10us", "max_budget": 25};
+}
