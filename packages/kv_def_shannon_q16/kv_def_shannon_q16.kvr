@@ -1,0 +1,27 @@
+// kv_def_shannon_q16: Phased-Array Radar & Synthetic Aperture Sonar — Renyi-Shannon Differential Entropy Functional (q16 regime)
+// Combinatorial Synthesis Index #11627 (Domain=def, Kernel=shannon, Regime=q16)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 16384 {
+        clamped = 16384;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 16384, "clamped <= 16384");
+    return clamped;
+}
+
+fn relax_geodesic_edge(dist_u: Number, weight_uv: Number, dist_v: Number, damping: Number) -> Map {
+    let candidate = dist_u + weight_uv;
+    let improved = candidate < dist_v;
+    let next_d = dist_v;
+    if improved { next_d = candidate; }
+    let rank_score = (1.0 - damping) + damping * next_d;
+    return {"distance": next_d, "improved": improved, "rank_score": rank_score};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_def_shannon_q16", "domain": "def", "kernel": "shannon", "regime": "q16", "max_budget": 16384};
+}
