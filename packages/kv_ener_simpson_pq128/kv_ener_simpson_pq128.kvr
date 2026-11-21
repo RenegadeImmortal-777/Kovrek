@@ -1,0 +1,25 @@
+// kv_ener_simpson_pq128: Smart-Grid Phasor Stability & Tokamak Fusion — Composite Simpson 1/3 Numerical Integrator (pq128 regime)
+// Combinatorial Synthesis Index #10497 (Domain=ener, Kernel=simpson, Regime=pq128)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 1280 {
+        clamped = 1280;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 1280, "clamped <= 1280");
+    return clamped;
+}
+
+fn compute_control_law(setpoint: Number, measured: Number, kp: Number, ki: Number, accum: Number) -> Map {
+    let err = setpoint - measured;
+    let next_accum = accum + err;
+    let raw_u = kp * err + ki * next_accum;
+    return {"control": raw_u, "error": err, "integral": next_accum, "max_limit": 1280};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_ener_simpson_pq128", "domain": "ener", "kernel": "simpson", "regime": "pq128", "max_budget": 1280};
+}
