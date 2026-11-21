@@ -1,0 +1,27 @@
+// kv_aero_merkle_fips1: Aerospace & Orbital Flight Control — Domain-Separated SHA3-256 Merkle Branch (fips1 regime)
+// Combinatorial Synthesis Index #10764 (Domain=aero, Kernel=merkle, Regime=fips1)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 16384 {
+        clamped = 16384;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 16384, "clamped <= 16384");
+    return clamped;
+}
+
+fn interpolate_geodesic(p0: Number, p1: Number, p2: Number, t: Number) -> Map {
+    let u = t;
+    if u < 0.0 { u = 0.0; }
+    if u > 1.0 { u = 1.0; }
+    let om = 1.0 - u;
+    let quad_bezier = om * om * p0 + 2.0 * om * u * p1 + u * u * p2;
+    return {"point": quad_bezier, "param_t": u, "tangent": 2.0 * om * (p1 - p0) + 2.0 * u * (p2 - p1)};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_aero_merkle_fips1", "domain": "aero", "kernel": "merkle", "regime": "fips1", "max_budget": 16384};
+}

@@ -1,0 +1,27 @@
+// kv_dist_cg_cryo77k: Byzantine Fault-Tolerant Distributed Consensus — Preconditioned Conjugate Gradient Step (cryo77k regime)
+// Combinatorial Synthesis Index #10598 (Domain=dist, Kernel=cg, Regime=cryo77k)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 770 {
+        clamped = 770;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 770, "clamped <= 770");
+    return clamped;
+}
+
+fn integrate_step(y0: Number, dt: Number, deriv_scale: Number) -> Number {
+    let c = 3;
+    let k1 = dt * (-deriv_scale * y0 + c * 0.001);
+    let k2 = dt * (-deriv_scale * (y0 + 0.5 * k1) + c * 0.001);
+    let k3 = dt * (-deriv_scale * (y0 + 0.5 * k2) + c * 0.001);
+    let k4 = dt * (-deriv_scale * (y0 + k3) + c * 0.001);
+    return y0 + (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0;
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_dist_cg_cryo77k", "domain": "dist", "kernel": "cg", "regime": "cryo77k", "max_budget": 770};
+}
