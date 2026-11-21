@@ -1,0 +1,24 @@
+// kv_cad_legendre_q8: Computational Geometry, NURBS & Solid Meshing — 3-Point Gauss-Legendre Quadrature Rule (q8 regime)
+// Combinatorial Synthesis Index #9749 (Domain=cad, Kernel=legendre, Regime=q8)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 128 {
+        clamped = 128;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 128, "clamped <= 128");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 0.001};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_cad_legendre_q8", "domain": "cad", "kernel": "legendre", "regime": "q8", "max_budget": 128};
+}
