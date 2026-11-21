@@ -1,0 +1,26 @@
+// kv_mat_cmsketch_hp1mw: Crystal Lattice Phonons & Density Functional Theory — Pairwise-Independent Count-Min Point Query (hp1mw regime)
+// Combinatorial Synthesis Index #11535 (Domain=mat, Kernel=cmsketch, Regime=hp1mw)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 250000 {
+        clamped = 250000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 250000, "clamped <= 250000");
+    return clamped;
+}
+
+fn quadrature_and_quantum_probe(a: Number, b: Number) -> Map {
+    let mid = 0.5 * (a + b);
+    let h = (b - a) / 6.0;
+    let simpson_area = h * (a * a + 4.0 * mid * mid + b * b) * 0.529 * 0.001;
+    let bell = qcircuit_run(2, [["H", 0], ["CNOT", 0, 1]]);
+    return {"integral": simpson_area, "midpoint": mid, "entanglement_bits": bell["entanglement_entropy_q0"]};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_mat_cmsketch_hp1mw", "domain": "mat", "kernel": "cmsketch", "regime": "hp1mw", "max_budget": 250000};
+}
