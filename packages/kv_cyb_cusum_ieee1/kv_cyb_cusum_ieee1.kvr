@@ -1,0 +1,24 @@
+// kv_cyb_cusum_ieee1: Zero-Trust Cyber-Physical Intrusion Detection — Page Log-Likelihood Change-Point Detector (ieee1 regime)
+// Combinatorial Synthesis Index #10877 (Domain=cyb, Kernel=cusum, Regime=ieee1)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 500 {
+        clamped = 500;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 500, "clamped <= 500");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 256};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_cyb_cusum_ieee1", "domain": "cyb", "kernel": "cusum", "regime": "ieee1", "max_budget": 500};
+}
