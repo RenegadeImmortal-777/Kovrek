@@ -1,0 +1,24 @@
+// kv_spce_poisson_geo36k: Deep-Space Optical Navigation & GCR Shielding — Successive Over-Relaxation Elliptic Kernel (geo36k regime)
+// Combinatorial Synthesis Index #9962 (Domain=spce, Kernel=poisson, Regime=geo36k)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 36000 {
+        clamped = 36000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 36000, "clamped <= 36000");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 149597870.7};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_spce_poisson_geo36k", "domain": "spce", "kernel": "poisson", "regime": "geo36k", "max_budget": 36000};
+}
