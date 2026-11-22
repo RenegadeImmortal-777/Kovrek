@@ -1,0 +1,33 @@
+// kv_logi_nelder_rad1m: Vehicle Routing & Mixed-Integer Supply Chains — Nelder-Mead Polytope Simplex Optimizer (rad1m regime)
+// Combinatorial Synthesis Index #14072 (Domain=logi, Kernel=nelder, Regime=rad1m)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 500000 {
+        clamped = 500000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 500000, "clamped <= 500000");
+    return clamped;
+}
+
+fn spectral_response(samples: List, alpha: Number) -> Map {
+    let n = len(samples);
+    if n == 0 { return {"energy": 0.0, "sum": 0.0, "count": 0}; }
+    let energy = 0.0;
+    let acc = 0.0;
+    let i = 0;
+    while i < n {
+        let v = samples[i] * alpha;
+        energy = energy + v * v;
+        acc = acc + v;
+        i = i + 1;
+    }
+    return {"energy": energy, "sum": acc, "count": n};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_logi_nelder_rad1m", "domain": "logi", "kernel": "nelder", "regime": "rad1m", "max_budget": 500000};
+}

@@ -1,0 +1,24 @@
+// kv_spce_astar_uhv1npa: Deep-Space Optical Navigation & GCR Shielding — Admissible Heuristic A* Frontier Evaluator (uhv1npa regime)
+// Combinatorial Synthesis Index #14122 (Domain=spce, Kernel=astar, Regime=uhv1npa)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 10 {
+        clamped = 10;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 10, "clamped <= 10");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 149597870.7};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_spce_astar_uhv1npa", "domain": "spce", "kernel": "astar", "regime": "uhv1npa", "max_budget": 10};
+}
