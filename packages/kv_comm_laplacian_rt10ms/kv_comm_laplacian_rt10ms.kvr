@@ -1,0 +1,27 @@
+// kv_comm_laplacian_rt10ms: 6G Terahertz OFDM & Channel Coding — Rayleigh Quotient Spectral Gap Estimator (rt10ms regime)
+// Combinatorial Synthesis Index #13641 (Domain=comm, Kernel=laplacian, Regime=rt10ms)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 1000 {
+        clamped = 1000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 1000, "clamped <= 1000");
+    return clamped;
+}
+
+fn relax_geodesic_edge(dist_u: Number, weight_uv: Number, dist_v: Number, damping: Number) -> Map {
+    let candidate = dist_u + weight_uv;
+    let improved = candidate < dist_v;
+    let next_d = dist_v;
+    if improved { next_d = candidate; }
+    let rank_score = (1.0 - damping) + damping * next_d;
+    return {"distance": next_d, "improved": improved, "rank_score": rank_score};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_comm_laplacian_rt10ms", "domain": "comm", "kernel": "laplacian", "regime": "rt10ms", "max_budget": 1000};
+}

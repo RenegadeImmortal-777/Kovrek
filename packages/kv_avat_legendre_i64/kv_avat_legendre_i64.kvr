@@ -1,0 +1,24 @@
+// kv_avat_legendre_i64: Avionics & Fly-By-Wire Envelope Protection — 3-Point Gauss-Legendre Quadrature Rule (i64 regime)
+// Combinatorial Synthesis Index #13616 (Domain=avat, Kernel=legendre, Regime=i64)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 500000 {
+        clamped = 500000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 500000, "clamped <= 500000");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 250};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_avat_legendre_i64", "domain": "avat", "kernel": "legendre", "regime": "i64", "max_budget": 500000};
+}
