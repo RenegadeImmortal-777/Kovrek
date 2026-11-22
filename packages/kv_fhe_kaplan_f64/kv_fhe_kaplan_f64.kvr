@@ -1,0 +1,33 @@
+// kv_fhe_kaplan_f64: Ring-LWE Lattice & Homomorphic Cryptography — Non-Parametric Product-Limit Hazard Estimator (f64 regime)
+// Combinatorial Synthesis Index #12153 (Domain=fhe, Kernel=kaplan, Regime=f64)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 65536 {
+        clamped = 65536;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 65536, "clamped <= 65536");
+    return clamped;
+}
+
+fn spectral_response(samples: List, alpha: Number) -> Map {
+    let n = len(samples);
+    if n == 0 { return {"energy": 0.0, "sum": 0.0, "count": 0}; }
+    let energy = 0.0;
+    let acc = 0.0;
+    let i = 0;
+    while i < n {
+        let v = samples[i] * alpha;
+        energy = energy + v * v;
+        acc = acc + v;
+        i = i + 1;
+    }
+    return {"energy": energy, "sum": acc, "count": n};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_fhe_kaplan_f64", "domain": "fhe", "kernel": "kaplan", "regime": "f64", "max_budget": 65536};
+}

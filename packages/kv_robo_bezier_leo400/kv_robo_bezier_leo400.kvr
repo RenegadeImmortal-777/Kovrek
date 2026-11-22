@@ -1,0 +1,25 @@
+// kv_robo_bezier_leo400: 6-DOF Manipulator Inverse Kinematics & SLAM — De Casteljau Cubic Bernstein Evaluator (leo400 regime)
+// Combinatorial Synthesis Index #12072 (Domain=robo, Kernel=bezier, Regime=leo400)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 4000 {
+        clamped = 4000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 4000, "clamped <= 4000");
+    return clamped;
+}
+
+fn compute_control_law(setpoint: Number, measured: Number, kp: Number, ki: Number, accum: Number) -> Map {
+    let err = setpoint - measured;
+    let next_accum = accum + err;
+    let raw_u = kp * err + ki * next_accum;
+    return {"control": raw_u, "error": err, "integral": next_accum, "max_limit": 4000};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_robo_bezier_leo400", "domain": "robo", "kernel": "bezier", "regime": "leo400", "max_budget": 4000};
+}
