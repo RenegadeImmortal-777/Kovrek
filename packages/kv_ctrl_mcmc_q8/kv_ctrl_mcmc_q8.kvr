@@ -1,0 +1,27 @@
+// kv_ctrl_mcmc_q8: Nonlinear & Robust Industrial Control — Metropolis-Hastings Ergodic Chain Sampler (q8 regime)
+// Combinatorial Synthesis Index #12623 (Domain=ctrl, Kernel=mcmc, Regime=q8)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 128 {
+        clamped = 128;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 128, "clamped <= 128");
+    return clamped;
+}
+
+fn relax_geodesic_edge(dist_u: Number, weight_uv: Number, dist_v: Number, damping: Number) -> Map {
+    let candidate = dist_u + weight_uv;
+    let improved = candidate < dist_v;
+    let next_d = dist_v;
+    if improved { next_d = candidate; }
+    let rank_score = (1.0 - damping) + damping * next_d;
+    return {"distance": next_d, "improved": improved, "rank_score": rank_score};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_ctrl_mcmc_q8", "domain": "ctrl", "kernel": "mcmc", "regime": "q8", "max_budget": 128};
+}

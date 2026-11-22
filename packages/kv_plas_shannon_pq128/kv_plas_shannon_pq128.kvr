@@ -1,0 +1,27 @@
+// kv_plas_shannon_pq128: Magnetohydrodynamic Alfvén Waves & Stellarators — Renyi-Shannon Differential Entropy Functional (pq128 regime)
+// Combinatorial Synthesis Index #12726 (Domain=plas, Kernel=shannon, Regime=pq128)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 1280 {
+        clamped = 1280;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 1280, "clamped <= 1280");
+    return clamped;
+}
+
+fn relax_geodesic_edge(dist_u: Number, weight_uv: Number, dist_v: Number, damping: Number) -> Map {
+    let candidate = dist_u + weight_uv;
+    let improved = candidate < dist_v;
+    let next_d = dist_v;
+    if improved { next_d = candidate; }
+    let rank_score = (1.0 - damping) + damping * next_d;
+    return {"distance": next_d, "improved": improved, "rank_score": rank_score};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_plas_shannon_pq128", "domain": "plas", "kernel": "shannon", "regime": "pq128", "max_budget": 1280};
+}
