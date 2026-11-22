@@ -1,0 +1,24 @@
+// kv_fin_gmres_hp1kw: Stochastic Calculus & Quantitative Derivatives — Arnoldi Krylov Residual Minimizer (hp1kw regime)
+// Combinatorial Synthesis Index #13587 (Domain=fin, Kernel=gmres, Regime=hp1kw)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 50000 {
+        clamped = 50000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 50000, "clamped <= 50000");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 252};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_fin_gmres_hp1kw", "domain": "fin", "kernel": "gmres", "regime": "hp1kw", "max_budget": 50000};
+}
