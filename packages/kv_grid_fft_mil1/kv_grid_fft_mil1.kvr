@@ -1,0 +1,27 @@
+// kv_grid_fft_mil1: Exascale Topology-Aware Job Scheduling — Spectral Discrete Fourier Energy Analyzer (mil1 regime)
+// Combinatorial Synthesis Index #12572 (Domain=grid, Kernel=fft, Regime=mil1)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 4000 {
+        clamped = 4000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 4000, "clamped <= 4000");
+    return clamped;
+}
+
+fn relax_geodesic_edge(dist_u: Number, weight_uv: Number, dist_v: Number, damping: Number) -> Map {
+    let candidate = dist_u + weight_uv;
+    let improved = candidate < dist_v;
+    let next_d = dist_v;
+    if improved { next_d = candidate; }
+    let rank_score = (1.0 - damping) + damping * next_d;
+    return {"distance": next_d, "improved": improved, "rank_score": rank_score};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_grid_fft_mil1", "domain": "grid", "kernel": "fft", "regime": "mil1", "max_budget": 4000};
+}
