@@ -1,0 +1,27 @@
+// kv_comp_hll_i32: Compiler Abstract Interpretation & SSA Optimization — HyperLogLog Harmonic Register Aggregator (i32 regime)
+// Combinatorial Synthesis Index #13028 (Domain=comp, Kernel=hll, Regime=i32)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 32768 {
+        clamped = 32768;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 32768, "clamped <= 32768");
+    return clamped;
+}
+
+fn entropy_and_hazard_metrics(prob_p: Number, prob_q: Number, shape_k: Number) -> Map {
+    let p = prob_p;
+    if p <= 0.000001 { p = 0.000001; }
+    if p >= 0.999999 { p = 0.999999; }
+    let shannon_bits = -(p * log(p) + (1.0 - p) * log(1.0 - p)) * 1.4426950408889634;
+    let transport_l1 = abs(p - prob_q);
+    return {"shannon_bits": shannon_bits, "wasserstein_1d": transport_l1, "shape": shape_k};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_comp_hll_i32", "domain": "comp", "kernel": "hll", "regime": "i32", "max_budget": 32768};
+}
