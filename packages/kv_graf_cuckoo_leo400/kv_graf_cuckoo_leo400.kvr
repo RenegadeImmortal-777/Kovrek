@@ -1,0 +1,27 @@
+// kv_graf_cuckoo_leo400: Spectral Graph Theory & Hypergraph Partitioning — Partial-Key Cuckoo Fingerprint Displacement (leo400 regime)
+// Combinatorial Synthesis Index #15005 (Domain=graf, Kernel=cuckoo, Regime=leo400)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 4000 {
+        clamped = 4000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 4000, "clamped <= 4000");
+    return clamped;
+}
+
+fn interpolate_geodesic(p0: Number, p1: Number, p2: Number, t: Number) -> Map {
+    let u = t;
+    if u < 0.0 { u = 0.0; }
+    if u > 1.0 { u = 1.0; }
+    let om = 1.0 - u;
+    let quad_bezier = om * om * p0 + 2.0 * om * u * p1 + u * u * p2;
+    return {"point": quad_bezier, "param_t": u, "tangent": 2.0 * om * (p1 - p0) + 2.0 * u * (p2 - p1)};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_graf_cuckoo_leo400", "domain": "graf", "kernel": "cuckoo", "regime": "leo400", "max_budget": 4000};
+}
