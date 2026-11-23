@@ -1,0 +1,24 @@
+// kv_chem_wasserstein_hp1mw: Computational Chemistry & Molecular Dynamics — 1D Kantorovich-Rubinstein Optimal Transport (hp1mw regime)
+// Combinatorial Synthesis Index #15231 (Domain=chem, Kernel=wasserstein, Regime=hp1mw)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 250000 {
+        clamped = 250000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 250000, "clamped <= 250000");
+    return clamped;
+}
+
+fn cryptographic_frame_digest(payload: String, context_tag: String) -> Map {
+    let mac = kmac256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", payload, context_tag, 32);
+    let ecc = ecc_encode(payload);
+    return {"kmac256": mac, "secded_token": ecc, "sha3_256": sha3_256(payload)};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_chem_wasserstein_hp1mw", "domain": "chem", "kernel": "wasserstein", "regime": "hp1mw", "max_budget": 250000};
+}

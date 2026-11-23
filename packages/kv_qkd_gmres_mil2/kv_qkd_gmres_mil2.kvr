@@ -1,0 +1,24 @@
+// kv_qkd_gmres_mil2: Decoy-State BB84 & Entanglement Repeater Routing — Arnoldi Krylov Residual Minimizer (mil2 regime)
+// Combinatorial Synthesis Index #15389 (Domain=qkd, Kernel=gmres, Regime=mil2)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 8000 {
+        clamped = 8000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 8000, "clamped <= 8000");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 0.11};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_qkd_gmres_mil2", "domain": "qkd", "kernel": "gmres", "regime": "mil2", "max_budget": 8000};
+}
