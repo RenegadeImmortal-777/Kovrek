@@ -1,0 +1,24 @@
+// kv_spce_legendre_mil1: Deep-Space Optical Navigation & GCR Shielding — 3-Point Gauss-Legendre Quadrature Rule (mil1 regime)
+// Combinatorial Synthesis Index #15682 (Domain=spce, Kernel=legendre, Regime=mil1)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 4000 {
+        clamped = 4000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 4000, "clamped <= 4000");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 149597870.7};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_spce_legendre_mil1", "domain": "spce", "kernel": "legendre", "regime": "mil1", "max_budget": 4000};
+}
