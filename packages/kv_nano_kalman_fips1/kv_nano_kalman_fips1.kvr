@@ -1,0 +1,24 @@
+// kv_nano_kalman_fips1: Carbon Nanotube Ballistic Transport & Quantum Dots — Kalman Covariance & Innovation Filter (fips1 regime)
+// Combinatorial Synthesis Index #14283 (Domain=nano, Kernel=kalman, Regime=fips1)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 16384 {
+        clamped = 16384;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 16384, "clamped <= 16384");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 1.602};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_nano_kalman_fips1", "domain": "nano", "kernel": "kalman", "regime": "fips1", "max_budget": 16384};
+}
