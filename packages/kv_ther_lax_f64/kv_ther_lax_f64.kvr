@@ -1,0 +1,26 @@
+// kv_ther_lax_f64: Non-Equilibrium Statistical Mechanics & Boltzmann Transport — Lax-Friedrichs Hyperbolic Flux Conservation (f64 regime)
+// Combinatorial Synthesis Index #15849 (Domain=ther, Kernel=lax, Regime=f64)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 65536 {
+        clamped = 65536;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 65536, "clamped <= 65536");
+    return clamped;
+}
+
+fn quadrature_and_quantum_probe(a: Number, b: Number) -> Map {
+    let mid = 0.5 * (a + b);
+    let h = (b - a) / 6.0;
+    let simpson_area = h * (a * a + 4.0 * mid * mid + b * b) * 1.380649 * 0.001;
+    let bell = qcircuit_run(2, [["H", 0], ["CNOT", 0, 1]]);
+    return {"integral": simpson_area, "midpoint": mid, "entanglement_bits": bell["entanglement_entropy_q0"]};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_ther_lax_f64", "domain": "ther", "kernel": "lax", "regime": "f64", "max_budget": 65536};
+}

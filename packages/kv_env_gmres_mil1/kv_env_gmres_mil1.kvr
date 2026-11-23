@@ -1,0 +1,24 @@
+// kv_env_gmres_mil1: Subsurface Hydrology & Contaminant Transport — Arnoldi Krylov Residual Minimizer (mil1 regime)
+// Combinatorial Synthesis Index #15916 (Domain=env, Kernel=gmres, Regime=mil1)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 4000 {
+        clamped = 4000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 4000, "clamped <= 4000");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 9.80665};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_env_gmres_mil1", "domain": "env", "kernel": "gmres", "regime": "mil1", "max_budget": 4000};
+}
