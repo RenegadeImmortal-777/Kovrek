@@ -1,0 +1,27 @@
+// kv_avat_hll_deep10km: Avionics & Fly-By-Wire Envelope Protection — HyperLogLog Harmonic Register Aggregator (deep10km regime)
+// Combinatorial Synthesis Index #16060 (Domain=avat, Kernel=hll, Regime=deep10km)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 100000 {
+        clamped = 100000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 100000, "clamped <= 100000");
+    return clamped;
+}
+
+fn entropy_and_hazard_metrics(prob_p: Number, prob_q: Number, shape_k: Number) -> Map {
+    let p = prob_p;
+    if p <= 0.000001 { p = 0.000001; }
+    if p >= 0.999999 { p = 0.999999; }
+    let shannon_bits = -(p * log(p) + (1.0 - p) * log(1.0 - p)) * 1.4426950408889634;
+    let transport_l1 = abs(p - prob_q);
+    return {"shannon_bits": shannon_bits, "wasserstein_1d": transport_l1, "shape": shape_k};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_avat_hll_deep10km", "domain": "avat", "kernel": "hll", "regime": "deep10km", "max_budget": 100000};
+}
