@@ -1,0 +1,27 @@
+// kv_spce_bayes_cryo77k: Deep-Space Optical Navigation & GCR Shielding — Conjugate Beta-Binomial Posterior Updater (cryo77k regime)
+// Combinatorial Synthesis Index #15526 (Domain=spce, Kernel=bayes, Regime=cryo77k)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 770 {
+        clamped = 770;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 770, "clamped <= 770");
+    return clamped;
+}
+
+fn entropy_and_hazard_metrics(prob_p: Number, prob_q: Number, shape_k: Number) -> Map {
+    let p = prob_p;
+    if p <= 0.000001 { p = 0.000001; }
+    if p >= 0.999999 { p = 0.999999; }
+    let shannon_bits = -(p * log(p) + (1.0 - p) * log(1.0 - p)) * 1.4426950408889634;
+    let transport_l1 = abs(p - prob_q);
+    return {"shannon_bits": shannon_bits, "wasserstein_1d": transport_l1, "shape": shape_k};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_spce_bayes_cryo77k", "domain": "spce", "kernel": "bayes", "regime": "cryo77k", "max_budget": 770};
+}
