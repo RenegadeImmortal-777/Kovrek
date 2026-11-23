@@ -1,0 +1,27 @@
+// kv_qkd_iir_rt1ms: Decoy-State BB84 & Entanglement Repeater Routing — Direct-Form-II Biquad IIR Resonator (rt1ms regime)
+// Combinatorial Synthesis Index #16221 (Domain=qkd, Kernel=iir, Regime=rt1ms)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 100 {
+        clamped = 100;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 100, "clamped <= 100");
+    return clamped;
+}
+
+fn interpolate_geodesic(p0: Number, p1: Number, p2: Number, t: Number) -> Map {
+    let u = t;
+    if u < 0.0 { u = 0.0; }
+    if u > 1.0 { u = 1.0; }
+    let om = 1.0 - u;
+    let quad_bezier = om * om * p0 + 2.0 * om * u * p1 + u * u * p2;
+    return {"point": quad_bezier, "param_t": u, "tangent": 2.0 * om * (p1 - p0) + 2.0 * u * (p2 - p1)};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_qkd_iir_rt1ms", "domain": "qkd", "kernel": "iir", "regime": "rt1ms", "max_budget": 100};
+}

@@ -1,0 +1,31 @@
+// kv_plas_anneal_i64: Magnetohydrodynamic Alfvén Waves & Stellarators — Kirkpatrick Boltzmann Simulated Annealing (i64 regime)
+// Combinatorial Synthesis Index #16314 (Domain=plas, Kernel=anneal, Regime=i64)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 500000 {
+        clamped = 500000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 500000, "clamped <= 500000");
+    return clamped;
+}
+
+fn optimize_iteration(x: Number, grad: Number, step_lr: Number, inv_temp: Number) -> Map {
+    let proposal = x - step_lr * grad;
+    let delta_e = (proposal * proposal) - (x * x);
+    let accept = true;
+    if delta_e > 0.0 and inv_temp > 0.0 {
+        let prob = exp(-delta_e * inv_temp);
+        accept = prob > 0.5;
+    }
+    let next_x = x;
+    if accept { next_x = proposal; }
+    return {"state": next_x, "accepted": accept, "delta_energy": delta_e};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_plas_anneal_i64", "domain": "plas", "kernel": "anneal", "regime": "i64", "max_budget": 500000};
+}
