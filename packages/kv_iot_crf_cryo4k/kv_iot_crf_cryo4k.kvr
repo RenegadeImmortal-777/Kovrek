@@ -1,0 +1,27 @@
+// kv_iot_crf_cryo4k: Ultra-Low-Power Mesh Sensor Telemetry — Linear-Chain Potential Partition Scorer (cryo4k regime)
+// Combinatorial Synthesis Index #17285 (Domain=iot, Kernel=crf, Regime=cryo4k)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 420 {
+        clamped = 420;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 420, "clamped <= 420");
+    return clamped;
+}
+
+fn integrate_step(y0: Number, dt: Number, deriv_scale: Number) -> Number {
+    let c = 3.3;
+    let k1 = dt * (-deriv_scale * y0 + c * 0.001);
+    let k2 = dt * (-deriv_scale * (y0 + 0.5 * k1) + c * 0.001);
+    let k3 = dt * (-deriv_scale * (y0 + 0.5 * k2) + c * 0.001);
+    let k4 = dt * (-deriv_scale * (y0 + k3) + c * 0.001);
+    return y0 + (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0;
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_iot_crf_cryo4k", "domain": "iot", "kernel": "crf", "regime": "cryo4k", "max_budget": 420};
+}
