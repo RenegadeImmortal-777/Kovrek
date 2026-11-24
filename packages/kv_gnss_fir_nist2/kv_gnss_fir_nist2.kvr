@@ -1,0 +1,24 @@
+// kv_gnss_fir_nist2: Multi-Constellation GNSS & Strapdown INS — Windowed Sinc FIR Convolution Filter (nist2 regime)
+// Combinatorial Synthesis Index #17802 (Domain=gnss, Kernel=fir, Regime=nist2)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 8192 {
+        clamped = 8192;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 8192, "clamped <= 8192");
+    return clamped;
+}
+
+fn cryptographic_frame_digest(payload: String, context_tag: String) -> Map {
+    let mac = kmac256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", payload, context_tag, 32);
+    let ecc = ecc_encode(payload);
+    return {"kmac256": mac, "secded_token": ecc, "sha3_256": sha3_256(payload)};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_gnss_fir_nist2", "domain": "gnss", "kernel": "fir", "regime": "nist2", "max_budget": 8192};
+}
