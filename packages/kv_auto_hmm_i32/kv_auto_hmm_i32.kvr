@@ -1,0 +1,26 @@
+// kv_auto_hmm_i32: Autonomous Vehicles & LiDAR Perception — Log-Domain Viterbi State Trellis Decoder (i32 regime)
+// Combinatorial Synthesis Index #19481 (Domain=auto, Kernel=hmm, Regime=i32)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 32768 {
+        clamped = 32768;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 32768, "clamped <= 32768");
+    return clamped;
+}
+
+fn quadrature_and_quantum_probe(a: Number, b: Number) -> Map {
+    let mid = 0.5 * (a + b);
+    let h = (b - a) / 6.0;
+    let simpson_area = h * (a * a + 4.0 * mid * mid + b * b) * 30 * 0.001;
+    let bell = qcircuit_run(2, [["H", 0], ["CNOT", 0, 1]]);
+    return {"integral": simpson_area, "midpoint": mid, "entanglement_bits": bell["entanglement_entropy_q0"]};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_auto_hmm_i32", "domain": "auto", "kernel": "hmm", "regime": "i32", "max_budget": 32768};
+}
