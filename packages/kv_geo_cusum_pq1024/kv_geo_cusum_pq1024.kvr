@@ -1,0 +1,24 @@
+// kv_geo_cusum_pq1024: Seismic Wave Tomography & Plate Geodynamics — Page Log-Likelihood Change-Point Detector (pq1024 regime)
+// Combinatorial Synthesis Index #18831 (Domain=geo, Kernel=cusum, Regime=pq1024)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 10240 {
+        clamped = 10240;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 10240, "clamped <= 10240");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 6371};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_geo_cusum_pq1024", "domain": "geo", "kernel": "cusum", "regime": "pq1024", "max_budget": 10240};
+}
