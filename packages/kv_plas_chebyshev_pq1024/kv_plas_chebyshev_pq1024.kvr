@@ -1,0 +1,27 @@
+// kv_plas_chebyshev_pq1024: Magnetohydrodynamic Alfvén Waves & Stellarators — Clenshaw Recurrence Chebyshev Evaluator (pq1024 regime)
+// Combinatorial Synthesis Index #18186 (Domain=plas, Kernel=chebyshev, Regime=pq1024)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 10240 {
+        clamped = 10240;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 10240, "clamped <= 10240");
+    return clamped;
+}
+
+fn integrate_step(y0: Number, dt: Number, deriv_scale: Number) -> Number {
+    let c = 10000;
+    let k1 = dt * (-deriv_scale * y0 + c * 0.001);
+    let k2 = dt * (-deriv_scale * (y0 + 0.5 * k1) + c * 0.001);
+    let k3 = dt * (-deriv_scale * (y0 + 0.5 * k2) + c * 0.001);
+    let k4 = dt * (-deriv_scale * (y0 + k3) + c * 0.001);
+    return y0 + (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0;
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_plas_chebyshev_pq1024", "domain": "plas", "kernel": "chebyshev", "regime": "pq1024", "max_budget": 10240};
+}
