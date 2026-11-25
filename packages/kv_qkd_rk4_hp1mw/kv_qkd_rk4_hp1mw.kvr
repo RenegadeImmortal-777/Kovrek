@@ -1,0 +1,27 @@
+// kv_qkd_rk4_hp1mw: Decoy-State BB84 & Entanglement Repeater Routing — Runge-Kutta 4th-Order ODE Integrator (hp1mw regime)
+// Combinatorial Synthesis Index #18457 (Domain=qkd, Kernel=rk4, Regime=hp1mw)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 250000 {
+        clamped = 250000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 250000, "clamped <= 250000");
+    return clamped;
+}
+
+fn integrate_step(y0: Number, dt: Number, deriv_scale: Number) -> Number {
+    let c = 0.11;
+    let k1 = dt * (-deriv_scale * y0 + c * 0.001);
+    let k2 = dt * (-deriv_scale * (y0 + 0.5 * k1) + c * 0.001);
+    let k3 = dt * (-deriv_scale * (y0 + 0.5 * k2) + c * 0.001);
+    let k4 = dt * (-deriv_scale * (y0 + k3) + c * 0.001);
+    return y0 + (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0;
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_qkd_rk4_hp1mw", "domain": "qkd", "kernel": "rk4", "regime": "hp1mw", "max_budget": 250000};
+}

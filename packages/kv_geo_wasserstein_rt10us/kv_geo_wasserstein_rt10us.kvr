@@ -1,0 +1,24 @@
+// kv_geo_wasserstein_rt10us: Seismic Wave Tomography & Plate Geodynamics — 1D Kantorovich-Rubinstein Optimal Transport (rt10us regime)
+// Combinatorial Synthesis Index #18571 (Domain=geo, Kernel=wasserstein, Regime=rt10us)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 25 {
+        clamped = 25;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 25, "clamped <= 25");
+    return clamped;
+}
+
+fn cryptographic_frame_digest(payload: String, context_tag: String) -> Map {
+    let mac = kmac256("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", payload, context_tag, 32);
+    let ecc = ecc_encode(payload);
+    return {"kmac256": mac, "secded_token": ecc, "sha3_256": sha3_256(payload)};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_geo_wasserstein_rt10us", "domain": "geo", "kernel": "wasserstein", "regime": "rt10us", "max_budget": 25};
+}
