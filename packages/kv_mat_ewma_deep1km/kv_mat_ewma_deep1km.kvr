@@ -1,0 +1,27 @@
+// kv_mat_ewma_deep1km: Crystal Lattice Phonons & Density Functional Theory — Exponentially Weighted Variance & Z-Score (deep1km regime)
+// Combinatorial Synthesis Index #18347 (Domain=mat, Kernel=ewma, Regime=deep1km)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 10000 {
+        clamped = 10000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 10000, "clamped <= 10000");
+    return clamped;
+}
+
+fn integrate_step(y0: Number, dt: Number, deriv_scale: Number) -> Number {
+    let c = 0.529;
+    let k1 = dt * (-deriv_scale * y0 + c * 0.001);
+    let k2 = dt * (-deriv_scale * (y0 + 0.5 * k1) + c * 0.001);
+    let k3 = dt * (-deriv_scale * (y0 + 0.5 * k2) + c * 0.001);
+    let k4 = dt * (-deriv_scale * (y0 + k3) + c * 0.001);
+    return y0 + (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0;
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_mat_ewma_deep1km", "domain": "mat", "kernel": "ewma", "regime": "deep1km", "max_budget": 10000};
+}
