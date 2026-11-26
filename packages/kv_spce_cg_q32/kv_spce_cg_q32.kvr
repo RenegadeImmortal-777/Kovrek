@@ -1,0 +1,27 @@
+// kv_spce_cg_q32: Deep-Space Optical Navigation & GCR Shielding — Preconditioned Conjugate Gradient Step (q32 regime)
+// Combinatorial Synthesis Index #20310 (Domain=spce, Kernel=cg, Regime=q32)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 131072 {
+        clamped = 131072;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 131072, "clamped <= 131072");
+    return clamped;
+}
+
+fn integrate_step(y0: Number, dt: Number, deriv_scale: Number) -> Number {
+    let c = 149597870.7;
+    let k1 = dt * (-deriv_scale * y0 + c * 0.001);
+    let k2 = dt * (-deriv_scale * (y0 + 0.5 * k1) + c * 0.001);
+    let k3 = dt * (-deriv_scale * (y0 + 0.5 * k2) + c * 0.001);
+    let k4 = dt * (-deriv_scale * (y0 + k3) + c * 0.001);
+    return y0 + (k1 + 2.0 * k2 + 2.0 * k3 + k4) / 6.0;
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_spce_cg_q32", "domain": "spce", "kernel": "cg", "regime": "q32", "max_budget": 131072};
+}

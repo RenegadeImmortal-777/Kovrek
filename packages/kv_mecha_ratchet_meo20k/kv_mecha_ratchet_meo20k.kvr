@@ -1,0 +1,27 @@
+// kv_mecha_ratchet_meo20k: Compliant Actuators & Soft Continuum Robotics — KMAC256 Forward-Secure Key Evolution (meo20k regime)
+// Combinatorial Synthesis Index #20345 (Domain=mecha, Kernel=ratchet, Regime=meo20k)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 20000 {
+        clamped = 20000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 20000, "clamped <= 20000");
+    return clamped;
+}
+
+fn entropy_and_hazard_metrics(prob_p: Number, prob_q: Number, shape_k: Number) -> Map {
+    let p = prob_p;
+    if p <= 0.000001 { p = 0.000001; }
+    if p >= 0.999999 { p = 0.999999; }
+    let shannon_bits = -(p * log(p) + (1.0 - p) * log(1.0 - p)) * 1.4426950408889634;
+    let transport_l1 = abs(p - prob_q);
+    return {"shannon_bits": shannon_bits, "wasserstein_1d": transport_l1, "shape": shape_k};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_mecha_ratchet_meo20k", "domain": "mecha", "kernel": "ratchet", "regime": "meo20k", "max_budget": 20000};
+}
