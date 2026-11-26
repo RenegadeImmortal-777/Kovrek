@@ -1,0 +1,24 @@
+// kv_chem_legendre_ht1000k: Computational Chemistry & Molecular Dynamics — 3-Point Gauss-Legendre Quadrature Rule (ht1000k regime)
+// Combinatorial Synthesis Index #20691 (Domain=chem, Kernel=legendre, Regime=ht1000k)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 10000 {
+        clamped = 10000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 10000, "clamped <= 10000");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 8.31446};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_chem_legendre_ht1000k", "domain": "chem", "kernel": "legendre", "regime": "ht1000k", "max_budget": 10000};
+}
