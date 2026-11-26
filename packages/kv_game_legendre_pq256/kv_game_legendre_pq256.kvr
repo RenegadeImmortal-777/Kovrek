@@ -1,0 +1,24 @@
+// kv_game_legendre_pq256: Rigid-Body Constraint Physics & Raytracing — 3-Point Gauss-Legendre Quadrature Rule (pq256 regime)
+// Combinatorial Synthesis Index #20120 (Domain=game, Kernel=legendre, Regime=pq256)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 2560 {
+        clamped = 2560;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 2560, "clamped <= 2560");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 120};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_game_legendre_pq256", "domain": "game", "kernel": "legendre", "regime": "pq256", "max_budget": 2560};
+}

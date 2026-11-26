@@ -1,0 +1,26 @@
+// kv_imag_qcircuit_mil1: MRI k-Space Reconstruction & Hyperspectral Optics — 2-Qubit Entanglement & Born Probability Probe (mil1 regime)
+// Combinatorial Synthesis Index #20082 (Domain=imag, Kernel=qcircuit, Regime=mil1)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 4000 {
+        clamped = 4000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 4000, "clamped <= 4000");
+    return clamped;
+}
+
+fn quadrature_and_quantum_probe(a: Number, b: Number) -> Map {
+    let mid = 0.5 * (a + b);
+    let h = (b - a) / 6.0;
+    let simpson_area = h * (a * a + 4.0 * mid * mid + b * b) * 512 * 0.001;
+    let bell = qcircuit_run(2, [["H", 0], ["CNOT", 0, 1]]);
+    return {"integral": simpson_area, "midpoint": mid, "entanglement_bits": bell["entanglement_entropy_q0"]};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_imag_qcircuit_mil1", "domain": "imag", "kernel": "qcircuit", "regime": "mil1", "max_budget": 4000};
+}
