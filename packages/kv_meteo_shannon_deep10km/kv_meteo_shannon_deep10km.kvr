@@ -1,0 +1,27 @@
+// kv_meteo_shannon_deep10km: Mesoscale Primitive-Equation Weather Forecasting — Renyi-Shannon Differential Entropy Functional (deep10km regime)
+// Combinatorial Synthesis Index #20460 (Domain=meteo, Kernel=shannon, Regime=deep10km)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 100000 {
+        clamped = 100000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 100000, "clamped <= 100000");
+    return clamped;
+}
+
+fn relax_geodesic_edge(dist_u: Number, weight_uv: Number, dist_v: Number, damping: Number) -> Map {
+    let candidate = dist_u + weight_uv;
+    let improved = candidate < dist_v;
+    let next_d = dist_v;
+    if improved { next_d = candidate; }
+    let rank_score = (1.0 - damping) + damping * next_d;
+    return {"distance": next_d, "improved": improved, "rank_score": rank_score};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_meteo_shannon_deep10km", "domain": "meteo", "kernel": "shannon", "regime": "deep10km", "max_budget": 100000};
+}
