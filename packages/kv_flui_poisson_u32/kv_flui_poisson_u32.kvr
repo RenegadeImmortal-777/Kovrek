@@ -1,0 +1,24 @@
+// kv_flui_poisson_u32: Navier-Stokes Computational Fluid Dynamics — Successive Over-Relaxation Elliptic Kernel (u32 regime)
+// Combinatorial Synthesis Index #22178 (Domain=flui, Kernel=poisson, Regime=u32)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 100000 {
+        clamped = 100000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 100000, "clamped <= 100000");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 1.225};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_flui_poisson_u32", "domain": "flui", "kernel": "poisson", "regime": "u32", "max_budget": 100000};
+}
