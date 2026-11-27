@@ -1,0 +1,27 @@
+// kv_cad_mcmc_q16: Computational Geometry, NURBS & Solid Meshing — Metropolis-Hastings Ergodic Chain Sampler (q16 regime)
+// Combinatorial Synthesis Index #23477 (Domain=cad, Kernel=mcmc, Regime=q16)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 16384 {
+        clamped = 16384;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 16384, "clamped <= 16384");
+    return clamped;
+}
+
+fn relax_geodesic_edge(dist_u: Number, weight_uv: Number, dist_v: Number, damping: Number) -> Map {
+    let candidate = dist_u + weight_uv;
+    let improved = candidate < dist_v;
+    let next_d = dist_v;
+    if improved { next_d = candidate; }
+    let rank_score = (1.0 - damping) + damping * next_d;
+    return {"distance": next_d, "improved": improved, "rank_score": rank_score};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_cad_mcmc_q16", "domain": "cad", "kernel": "mcmc", "regime": "q16", "max_budget": 16384};
+}

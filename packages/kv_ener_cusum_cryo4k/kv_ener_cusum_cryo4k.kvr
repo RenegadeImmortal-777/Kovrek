@@ -1,0 +1,24 @@
+// kv_ener_cusum_cryo4k: Smart-Grid Phasor Stability & Tokamak Fusion — Page Log-Likelihood Change-Point Detector (cryo4k regime)
+// Combinatorial Synthesis Index #23445 (Domain=ener, Kernel=cusum, Regime=cryo4k)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 420 {
+        clamped = 420;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 420, "clamped <= 420");
+    return clamped;
+}
+
+fn filter_update(prior: Number, prior_var: Number, obs: Number, gain: Number) -> Map {
+    let post = prior + gain * (obs - prior);
+    let post_var = (1.0 - gain) * prior_var;
+    return {"estimate": post, "variance": post_var, "gain": gain, "domain_scale": 60};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_ener_cusum_cryo4k", "domain": "ener", "kernel": "cusum", "regime": "cryo4k", "max_budget": 420};
+}
