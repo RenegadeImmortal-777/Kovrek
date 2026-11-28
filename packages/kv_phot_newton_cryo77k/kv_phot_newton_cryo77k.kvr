@@ -1,0 +1,25 @@
+// kv_phot_newton_cryo77k: Kerr Nonlinear Fiber Solitons & Silicon Photonics — Damped Newton-Raphson Secant Solver (cryo77k regime)
+// Combinatorial Synthesis Index #23739 (Domain=phot, Kernel=newton, Regime=cryo77k)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 770 {
+        clamped = 770;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 770, "clamped <= 770");
+    return clamped;
+}
+
+fn compute_control_law(setpoint: Number, measured: Number, kp: Number, ki: Number, accum: Number) -> Map {
+    let err = setpoint - measured;
+    let next_accum = accum + err;
+    let raw_u = kp * err + ki * next_accum;
+    return {"control": raw_u, "error": err, "integral": next_accum, "max_limit": 770};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_phot_newton_cryo77k", "domain": "phot", "kernel": "newton", "regime": "cryo77k", "max_budget": 770};
+}
