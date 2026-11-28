@@ -1,0 +1,27 @@
+// kv_med_reed_ieee2: Pharmacokinetic Compartment Modeling & ICU Vitals — Horner Syndrome Polynomial Evaluator (ieee2 regime)
+// Combinatorial Synthesis Index #24078 (Domain=med, Kernel=reed, Regime=ieee2)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 2500 {
+        clamped = 2500;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 2500, "clamped <= 2500");
+    return clamped;
+}
+
+fn relax_geodesic_edge(dist_u: Number, weight_uv: Number, dist_v: Number, damping: Number) -> Map {
+    let candidate = dist_u + weight_uv;
+    let improved = candidate < dist_v;
+    let next_d = dist_v;
+    if improved { next_d = candidate; }
+    let rank_score = (1.0 - damping) + damping * next_d;
+    return {"distance": next_d, "improved": improved, "rank_score": rank_score};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_med_reed_ieee2", "domain": "med", "kernel": "reed", "regime": "ieee2", "max_budget": 2500};
+}
