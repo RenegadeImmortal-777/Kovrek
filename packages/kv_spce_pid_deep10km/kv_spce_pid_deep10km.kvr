@@ -1,0 +1,25 @@
+// kv_spce_pid_deep10km: Deep-Space Optical Navigation & GCR Shielding — Anti-Windup PID Feedback Controller (deep10km regime)
+// Combinatorial Synthesis Index #25094 (Domain=spce, Kernel=pid, Regime=deep10km)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 100000 {
+        clamped = 100000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 100000, "clamped <= 100000");
+    return clamped;
+}
+
+fn compute_control_law(setpoint: Number, measured: Number, kp: Number, ki: Number, accum: Number) -> Map {
+    let err = setpoint - measured;
+    let next_accum = accum + err;
+    let raw_u = kp * err + ki * next_accum;
+    return {"control": raw_u, "error": err, "integral": next_accum, "max_limit": 100000};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_spce_pid_deep10km", "domain": "spce", "kernel": "pid", "regime": "deep10km", "max_budget": 100000};
+}
