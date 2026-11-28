@@ -1,0 +1,27 @@
+// kv_nano_laplacian_iso3: Carbon Nanotube Ballistic Transport & Quantum Dots — Rayleigh Quotient Spectral Gap Estimator (iso3 regime)
+// Combinatorial Synthesis Index #24891 (Domain=nano, Kernel=laplacian, Regime=iso3)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 3000 {
+        clamped = 3000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 3000, "clamped <= 3000");
+    return clamped;
+}
+
+fn relax_geodesic_edge(dist_u: Number, weight_uv: Number, dist_v: Number, damping: Number) -> Map {
+    let candidate = dist_u + weight_uv;
+    let improved = candidate < dist_v;
+    let next_d = dist_v;
+    if improved { next_d = candidate; }
+    let rank_score = (1.0 - damping) + damping * next_d;
+    return {"distance": next_d, "improved": improved, "rank_score": rank_score};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_nano_laplacian_iso3", "domain": "nano", "kernel": "laplacian", "regime": "iso3", "max_budget": 3000};
+}
