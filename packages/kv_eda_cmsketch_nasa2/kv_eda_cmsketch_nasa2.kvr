@@ -1,0 +1,26 @@
+// kv_eda_cmsketch_nasa2: VLSI Place-and-Route & Timing Closure — Pairwise-Independent Count-Min Point Query (nasa2 regime)
+// Combinatorial Synthesis Index #23839 (Domain=eda, Kernel=cmsketch, Regime=nasa2)
+
+@verify
+fn verify_regime_budget(input_val: Int) -> Int {
+    requires(input_val >= 0, "input_val >= 0");
+    let clamped = input_val;
+    if clamped > 24000 {
+        clamped = 24000;
+    }
+    ensures(clamped >= 0, "clamped >= 0");
+    ensures(clamped <= 24000, "clamped <= 24000");
+    return clamped;
+}
+
+fn quadrature_and_quantum_probe(a: Number, b: Number) -> Map {
+    let mid = 0.5 * (a + b);
+    let h = (b - a) / 6.0;
+    let simpson_area = h * (a * a + 4.0 * mid * mid + b * b) * 0.7 * 0.001;
+    let bell = qcircuit_run(2, [["H", 0], ["CNOT", 0, 1]]);
+    return {"integral": simpson_area, "midpoint": mid, "entanglement_bits": bell["entanglement_entropy_q0"]};
+}
+
+fn package_metadata() -> Map {
+    return {"name": "kv_eda_cmsketch_nasa2", "domain": "eda", "kernel": "cmsketch", "regime": "nasa2", "max_budget": 24000};
+}
